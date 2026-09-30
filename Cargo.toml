@@ -1,0 +1,28 @@
+[package]
+name = "wavemorphfs"
+version = "0.1.0"
+edition = "2024"
+description = "Read-only FUSE overlay that presents pristine audio downloads (CUE+image rips, SACD ISOs) as split, fully tagged tracks"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+chardetng = "1"
+claxon = "0.4"
+clap = { version = "4", features = ["derive"] }
+encoding_rs = "0.8"
+env_logger = "0.11"
+fuser = "0.18"
+libc = "0.2"
+log = "0.4"
+lru = "0.18"
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+debug = 1
