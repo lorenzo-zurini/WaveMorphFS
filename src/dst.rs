@@ -103,6 +103,7 @@ fn read_map(gb: &mut Bits, t: &mut Table, map: &mut [usize; MAX_CHANNELS], chann
     Ok(())
 }
 
+#[allow(clippy::needless_range_loop)] // mirrors FFmpeg's loop structure
 fn read_table(gb: &mut Bits, t: &mut Table, pred: &[[i32; 3]; 3], length_bits: u32, coeff_bits: u32, signed: bool, offset: i32) -> Result<()> {
     for i in 0..t.elements {
         t.length[i] = gb.bits(length_bits) as usize + 1;

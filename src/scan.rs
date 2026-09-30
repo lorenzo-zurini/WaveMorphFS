@@ -12,7 +12,7 @@
 
 use crate::cache::{Cache, SrcKey};
 use crate::cue::CueSheet;
-use crate::flac::{BLOCK_PICTURE, FlacMeta, MetaBlock};
+use crate::flac::{FlacMeta, MetaBlock};
 use crate::retag::RetagFlac;
 use crate::sacd::{self, SacdDisc};
 use crate::sidecar::Sidecar;

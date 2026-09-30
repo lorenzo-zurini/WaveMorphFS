@@ -60,9 +60,6 @@ impl Tags {
         self.0.get(&key.to_ascii_uppercase()).and_then(|v| v.first()).map(|s| s.as_str())
     }
 
-    pub fn remove(&mut self, key: &str) {
-        self.0.remove(&key.to_ascii_uppercase());
-    }
 
     /// Overlay `other` on top of self: every key present in `other` replaces ours.
     pub fn overlay(&mut self, other: &Tags) {
