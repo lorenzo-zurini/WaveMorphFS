@@ -51,6 +51,9 @@ enum Cmd {
         /// Re-walk the library this often (seconds) to pre-process new albums
         #[arg(long, default_value_t = 900)]
         prescan: u64,
+        /// Also expose SACD multichannel areas as separate "(Multichannel)" albums
+        #[arg(long)]
+        sacd_multichannel: bool,
     },
     /// Show what a source directory looks like through the filesystem
     Ls { dir: PathBuf },
@@ -84,13 +87,14 @@ fn default_roots() -> Vec<Root> {
 }
 
 fn library(cli: &Cli, workers: usize) -> Result<Arc<Library>> {
+    let sacd_multichannel = matches!(cli.cmd, Cmd::Mount { sacd_multichannel: true, .. });
     let roots = if cli.roots.is_empty() { default_roots() } else { cli.roots.clone() };
     for r in &roots {
         if !r.path.is_dir() {
             bail!("root {} does not exist: {}", r.name, r.path.display());
         }
     }
-    Library::new(Config { roots, tags_dir: expand(&cli.tags_dir), cache_dir: expand(&cli.cache_dir), workers })
+    Library::new(Config { roots, tags_dir: expand(&cli.tags_dir), cache_dir: expand(&cli.cache_dir), workers, sacd_multichannel })
 }
 
 fn abs(p: &Path) -> Result<PathBuf> {
@@ -101,7 +105,7 @@ fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).format_timestamp_secs().init();
     let cli = Cli::parse();
     match &cli.cmd {
-        Cmd::Mount { mountpoint, workers, threads, allow_other, prescan } => {
+        Cmd::Mount { mountpoint, workers, threads, allow_other, prescan, .. } => {
             let lib = library(&cli, *workers)?;
             lib.start_workers();
             lib.start_prescan(Duration::from_secs(*prescan));
