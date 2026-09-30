@@ -46,6 +46,8 @@ pub struct Config {
     pub tags_dir: PathBuf,
     pub cache_dir: PathBuf,
     pub workers: usize,
+    /// also expose SACD multichannel areas ("MC NN - Title.dsf", album "... (Multichannel)")
+    pub sacd_multichannel: bool,
 }
 
 #[derive(Clone)]
@@ -113,7 +115,7 @@ pub struct ReadyImage {
 
 enum Job {
     Image { src: PathBuf, dir: PathBuf },
-    Sacd { src: PathBuf, dir: PathBuf },
+    Sacd { src: PathBuf, dir: PathBuf, mc: bool },
     Md5 { image: Arc<FlacImage>, ranges: Vec<(u64, u64)>, dir: PathBuf },
 }
 
@@ -121,7 +123,7 @@ pub struct Library {
     pub cfg: Config,
     pub cache: Cache,
     images: Mutex<HashMap<PathBuf, (SrcKey, Work<ReadyImage>)>>,
-    sacds: Mutex<HashMap<PathBuf, (SrcKey, Work<SacdDisc>)>>,
+    sacds: Mutex<HashMap<(PathBuf, bool), (SrcKey, Work<SacdDisc>)>>,
     listings: Mutex<HashMap<PathBuf, Arc<Listing>>>,
     generations: Mutex<HashMap<PathBuf, (u64, SystemTime)>>,
     dir_locks: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
@@ -233,20 +235,26 @@ impl Library {
                 self.md5_queued.lock().remove(&image.path);
                 self.bump(&dir);
             }
-            Job::Sacd { src, dir } => {
+            Job::Sacd { src, dir, mc } => {
                 let key = SrcKey::of(&src).ok();
-                let state = match SacdDisc::open(&src, Some(&self.cache)) {
+                let area = if mc { "multichannel" } else { "stereo" };
+                let state = match SacdDisc::open(&src, Some(&self.cache), mc) {
                     Ok(d) => {
-                        info!("SACD ready: {} ({} tracks)", src.display(), d.tracks.len());
+                        info!("SACD {area} area ready: {} ({} tracks, {} ch{})", src.display(), d.tracks.len(), d.channels, if d.dst { ", DST" } else { "" });
                         Work::Ready(Arc::new(d))
                     }
                     Err(e) => {
-                        warn!("SACD failed: {}: {e:#}", src.display());
-                        Work::Failed(format!("{e:#}"))
+                        let msg = format!("{e:#}");
+                        if msg.contains("no multichannel area") {
+                            log::debug!("{}: {msg}", src.display());
+                        } else {
+                            warn!("SACD {area} area failed: {}: {msg}", src.display());
+                        }
+                        Work::Failed(msg)
                     }
                 };
                 if let Some(k) = key {
-                    self.sacds.lock().insert(src, (k, state));
+                    self.sacds.lock().insert((src, mc), (k, state));
                 }
                 self.bump(&dir);
             }
@@ -328,11 +336,12 @@ impl Library {
         st
     }
 
-    fn sacd_state(&self, src: &Path, dir: &Path) -> Work<SacdDisc> {
+    fn sacd_state(&self, src: &Path, dir: &Path, mc: bool) -> Work<SacdDisc> {
+        let mkey = (src.to_path_buf(), mc);
         let Ok(key) = SrcKey::of(src) else { return Work::Failed("stat failed".into()) };
         {
             let map = self.sacds.lock();
-            if let Some((k, st)) = map.get(src)
+            if let Some((k, st)) = map.get(&mkey)
                 && *k == key
             {
                 match st {
@@ -344,19 +353,19 @@ impl Library {
         }
         if recently_modified(src) {
             let st = Work::Settling(Instant::now() + SETTLE);
-            self.sacds.lock().insert(src.to_path_buf(), (key, st.clone()));
+            self.sacds.lock().insert(mkey.clone(), (key, st.clone()));
             return st;
         }
-        let cached = sacd::is_cached(&self.cache, src);
-        self.sacds.lock().insert(src.to_path_buf(), (key, Work::Pending));
-        if !cached && self.enqueue(Job::Sacd { src: src.to_path_buf(), dir: dir.to_path_buf() }) {
+        let cached = sacd::is_cached(&self.cache, src, mc);
+        self.sacds.lock().insert(mkey.clone(), (key, Work::Pending));
+        if !cached && self.enqueue(Job::Sacd { src: src.to_path_buf(), dir: dir.to_path_buf(), mc }) {
             return Work::Pending;
         }
-        let st = match SacdDisc::open(src, Some(&self.cache)) {
+        let st = match SacdDisc::open(src, Some(&self.cache), mc) {
             Ok(d) => Work::Ready(Arc::new(d)),
             Err(e) => Work::Failed(format!("{e:#}")),
         };
-        self.sacds.lock().insert(src.to_path_buf(), (key, st.clone()));
+        self.sacds.lock().insert(mkey.clone(), (key, st.clone()));
         st
     }
 
@@ -491,14 +500,19 @@ impl Library {
             if downloading(&n.to_string_lossy()) || !sacd::is_sacd(&p) {
                 continue;
             }
-            match self.sacd_state(&p, dir) {
+            let disc_no = if multi_iso { Some(ii as u32 + 1) } else { None };
+            match self.sacd_state(&p, dir, false) {
                 Work::Ready(disc) => {
-                    let disc_no = if multi_iso { Some(ii as u32 + 1) } else { None };
-                    virtuals.extend(self.sacd_tracks(dir, &disc, disc_no, isos.len(), sidecar.as_ref(), &[mtime(&p), sidecar_mtime]));
+                    virtuals.extend(self.sacd_tracks(dir, &disc, disc_no, isos.len(), sidecar.as_ref(), &[mtime(&p), sidecar_mtime], false));
                     hidden.insert(n.clone());
+                    if self.cfg.sacd_multichannel
+                        && let Work::Ready(mc) = self.sacd_state(&p, dir, true)
+                    {
+                        virtuals.extend(self.sacd_tracks(dir, &mc, disc_no, isos.len(), sidecar.as_ref(), &[mtime(&p), sidecar_mtime], true));
+                    }
                 }
                 Work::Pending | Work::Settling(_) => {
-                    if let Work::Settling(u) = self.sacd_state(&p, dir) {
+                    if let Work::Settling(u) = self.sacd_state(&p, dir, false) {
                         note_settle(u);
                     }
                     hidden.insert(n.clone());
@@ -667,7 +681,7 @@ impl Library {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn sacd_tracks(&self, _dir: &Path, disc: &Arc<SacdDisc>, disc_no: Option<u32>, ndiscs: usize, sidecar: Option<&Sidecar>, mtimes: &[Option<SystemTime>]) -> Vec<Entry> {
+    fn sacd_tracks(&self, _dir: &Path, disc: &Arc<SacdDisc>, disc_no: Option<u32>, ndiscs: usize, sidecar: Option<&Sidecar>, mtimes: &[Option<SystemTime>], mc: bool) -> Vec<Entry> {
         let mt = mtimes.iter().flatten().max().copied().unwrap_or(SystemTime::UNIX_EPOCH);
         let n = disc.tracks.len();
         let mut out = Vec::new();
@@ -686,10 +700,16 @@ impl Library {
                     tg.overlay(tt);
                 }
             }
+            if mc {
+                // a separate album in music servers, e.g. "Pictures at an Exhibition (Multichannel)"
+                let album = tg.get("ALBUM").unwrap_or("SACD").to_string();
+                tg.set("ALBUM", format!("{album} (Multichannel)"));
+            }
             let title = tg.get("TITLE").map(tags::sanitize_name).unwrap_or_else(|| format!("Track {num:02}"));
+            let prefix = if mc { "MC " } else { "" };
             let name = match disc_no {
-                Some(d) => format!("{d}-{num:02} - {title}.dsf"),
-                None => format!("{num:02} - {title}.dsf"),
+                Some(d) => format!("{prefix}{d}-{num:02} - {title}.dsf"),
+                None => format!("{prefix}{num:02} - {title}.dsf"),
             };
             if let Some(sc) = sidecar
                 && let Some(ft) = sc.file(&name)

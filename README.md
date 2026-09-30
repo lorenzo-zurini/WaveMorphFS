@@ -31,7 +31,8 @@ you control — never written into the downloads.
   in the cache; the conversion is accepted only if the decoded PCM MD5 matches the
   source. The source file is never modified.
 * **SACD ISOs** (Scarlet Book) are parsed for track lists and text; the stereo area
-  is exposed as DSF. Plain DSD is only re-ordered (byte de-interleave + bit
+  is exposed as DSF. With `--sacd-multichannel` the multichannel area is exposed too,
+  as `MC NN - Title.dsf` tagged `<album> (Multichannel)` (5.0/5.1 channel layouts). Plain DSD is only re-ordered (byte de-interleave + bit
   reversal); DST-compressed areas are decoded by a port of FFmpeg's DST decoder.
 * Each split track's STREAMINFO carries the real audio MD5, computed in the
   background after the image is indexed (one decode pass per image, cached), so
@@ -99,7 +100,6 @@ is shown in the album folder if it has no cover of its own.
 
 ## Limitations
 
-* SACD multichannel areas are not exposed (the stereo area is).
 * Variable-blocksize FLAC images are not split (they are shown as-is).
 
 ## License

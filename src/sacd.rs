@@ -143,7 +143,8 @@ const DATA_AUDIO: u8 = 2;
 const IDX_MAGIC: &[u8; 8] = b"WMSACD01";
 
 impl SacdDisc {
-    pub fn open(path: &Path, cache: Option<&Cache>) -> Result<SacdDisc> {
+    /// Open the stereo area, or with `multichannel` the multichannel area.
+    pub fn open(path: &Path, cache: Option<&Cache>, multichannel: bool) -> Result<SacdDisc> {
         let f = File::open(path)?;
         let flen = f.metadata()?.len();
         let sec = |n: u64, count: u64| -> Result<Vec<u8>> {
@@ -163,8 +164,8 @@ impl SacdDisc {
         let master_charset = m[138]; // first locale: [lang, lang, charset, reserved] at 136
 
         // choose the stereo area, fall back to multichannel if it is the only one
-        let area_start = if area1 != 0 { area1 } else { area2 };
-        ensure!(area_start != 0, "no audio area");
+        let area_start = if multichannel { area2 } else if area1 != 0 { area1 } else { area2 };
+        ensure!(area_start != 0, "{}", if multichannel { "no multichannel area" } else { "no audio area" });
         let at = sec(area_start, 1)?;
         ensure!(&at[..8] == b"TWOCHTOC" || &at[..8] == b"MULCHTOC", "bad area TOC signature");
         let toc_size = be16(&at, 10) as u64;
@@ -265,6 +266,7 @@ impl SacdDisc {
         album.set("MEDIA", "SACD");
 
         let key = SrcKey::of(path)?;
+        let key = SrcKey { size: key.size, mtime_ns: key.mtime_ns ^ (multichannel as i128) << 100 };
         let frames = match cache.and_then(|c| load_frames(c, path, key)) {
             Some(fr) => fr,
             None => {
@@ -423,8 +425,11 @@ fn scan_frames(f: &File, start: u64, end: u64, channels: u32, dst: bool) -> Resu
 }
 
 /// True if the frame table of this ISO is cached (opening is then cheap).
-pub fn is_cached(c: &Cache, src: &Path) -> bool {
-    SrcKey::of(src).is_ok_and(|k| frames_cache_path(c, src, k).exists())
+pub fn is_cached(c: &Cache, src: &Path, multichannel: bool) -> bool {
+    SrcKey::of(src).is_ok_and(|k| {
+        let k = SrcKey { size: k.size, mtime_ns: k.mtime_ns ^ (multichannel as i128) << 100 };
+        frames_cache_path(c, src, k).exists()
+    })
 }
 
 fn frames_cache_path(c: &Cache, src: &Path, key: SrcKey) -> PathBuf {
