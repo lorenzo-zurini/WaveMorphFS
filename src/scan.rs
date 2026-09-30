@@ -165,6 +165,7 @@ impl Library {
                         let job = { rx.lock().recv() };
                         let Ok(job) = job else { break };
                         lib.run_job(job);
+                        lib.write_status();
                     }
                 })
                 .expect("spawn worker");
@@ -184,6 +185,7 @@ impl Library {
                         lib.walk(&r.path, &mut n);
                     }
                     info!("prescan: {n} directories in {:?}", t.elapsed());
+                    lib.write_status();
                     std::thread::sleep(every);
                 }
             })
@@ -283,6 +285,55 @@ impl Library {
             .collect();
         let img = FlacImage::open(flac_path, meta, idx)?;
         Ok(ReadyImage { flac: Arc::new(img), source_tags, pictures })
+    }
+
+    /// Human-readable summary of processing state, written next to the cache dir.
+    pub fn write_status(&self) {
+        let mut out = String::new();
+        let now = SystemTime::now();
+        let ts = now.duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        out.push_str(&format!("WaveMorphFS status (unix time {ts})\n\n"));
+        let mut sections: Vec<(&str, Vec<String>)> = vec![("ready", vec![]), ("pending", vec![]), ("settling (still being written)", vec![]), ("FAILED", vec![])];
+        let mut push = |w: &str, label: String| {
+            let i = match w {
+                "ready" => 0,
+                "pending" => 1,
+                "settling" => 2,
+                _ => 3,
+            };
+            sections[i].1.push(label);
+        };
+        for (p, (_, st)) in self.images.lock().iter() {
+            let label = format!("image  {}", p.display());
+            match st {
+                Work::Ready(_) => push("ready", label),
+                Work::Pending => push("pending", label),
+                Work::Settling(_) => push("settling", label),
+                Work::Failed(e) => push("failed", format!("{label}\n         {e}")),
+            }
+        }
+        for ((p, mc), (_, st)) in self.sacds.lock().iter() {
+            let label = format!("SACD{} {}", if *mc { "/MC" } else { "   " }, p.display());
+            match st {
+                Work::Ready(d) => push("ready", format!("{label}  ({} tracks, {} ch{})", d.tracks.len(), d.channels, if d.dst { ", DST" } else { "" })),
+                Work::Pending => push("pending", label),
+                Work::Settling(_) => push("settling", label),
+                Work::Failed(e) if e.contains("no multichannel area") => {}
+                Work::Failed(e) => push("failed", format!("{label}\n         {e}")),
+            }
+        }
+        for (title, mut items) in sections {
+            items.sort();
+            out.push_str(&format!("== {title}: {}\n", items.len()));
+            if title != "ready" {
+                for i in &items {
+                    out.push_str(&format!("   {i}\n"));
+                }
+            }
+            out.push('\n');
+        }
+        let path = self.cfg.cache_dir.parent().unwrap_or(&self.cfg.cache_dir).join("status.txt");
+        let _ = crate::cache::atomic_write(&path, out.as_bytes());
     }
 
     fn bump(&self, dir: &Path) {
