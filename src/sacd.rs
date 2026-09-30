@@ -315,6 +315,11 @@ impl SacdDisc {
         let mut out: Vec<Vec<u8>> = Vec::with_capacity((f1 - f0) as usize);
         'sectors: for i in 0..(buf.len() as u64 / SECTOR) {
             let sec_no = s0 + i;
+            // the end marker's own sector is only part of the range if the next frame
+            // starts inside it; never parse beyond (e.g. the area's backup TOC)
+            if sec_no > end.0 as u64 || (sec_no == end.0 as u64 && end.1 == 0) {
+                break;
+            }
             let sb = &buf[(i * SECTOR) as usize..((i + 1) * SECTOR) as usize];
             let parsed = parse_sector(sb)?;
             for &(po, len, dt, fs) in &parsed.packets {
