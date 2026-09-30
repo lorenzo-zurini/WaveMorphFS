@@ -33,6 +33,9 @@ you control — never written into the downloads.
 * **SACD ISOs** (Scarlet Book) are parsed for track lists and text; the stereo area
   is exposed as DSF. Plain DSD is only re-ordered (byte de-interleave + bit
   reversal); DST-compressed areas are decoded by a port of FFmpeg's DST decoder.
+* Each split track's STREAMINFO carries the real audio MD5, computed in the
+  background after the image is indexed (one decode pass per image, cached), so
+  `flac -t` and players can verify every track end to end.
 * Slow work (indexing, conversion, SACD scans) runs in background workers; a
   folder's contents appear when ready and its mtime changes so music servers rescan.
 
@@ -97,8 +100,6 @@ is shown in the album folder if it has no cover of its own.
 ## Limitations
 
 * SACD multichannel areas are not exposed (the stereo area is).
-* The STREAMINFO MD5 of split tracks is left unset (computing it means decoding the
-  whole track); `flac -t` therefore warns that it cannot check the MD5.
 * Variable-blocksize FLAC images are not split (they are shown as-is).
 
 ## License

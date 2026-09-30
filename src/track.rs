@@ -90,6 +90,58 @@ impl FlacImage {
     }
 }
 
+/// MD5 of the decoded audio (FLAC STREAMINFO convention: interleaved, little-endian,
+/// ceil(bps/8) bytes per sample) for each sample range, in one pass over the image.
+pub fn track_md5s(img: &FlacImage, ranges: &[(u64, u64)]) -> Result<Vec<[u8; 16]>> {
+    use md5::{Digest, Md5};
+    let si = img.si();
+    let bs = img.bs();
+    let bytes = si.bps.div_ceil(8) as usize;
+    let ch = si.channels as usize;
+    let mut ctx: Vec<Md5> = ranges.iter().map(|_| Md5::new()).collect();
+    let f = File::open(&img.path)?;
+    let offs = &img.index.offsets;
+    let nf = img.index.nframes();
+    const WINDOW: u64 = 8 << 20;
+    let mut k = 0u64;
+    let mut pcm: Vec<u8> = Vec::new();
+    while k < nf {
+        // read a window of whole frames
+        let a = offs[k as usize];
+        let mut k_end = k + 1;
+        while k_end < nf && offs[k_end as usize + 1] - a <= WINDOW {
+            k_end += 1;
+        }
+        let b = offs[k_end as usize];
+        let mut buf = vec![0u8; (b - a) as usize];
+        ensure!(read_full_at(&f, &mut buf, a)? == buf.len(), "short read");
+        for kk in k..k_end {
+            let fa = (offs[kk as usize] - a) as usize;
+            let fb = (offs[kk as usize + 1] - a) as usize;
+            let dec = flac::decode_frame(&buf[fa..fb], si.bps)?;
+            let fs = kk * bs;
+            let fe = img.frame_end(kk);
+            for (ri, &(s, e)) in ranges.iter().enumerate() {
+                if s >= fe || e <= fs {
+                    continue;
+                }
+                let lo = (s.max(fs) - fs) as usize;
+                let hi = (e.min(fe) - fs) as usize;
+                pcm.clear();
+                pcm.reserve((hi - lo) * ch * bytes);
+                for i in lo..hi {
+                    for c in dec.iter().take(ch) {
+                        pcm.extend_from_slice(&c[i].to_le_bytes()[..bytes]);
+                    }
+                }
+                ctx[ri].update(&pcm);
+            }
+        }
+        k = k_end;
+    }
+    Ok(ctx.into_iter().map(|c| c.finalize().into()).collect())
+}
+
 /// A partial frame re-emitted as VERBATIM.
 #[derive(Debug, Clone, Copy)]
 struct Seg {
@@ -120,7 +172,7 @@ pub struct FlacTrack {
 
 impl FlacTrack {
     /// Track covering samples [start, end) of `img`.
-    pub fn new(img: Arc<FlacImage>, start: u64, end: u64, tags: &Tags, pictures: &[MetaBlock]) -> Result<FlacTrack> {
+    pub fn new(img: Arc<FlacImage>, start: u64, end: u64, tags: &Tags, pictures: &[MetaBlock], md5: Option<[u8; 16]>) -> Result<FlacTrack> {
         let total = img.total();
         let bs = img.bs();
         let nf = img.index.nframes();
@@ -198,7 +250,7 @@ impl FlacTrack {
             channels: si.channels,
             bps: si.bps,
             total_samples: end - start,
-            md5: [0; 16], // unknown (computing it would mean decoding the whole track)
+            md5: md5.unwrap_or([0; 16]), // all-zero = unknown until the background job has computed it
         };
         let mut meta = vec![MetaBlock { kind: flac::BLOCK_VORBIS, data: flac::build_vorbis("WaveMorphFS", &tags.to_pairs()) }];
         meta.extend(pictures.iter().cloned());
@@ -408,7 +460,8 @@ mod tests {
         for &(s, e) in ranges {
             let mut tags = Tags::new();
             tags.set("TITLE", format!("{s}-{e}"));
-            let tr = FlacTrack::new(image.clone(), s, e, &tags, &[]).unwrap();
+            let md5 = track_md5s(&image, &[(s, e)]).unwrap()[0];
+            let tr = FlacTrack::new(image.clone(), s, e, &tags, &[], Some(md5)).unwrap();
             let bytes = tr.read_at(0, tr.size() as usize).unwrap();
             assert_eq!(bytes.len() as u64, tr.size());
             let out = dir.path().join("t.flac");
