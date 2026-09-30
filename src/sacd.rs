@@ -12,7 +12,7 @@ use crate::dst::DstDecoder;
 use crate::id3;
 use crate::tags::Tags;
 use crate::vfile::{VFile, copy_overlap, read_full_at};
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use parking_lot::Mutex;
 use std::fs::File;
 use std::os::unix::fs::FileExt;

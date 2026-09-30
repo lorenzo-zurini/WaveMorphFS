@@ -205,12 +205,6 @@ impl FrameHeader {
         })
     }
 
-    pub fn channels(&self) -> u32 {
-        match self.ch_code {
-            0..=7 => self.ch_code as u32 + 1,
-            _ => 2,
-        }
-    }
 }
 
 /// Rewrite an existing header (`orig`, parsed as `h`) into a variable-blocksize
@@ -291,9 +285,7 @@ impl StreamInfo {
 
 pub const BLOCK_STREAMINFO: u8 = 0;
 pub const BLOCK_PADDING: u8 = 1;
-pub const BLOCK_SEEKTABLE: u8 = 3;
 pub const BLOCK_VORBIS: u8 = 4;
-pub const BLOCK_CUESHEET: u8 = 5;
 pub const BLOCK_PICTURE: u8 = 6;
 
 #[derive(Debug, Clone)]
@@ -595,9 +587,6 @@ pub struct BitWriter {
 }
 
 impl BitWriter {
-    pub fn new() -> Self {
-        BitWriter { buf: Vec::new(), acc: 0, nbits: 0 }
-    }
     pub fn put(&mut self, value: u64, bits: u32) {
         debug_assert!(bits <= 32);
         self.acc = (self.acc << bits) | (value & ((1u64 << bits) - 1));
