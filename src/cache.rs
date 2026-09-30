@@ -49,6 +49,7 @@ impl Cache {
     pub fn new(dir: PathBuf) -> Result<Cache> {
         std::fs::create_dir_all(dir.join("flacidx"))?;
         std::fs::create_dir_all(dir.join("images"))?;
+        std::fs::create_dir_all(dir.join("md5"))?;
         Ok(Cache { dir })
     }
 
@@ -95,6 +96,40 @@ impl Cache {
         ensure!(SrcKey::of(src)? == key, "{} changed while indexing", src.display());
         self.store_index(src, key, &idx)?;
         Ok(idx)
+    }
+
+    fn md5_path(&self, flac: &Path, key: SrcKey) -> PathBuf {
+        self.dir.join("md5").join(format!("{}.txt", name_for(flac, key)))
+    }
+
+    /// Cached per-range audio MD5s of a FLAC image: (start, end) -> md5
+    pub fn load_md5s(&self, flac: &Path) -> std::collections::HashMap<(u64, u64), [u8; 16]> {
+        let mut m = std::collections::HashMap::new();
+        let Ok(key) = SrcKey::of(flac) else { return m };
+        let Ok(text) = std::fs::read_to_string(self.md5_path(flac, key)) else { return m };
+        for line in text.lines() {
+            let mut it = line.split_whitespace();
+            let (Some(a), Some(b), Some(h)) = (it.next(), it.next(), it.next()) else { continue };
+            let (Ok(a), Ok(b)) = (a.parse(), b.parse()) else { continue };
+            if h.len() == 32 {
+                let mut d = [0u8; 16];
+                if (0..16).all(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16).map(|v| d[i] = v).is_ok()) {
+                    m.insert((a, b), d);
+                }
+            }
+        }
+        m
+    }
+
+    pub fn store_md5s(&self, flac: &Path, entries: &[((u64, u64), [u8; 16])]) -> Result<()> {
+        let key = SrcKey::of(flac)?;
+        let mut m = self.load_md5s(flac);
+        for (r, d) in entries {
+            m.insert(*r, *d);
+        }
+        let mut lines: Vec<String> = m.iter().map(|((a, b), d)| format!("{a} {b} {}", d.iter().map(|x| format!("{x:02x}")).collect::<String>())).collect();
+        lines.sort();
+        atomic_write(&self.md5_path(flac, key), (lines.join("\n") + "\n").as_bytes())
     }
 
     pub fn converted_path(&self, src: &Path, key: SrcKey) -> PathBuf {

@@ -114,6 +114,7 @@ pub struct ReadyImage {
 enum Job {
     Image { src: PathBuf, dir: PathBuf },
     Sacd { src: PathBuf, dir: PathBuf },
+    Md5 { image: Arc<FlacImage>, ranges: Vec<(u64, u64)>, dir: PathBuf },
 }
 
 pub struct Library {
@@ -125,6 +126,8 @@ pub struct Library {
     generations: Mutex<HashMap<PathBuf, (u64, SystemTime)>>,
     dir_locks: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
     jobs: Mutex<Option<Sender<Job>>>,
+    /// images whose per-track MD5 job is queued or running
+    md5_queued: Mutex<HashSet<PathBuf>>,
 }
 
 impl Library {
@@ -140,6 +143,7 @@ impl Library {
             generations: Mutex::new(HashMap::new()),
             dir_locks: Mutex::new(HashMap::new()),
             jobs: Mutex::new(None),
+            md5_queued: Mutex::new(HashSet::new()),
         }))
     }
 
@@ -212,6 +216,21 @@ impl Library {
                 if let Some(k) = key {
                     self.images.lock().insert(src, (k, state));
                 }
+                self.bump(&dir);
+            }
+            Job::Md5 { image, ranges, dir } => {
+                match crate::track::track_md5s(&image, &ranges) {
+                    Ok(d) => {
+                        let entries: Vec<_> = ranges.iter().copied().zip(d).collect();
+                        if let Err(e) = self.cache.store_md5s(&image.path, &entries) {
+                            warn!("storing MD5s for {}: {e:#}", image.path.display());
+                        } else {
+                            info!("track MD5s ready: {}", image.path.display());
+                        }
+                    }
+                    Err(e) => warn!("MD5 of {}: {e:#}", image.path.display()),
+                }
+                self.md5_queued.lock().remove(&image.path);
                 self.bump(&dir);
             }
             Job::Sacd { src, dir } => {
@@ -587,10 +606,22 @@ impl Library {
         };
         let mt = mtimes.iter().flatten().max().copied().unwrap_or(SystemTime::UNIX_EPOCH);
         let ntracks = cue.tracks.len();
+        let ranges: Vec<(u64, u64)> = cue
+            .tracks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.index01 * spf, cue.tracks.get(i + 1).map(|n| n.index01 * spf).unwrap_or(total).min(total)))
+            .collect();
+        let md5s = self.cache.load_md5s(&img.path);
+        if ranges.iter().any(|r| !md5s.contains_key(r)) && self.md5_queued.lock().insert(img.path.clone()) {
+            let queued = self.enqueue(Job::Md5 { image: Arc::clone(img), ranges: ranges.clone(), dir: _dir.to_path_buf() });
+            if !queued {
+                self.md5_queued.lock().remove(&img.path);
+            }
+        }
         let mut out = Vec::new();
         for (i, t) in cue.tracks.iter().enumerate() {
-            let s = t.index01 * spf;
-            let e = cue.tracks.get(i + 1).map(|n| n.index01 * spf).unwrap_or(total).min(total);
+            let (s, e) = ranges[i];
             if s >= e {
                 bail!("track {} starts beyond the end of the image", t.number);
             }
@@ -625,7 +656,7 @@ impl Library {
             {
                 tg.overlay(ft);
             }
-            let tr = FlacTrack::new(Arc::clone(img), s, e, &tg, &ready.pictures)?;
+            let tr = FlacTrack::new(Arc::clone(img), s, e, &tg, &ready.pictures, md5s.get(&(s, e)).copied())?;
             out.push(Entry { name: name.into(), kind: EntryKind::File(Arc::new(tr)), mtime: mt });
         }
         Ok(out)
