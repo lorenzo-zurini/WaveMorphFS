@@ -1,5 +1,6 @@
 mod cache;
 mod cue;
+mod dst;
 mod flac;
 mod fs;
 mod id3;

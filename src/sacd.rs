@@ -1,13 +1,14 @@
 //! SACD ISO reader (Scarlet Book) and DSF track generator.
 //!
-//! Only plain-DSD areas are supported (DST-compressed areas, typical for
-//! multichannel, are reported as unsupported). The stereo area is used.
+//! Plain-DSD and DST-compressed areas are supported (DST is decoded with the
+//! port in `dst.rs`). The stereo area is used.
 //! A one-time sequential scan of the area records where every 1/75 s audio
 //! frame starts; DSF output is then produced on demand by de-interleaving the
 //! byte-interleaved channels into 4096-byte blocks and reversing bit order
 //! (SACD stores DSD MSB-first, DSF LSB-first). Audio bits are untouched.
 
 use crate::cache::{Cache, SrcKey, atomic_write};
+use crate::dst::DstDecoder;
 use crate::id3;
 use crate::tags::Tags;
 use crate::vfile::{VFile, copy_overlap, read_full_at};
@@ -49,6 +50,9 @@ pub struct SacdDisc {
     pub album: Tags,
     /// per frame: (sector, byte offset of the frame's first audio packet)
     frames: Vec<(u32, u16)>,
+    /// last sector of the area's audio
+    area_end: u64,
+    pub dst: bool,
     /// small cache of recently decoded frame runs: (first frame, per-channel bytes)
     recent: Mutex<Option<(u64, Vec<Vec<u8>>)>>,
 }
@@ -165,10 +169,8 @@ impl SacdDisc {
         ensure!(&at[..8] == b"TWOCHTOC" || &at[..8] == b"MULCHTOC", "bad area TOC signature");
         let toc_size = be16(&at, 10) as u64;
         let frame_format = at[0x15] & 0x0F;
-        if frame_format == 0 {
-            bail!("DST-compressed area (not supported yet)");
-        }
-        ensure!(frame_format == 2 || frame_format == 3, "unknown frame format {frame_format}");
+        ensure!(matches!(frame_format, 0 | 2 | 3), "unknown frame format {frame_format}");
+        let dst = frame_format == 0;
         ensure!(at[0x14] == 4, "unsupported sample rate code {}", at[0x14]);
         let channels = at[0x20] as u32;
         ensure!((1..=6).contains(&channels), "bad channel count {channels}");
@@ -266,7 +268,7 @@ impl SacdDisc {
         let frames = match cache.and_then(|c| load_frames(c, path, key)) {
             Some(fr) => fr,
             None => {
-                let fr = scan_frames(&f, area_audio_start, area_audio_end, channels)?;
+                let fr = scan_frames(&f, area_audio_start, area_audio_end, channels, dst)?;
                 if let Some(c) = cache {
                     store_frames(c, path, key, &fr)?;
                 }
@@ -275,7 +277,7 @@ impl SacdDisc {
         };
         let last = tracks.last().unwrap().end;
         ensure!(last <= frames.len() as u64, "track list ends at frame {last} but the area has {} frames", frames.len());
-        Ok(SacdDisc { path: path.to_path_buf(), channels, tracks, album, frames, recent: Mutex::new(None) })
+        Ok(SacdDisc { path: path.to_path_buf(), channels, tracks, album, frames, area_end: area_audio_end, dst, recent: Mutex::new(None) })
     }
 
     pub fn track_tags(&self, i: usize) -> Tags {
@@ -298,50 +300,66 @@ impl SacdDisc {
         tg
     }
 
+    /// Coded bytes of frames [f0, f1): the audio packets between each frame's
+    /// start marker and the next one (fixed 4704*ch bytes for plain DSD,
+    /// variable for DST).
+    fn coded_frames(&self, f0: u64, f1: u64) -> Result<Vec<Vec<u8>>> {
+        let start = self.frames[f0 as usize];
+        let end = self.frames.get(f1 as usize).copied().unwrap_or((self.area_end as u32 + 1, 0));
+        let (s0, s1) = (start.0 as u64, end.0 as u64);
+        let count = s1 - s0 + 1;
+        let file = File::open(&self.path)?;
+        let mut buf = vec![0u8; (count * SECTOR) as usize];
+        let n = read_full_at(&file, &mut buf, s0 * SECTOR)?;
+        buf.truncate(n - n % SECTOR as usize);
+        let mut out: Vec<Vec<u8>> = Vec::with_capacity((f1 - f0) as usize);
+        'sectors: for i in 0..(buf.len() as u64 / SECTOR) {
+            let sec_no = s0 + i;
+            let sb = &buf[(i * SECTOR) as usize..((i + 1) * SECTOR) as usize];
+            let parsed = parse_sector(sb)?;
+            for &(po, len, dt, fs) in &parsed.packets {
+                let pos = (sec_no as u32, po as u16);
+                if pos < start {
+                    continue;
+                }
+                if pos >= end {
+                    break 'sectors;
+                }
+                if dt == DATA_AUDIO {
+                    if fs || out.is_empty() {
+                        out.push(Vec::with_capacity(FRAME_BYTES as usize * self.channels as usize));
+                    }
+                    out.last_mut().unwrap().extend_from_slice(&sb[po..po + len]);
+                }
+            }
+        }
+        ensure!(out.len() as u64 == f1 - f0, "expected {} frames, found {}", f1 - f0, out.len());
+        Ok(out)
+    }
+
     /// Per-channel DSD bytes (MSB-first, as stored) for frames [f0, f1).
     fn read_frames(&self, f0: u64, f1: u64) -> Result<Vec<Vec<u8>>> {
         let ch = self.channels as usize;
-        let need = (FRAME_BYTES as usize) * ch * (f1 - f0) as usize;
-        let mut inter: Vec<u8> = Vec::with_capacity(need);
-        let (s0, o0) = self.frames[f0 as usize];
-        let file = File::open(&self.path)?;
-        // read generously: plain DSD needs about 14/3 sectors per frame
-        let mut sector = s0 as u64;
-        let mut first = true;
-        let mut buf = Vec::new();
-        let mut buf_sector = sector;
-        while inter.len() < need {
-            if buf.is_empty() || sector >= buf_sector + (buf.len() as u64 / SECTOR) {
-                let count = (((need - inter.len()) as u64 / 1800) + 4).min(4096);
-                buf = vec![0u8; (count * SECTOR) as usize];
-                let n = read_full_at(&file, &mut buf, sector * SECTOR)?;
-                buf.truncate(n - n % SECTOR as usize);
-                ensure!(!buf.is_empty(), "unexpected end of ISO");
-                buf_sector = sector;
-            }
-            let o = ((sector - buf_sector) * SECTOR) as usize;
-            let s = &buf[o..o + SECTOR as usize];
-            let parsed = parse_sector(s)?;
-            for &(po, len, dt, _) in &parsed.packets {
-                if first && po < o0 as usize {
-                    continue;
+        let per_frame = FRAME_BYTES as usize * ch;
+        let coded = self.coded_frames(f0, f1)?;
+        let mut out = vec![Vec::with_capacity(FRAME_BYTES as usize * coded.len()); ch];
+        let mut dec = if self.dst { Some(DstDecoder::new(ch)?) } else { None };
+        let mut raw = vec![0u8; per_frame];
+        for (i, c) in coded.iter().enumerate() {
+            let inter: &[u8] = match dec.as_mut() {
+                Some(d) => {
+                    d.decode(c, &mut raw).map_err(|e| anyhow::anyhow!("frame {}: {e}", f0 + i as u64))?;
+                    &raw
                 }
-                if dt == DATA_AUDIO {
-                    let take = len.min(need - inter.len());
-                    inter.extend_from_slice(&s[po..po + take]);
-                    if inter.len() == need {
-                        break;
-                    }
+                None => {
+                    ensure!(c.len() == per_frame, "frame {} has {} bytes", f0 + i as u64, c.len());
+                    c
                 }
+            };
+            // de-interleave (byte-interleaved channels)
+            for (j, b) in inter.iter().enumerate() {
+                out[j % ch].push(*b);
             }
-            first = false;
-            sector += 1;
-        }
-        // de-interleave (byte-interleaved channels)
-        let per = need / ch;
-        let mut out = vec![Vec::with_capacity(per); ch];
-        for (i, b) in inter.iter().enumerate() {
-            out[i % ch].push(*b);
         }
         Ok(out)
     }
@@ -360,7 +378,7 @@ impl SacdDisc {
     }
 }
 
-fn scan_frames(f: &File, start: u64, end: u64, channels: u32) -> Result<Vec<(u32, u16)>> {
+fn scan_frames(f: &File, start: u64, end: u64, channels: u32, dst: bool) -> Result<Vec<(u32, u16)>> {
     let mut frames: Vec<(u32, u16)> = Vec::new();
     let frame_bytes = FRAME_BYTES as usize * channels as usize;
     let mut acc = 0usize; // audio bytes of the current frame seen so far
@@ -374,14 +392,14 @@ fn scan_frames(f: &File, start: u64, end: u64, channels: u32) -> Result<Vec<(u32
             let sec_no = s + i;
             let sb = &buf[(i * SECTOR) as usize..((i + 1) * SECTOR) as usize];
             let p = parse_sector(sb).with_context(|| format!("sector {sec_no}"))?;
-            ensure!(!p.dst, "DST-encoded sector {sec_no}");
+            ensure!(p.dst == dst, "sector {sec_no}: DST flag {} in a {} area", p.dst, if dst { "DST" } else { "plain DSD" });
             let mut tc_iter = p.frame_tcs.iter();
             for &(po, len, dt, fs) in &p.packets {
                 if dt != DATA_AUDIO {
                     continue;
                 }
                 if fs {
-                    ensure!(frames.is_empty() || acc == frame_bytes, "frame {} has {acc} bytes, expected {frame_bytes}", frames.len() - 1);
+                    ensure!(dst || frames.is_empty() || acc == frame_bytes, "frame {} has {acc} bytes, expected {frame_bytes}", frames.len() - 1);
                     let expect = frames.len() as u64;
                     if let Some(&t) = tc_iter.next() {
                         ensure!(t == expect, "sector {sec_no}: time code {t} where frame {expect} was expected");
@@ -395,7 +413,7 @@ fn scan_frames(f: &File, start: u64, end: u64, channels: u32) -> Result<Vec<(u32
         s += n;
     }
     ensure!(!frames.is_empty(), "no audio frames found");
-    ensure!(acc == frame_bytes, "last frame incomplete ({acc} bytes)");
+    ensure!(dst || acc == frame_bytes, "last frame incomplete ({acc} bytes)");
     Ok(frames)
 }
 

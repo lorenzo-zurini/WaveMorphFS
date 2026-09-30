@@ -4,8 +4,8 @@
 use crate::scan::{EntryKind, Library};
 use crate::vfile::VFile;
 use fuser::{
-    Errno, FileAttr, FileHandle, FileType, FopenFlags, Filesystem, Generation, INodeNo, LockOwner, OpenFlags, ReplyAttr, ReplyData,
-    ReplyDirectory, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyXattr, Request,
+    Errno, FileAttr, FileHandle, FileType, FopenFlags, Filesystem, Generation, INodeNo, LockOwner, OpenFlags, PollEvents, PollFlags,
+    PollNotifier, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyPoll, ReplyStatfs, ReplyXattr, Request,
 };
 use log::{debug, warn};
 use parking_lot::RwLock;
@@ -226,6 +226,15 @@ impl Filesystem for WaveFs {
                 reply.error(Errno::EIO)
             }
         }
+    }
+
+    // Read-only, static content: nothing to flush, always readable.
+    fn flush(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle, _lock_owner: LockOwner, reply: ReplyEmpty) {
+        reply.ok();
+    }
+
+    fn poll(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle, _ph: PollNotifier, events: PollEvents, _flags: PollFlags, reply: ReplyPoll) {
+        reply.poll(events);
     }
 
     fn readdir(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, mut reply: ReplyDirectory) {
