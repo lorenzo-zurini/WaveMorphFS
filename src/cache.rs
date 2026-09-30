@@ -85,6 +85,17 @@ impl Cache {
         atomic_write(&self.idx_path(src, key), &b)
     }
 
+    /// True if everything needed to present this image is already cached
+    /// (index, and for non-FLAC sources the verified conversion), so it can be
+    /// opened inline in milliseconds instead of queued.
+    pub fn image_is_cached(&self, src: &Path) -> bool {
+        let Ok(key) = SrcKey::of(src) else { return false };
+        let is_flac = src.extension().is_some_and(|e| e.eq_ignore_ascii_case("flac"));
+        let flac = if is_flac { src.to_path_buf() } else { self.converted_path(src, key) };
+        let Ok(fkey) = SrcKey::of(&flac) else { return false };
+        self.idx_path(&flac, fkey).exists()
+    }
+
     /// Index for a FLAC file, from cache or built (and cached) now.
     pub fn index_for(&self, src: &Path, meta: &FlacMeta) -> Result<FrameIndex> {
         let key = SrcKey::of(src)?;

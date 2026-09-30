@@ -422,6 +422,11 @@ fn scan_frames(f: &File, start: u64, end: u64, channels: u32, dst: bool) -> Resu
     Ok(frames)
 }
 
+/// True if the frame table of this ISO is cached (opening is then cheap).
+pub fn is_cached(c: &Cache, src: &Path) -> bool {
+    SrcKey::of(src).is_ok_and(|k| frames_cache_path(c, src, k).exists())
+}
+
 fn frames_cache_path(c: &Cache, src: &Path, key: SrcKey) -> PathBuf {
     let idx = c.dir.join("flacidx").join("x.idx");
     let dir = idx.parent().unwrap().to_path_buf();
