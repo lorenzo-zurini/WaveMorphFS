@@ -312,8 +312,11 @@ impl Library {
             self.images.lock().insert(src.to_path_buf(), (key, st.clone()));
             return st;
         }
+        // Cached work is cheap to reopen: do it inline so albums never vanish
+        // from a listing just because the process restarted.
+        let cached = self.cache.image_is_cached(src);
         self.images.lock().insert(src.to_path_buf(), (key, Work::Pending));
-        if self.enqueue(Job::Image { src: src.to_path_buf(), dir: dir.to_path_buf() }) {
+        if !cached && self.enqueue(Job::Image { src: src.to_path_buf(), dir: dir.to_path_buf() }) {
             return Work::Pending;
         }
         // inline mode
@@ -344,8 +347,9 @@ impl Library {
             self.sacds.lock().insert(src.to_path_buf(), (key, st.clone()));
             return st;
         }
+        let cached = sacd::is_cached(&self.cache, src);
         self.sacds.lock().insert(src.to_path_buf(), (key, Work::Pending));
-        if self.enqueue(Job::Sacd { src: src.to_path_buf(), dir: dir.to_path_buf() }) {
+        if !cached && self.enqueue(Job::Sacd { src: src.to_path_buf(), dir: dir.to_path_buf() }) {
             return Work::Pending;
         }
         let st = match SacdDisc::open(src, Some(&self.cache)) {
