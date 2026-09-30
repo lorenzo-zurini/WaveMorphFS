@@ -179,7 +179,8 @@ impl Cache {
             9..=16 => ("pcm_s16le", "s16le"),
             _ => ("pcm_s24le", "s24le"),
         };
-        let tmp = out.with_extension("flac.tmp");
+        // unique per process+thread, and ending in .flac because the flac CLI wants that
+        let tmp = PathBuf::from(format!("{}.flac", unique_tmp(&out).display()));
         // decode with ffmpeg, encode with the reference encoder
         let status = Command::new("sh")
             .arg("-c")
@@ -208,6 +209,11 @@ impl Cache {
             bail!("PCM MD5 mismatch after converting {} ({src_md5} vs {got})", src.display());
         }
         ensure!(SrcKey::of(src)? == key, "{} changed during conversion", src.display());
+        if out.exists() {
+            // another process finished the same conversion first; keep theirs
+            let _ = std::fs::remove_file(&tmp);
+            return Ok(out);
+        }
         std::fs::rename(&tmp, &out)?;
         // source tags (APEv2 etc.) for later use as album-level tags
         let tags = Command::new("ffprobe")
@@ -233,8 +239,17 @@ fn parse_ffprobe_tags(b: &[u8]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// A temp path next to `path` that is unique to this process and thread, so
+/// concurrent writers (the mount service and a CLI run) never share a temp file.
+pub fn unique_tmp(path: &Path) -> PathBuf {
+    let tid = format!("{:?}", std::thread::current().id()).chars().filter(|c| c.is_ascii_digit()).collect::<String>();
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".tmp.{}.{tid}", std::process::id()));
+    path.with_file_name(name)
+}
+
 pub fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("tmp");
+    let tmp = unique_tmp(path);
     std::fs::write(&tmp, data).with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, path)?;
     Ok(())
