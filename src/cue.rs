@@ -123,9 +123,12 @@ impl CueSheet {
         if sheet.tracks.is_empty() {
             bail!("no audio tracks");
         }
-        for w in sheet.tracks.windows(2) {
-            if w[1].index01 <= w[0].index01 {
-                bail!("track {} INDEX 01 is not after track {}", w[1].number, w[0].number);
+        // INDEX positions are relative to each FILE, so ordering only applies to single-file sheets
+        if sheet.files.len() == 1 {
+            for w in sheet.tracks.windows(2) {
+                if w[1].index01 <= w[0].index01 {
+                    bail!("track {} INDEX 01 is not after track {}", w[1].number, w[0].number);
+                }
             }
         }
         Ok(sheet)
