@@ -379,7 +379,9 @@ Tags read_tags(std::span<const uint8_t> tag) {
             if (body->size() < 4) continue;
             auto [d, text] = split_terminated(enc, body->subspan(4));
             if (id == "COMM" && !decode_text(enc, d).empty()) continue;  // described comments are not "the" comment
-            t.add(id == "COMM" ? "COMMENT" : "LYRICS", decode_text(enc, text));
+            std::string v = decode_text(enc, text);
+            while (!v.empty() && v.back() == '\0') v.pop_back();  // optional terminator
+            t.add(id == "COMM" ? "COMMENT" : "LYRICS", v);
         } else if (id == "TRCK" || id == "TPOS") {
             auto vs = values(*body);
             if (vs.empty()) continue;
