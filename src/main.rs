@@ -229,7 +229,7 @@ fn main() -> Result<()> {
                 bail!("no taggable audio files in {}", dir.display());
             }
             let mut album = per[0].1.clone();
-            album.0.retain(|k, v| per.iter().all(|(_, t)| t.0.get(k) == Some(v)) && !tags::TRACK_SPECIFIC.contains(&k.as_str()));
+            album.0.retain(|k, v| per.iter().all(|(_, t)| t.0.get(k) == Some(v)) && !tags::TRACK_SPECIFIC.iter().any(|n| k.is(n)));
             let files: Vec<(String, tags::Tags)> = per
                 .into_iter()
                 .map(|(n, mut t)| {

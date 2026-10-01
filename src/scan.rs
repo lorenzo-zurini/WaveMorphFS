@@ -705,7 +705,7 @@ impl Library {
                 }
             }
             if tg.get("ARTIST").is_none()
-                && let Some(aa) = tg.0.get("ALBUMARTIST").cloned()
+                && let Some(aa) = tg.get_all("ALBUMARTIST").cloned()
             {
                 tg.set_many("ARTIST", aa);
             }
