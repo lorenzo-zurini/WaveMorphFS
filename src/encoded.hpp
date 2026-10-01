@@ -8,6 +8,8 @@
 #pragma once
 
 #include <array>
+#include <future>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -35,7 +37,7 @@ std::optional<std::vector<TrackLayout>> load_layout(const AvImage& img, const Ra
 /// Encode every track once to measure it; stores the result in the cache.
 std::vector<TrackLayout> build_layout(const AvImage& img, const Ranges& ranges, const Cache* cache);
 
-class EncodedTrack : public VFile {
+class EncodedTrack : public VFile, public std::enable_shared_from_this<EncodedTrack> {
 public:
     EncodedTrack(std::shared_ptr<const AvImage> img, uint64_t start, uint64_t end, const Tags& tags, const TrackLayout& layout);
     uint64_t size() const override { return size_; }
@@ -43,13 +45,26 @@ public:
     std::string describe() const override;
 
 private:
+    using Frame = std::shared_ptr<const Bytes>;
+    using Promises = std::vector<std::pair<uint64_t, std::shared_ptr<std::promise<Frame>>>>;
+    /// Claim the frames of [a, b) nobody is producing yet (mu_ held).
+    Promises claim(uint64_t a, uint64_t b) const;
+    /// Decode and encode claimed frames, fulfilling their promises.
+    void produce(const Promises& ps) const;
+
     std::shared_ptr<const AvImage> img_;
     uint64_t start_, end_;
     Bytes header_;
     std::vector<uint32_t> offsets_;  // frame start offsets relative to the audio, + end
     uint64_t size_;
     mutable std::mutex mu_;
-    mutable std::vector<std::pair<uint64_t, std::shared_ptr<const Bytes>>> recent_;  // encoded frames
+    struct Cached {
+        std::shared_future<Frame> frame;
+        uint64_t used;
+    };
+    mutable std::map<uint64_t, Cached> frames_;  // encoded (or encoding) frames
+    mutable uint64_t clock_ = 0;
+    mutable uint64_t last_end_ = UINT64_MAX;  // frame after the previous read (mu_)
 };
 
 }  // namespace wm

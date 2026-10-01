@@ -20,7 +20,11 @@ namespace wm {
 namespace {
 
 const char INDEX_MAGIC[8] = {'W', 'M', 'A', 'V', 'I', 'X', '0', '1'};
-constexpr size_t RECENT = 6;
+/// decoded packets kept per image (APE: up to 294912 samples each)
+constexpr size_t CACHE_PACKETS = 24;
+/// decode this many samples beyond the one being read, in parallel (~30 s at 44.1 kHz)
+constexpr uint64_t READ_AHEAD_SAMPLES = 1'500'000;
+constexpr size_t MAX_DECODERS = 8;
 
 std::string av_err(int e) {
     char buf[AV_ERROR_MAX_STRING_SIZE] = {};
@@ -196,58 +200,122 @@ std::shared_ptr<AvImage> AvImage::open(const fs::path& p, const Cache* cache) {
     return img;
 }
 
-AvImage::Samples AvImage::packet_samples(size_t k) const {
-    std::lock_guard g(mu_);
-    for (auto it = recent_.begin(); it != recent_.end(); ++it)
-        if (it->first == k) {
-            auto v = it->second;
-            recent_.erase(it);
-            recent_.emplace_back(k, v);
-            return v;
+std::unique_ptr<AvImage::Decoder> AvImage::take_decoder() const {
+    {
+        std::lock_guard g(mu_);
+        if (!idle_.empty()) {
+            auto d = std::move(idle_.back());
+            idle_.pop_back();
+            return d;
         }
-    if (!dec_) dec_ = std::make_unique<Decoder>(path);
-    auto& d = *dec_;
+    }
+    return std::make_unique<Decoder>(path);
+}
+
+void AvImage::give_decoder(std::unique_ptr<Decoder> d) const {
+    std::lock_guard g(mu_);
+    if (idle_.size() < MAX_DECODERS) idle_.push_back(std::move(d));
+}
+
+AvImage::Samples AvImage::decode_packet(size_t k) const {
+    auto d = take_decoder();
     const auto& want = packets_[k];
-    int r = av_seek_frame(d.fmt, d.stream, want.pts, AVSEEK_FLAG_BACKWARD);
+    int r = av_seek_frame(d->fmt, d->stream, want.pts, AVSEEK_FLAG_BACKWARD);
     if (r < 0) fail("{}: seek to packet {} failed: {}", path.string(), k, av_err(r));
-    avcodec_flush_buffers(d.codec);
+    avcodec_flush_buffers(d->codec);
     auto out = std::make_shared<PerChannel>(channels);
     while (true) {
-        r = av_read_frame(d.fmt, d.pkt);
-        if (r < 0) {
-            dec_.reset();
-            fail("{}: packet {} not found after seeking: {}", path.string(), k, av_err(r));
-        }
-        if (d.pkt->stream_index != d.stream || d.pkt->pts < want.pts) {
-            av_packet_unref(d.pkt);
+        r = av_read_frame(d->fmt, d->pkt);
+        if (r < 0) fail("{}: packet {} not found after seeking: {}", path.string(), k, av_err(r));
+        if (d->pkt->stream_index != d->stream || d->pkt->pts < want.pts) {
+            av_packet_unref(d->pkt);
             continue;
         }
-        if (d.pkt->pts > want.pts) {
-            av_packet_unref(d.pkt);
-            dec_.reset();
+        if (d->pkt->pts > want.pts) {
+            av_packet_unref(d->pkt);
             fail("{}: seeking overshot packet {}", path.string(), k);
         }
         try {
-            d.decode_current(*out);
+            d->decode_current(*out);
         } catch (...) {
-            av_packet_unref(d.pkt);
-            dec_.reset();
-            throw;
+            av_packet_unref(d->pkt);
+            throw;  // the decoder is dropped: its state is unknown
         }
-        av_packet_unref(d.pkt);
+        av_packet_unref(d->pkt);
         break;
     }
-    // a packet's samples may come out over several frames; the count is known from indexing
-    if (k + 1 == packets_.size()) {
-        avcodec_send_packet(d.codec, nullptr);
-        while (avcodec_receive_frame(d.codec, d.frame) >= 0) d.take(*out);
-        dec_.reset();  // the decoder is drained; reopen for the next read
+    bool drained = false;
+    if (k + 1 == packets_.size()) {  // the last packet's samples may need a flush
+        avcodec_send_packet(d->codec, nullptr);
+        while (avcodec_receive_frame(d->codec, d->frame) >= 0) d->take(*out);
+        drained = true;
     }
     WM_ENSURE((*out)[0].size() == want.count, "{}: packet {} decoded to {} samples, expected {}", path.string(), k, (*out)[0].size(), want.count);
-    Samples v = out;
-    recent_.emplace_back(k, v);
-    if (recent_.size() > RECENT) recent_.erase(recent_.begin());
-    return v;
+    if (!drained) give_decoder(std::move(d));
+    return out;
+}
+
+std::shared_future<AvImage::Samples> AvImage::start(size_t k, std::shared_ptr<std::promise<Samples>>* claimed) const {
+    if (auto it = cache_.find(k); it != cache_.end()) {
+        it->second.used = ++clock_;
+        return it->second.samples;
+    }
+    auto promise = std::make_shared<std::promise<Samples>>();
+    std::shared_future<Samples> f = promise->get_future().share();
+    cache_[k] = {f, ++clock_};
+    // bounded: drop the least recently used finished entries
+    while (cache_.size() > CACHE_PACKETS) {
+        auto victim = cache_.end();
+        for (auto it = cache_.begin(); it != cache_.end(); ++it)
+            if (it->first != k && it->second.samples.wait_for(std::chrono::seconds(0)) == std::future_status::ready &&
+                (victim == cache_.end() || it->second.used < victim->second.used))
+                victim = it;
+        if (victim == cache_.end()) break;
+        cache_.erase(victim);
+    }
+    if (claimed) {
+        *claimed = promise;  // the caller decodes it itself
+        return f;
+    }
+    submit([this, self = shared_from_this(), k, promise] { fulfil(k, *promise); });
+    return f;
+}
+
+void AvImage::fulfil(size_t k, std::promise<Samples>& promise) const {
+    try {
+        promise.set_value(decode_packet(k));
+    } catch (...) {
+        promise.set_exception(std::current_exception());
+        std::lock_guard g(mu_);
+        cache_.erase(k);  // let a later read retry
+    }
+}
+
+void AvImage::prefetch_after(size_t k) const {
+    if (weak_from_this().expired()) return;  // not shared: no background work
+    std::lock_guard g(mu_);
+    uint64_t ahead = 0;
+    for (size_t j = k + 1; j < packets_.size() && ahead < READ_AHEAD_SAMPLES; j++) {
+        ahead += packets_[j].count;
+        start(j, nullptr);
+    }
+}
+
+AvImage::Samples AvImage::packet_samples(size_t k) const {
+    // the packet being read is decoded right here if nobody has started it (pool
+    // threads only ever do read-ahead, so they never wait on each other)
+    std::shared_future<Samples> f;
+    std::shared_ptr<std::promise<Samples>> mine;
+    bool sequential;
+    {
+        std::lock_guard g(mu_);
+        sequential = last_packet_ != SIZE_MAX && (k == last_packet_ || k == last_packet_ + 1);
+        last_packet_ = k;
+        f = start(k, &mine);
+    }
+    if (sequential) prefetch_after(k);  // a reader moving forward: decode ahead in parallel
+    if (mine) fulfil(k, *mine);
+    return f.get();
 }
 
 std::vector<std::vector<int32_t>> AvImage::decode_range(uint64_t s, uint64_t e) const {

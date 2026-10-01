@@ -9,6 +9,8 @@
 #pragma once
 
 #include <array>
+#include <future>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -20,7 +22,7 @@ namespace wm {
 
 class Cache;
 
-class AvImage {
+class AvImage : public std::enable_shared_from_this<AvImage> {
 public:
     /// Open (index from the cache, or verified and indexed now).
     static std::shared_ptr<AvImage> open(const fs::path& p, const Cache* cache);
@@ -46,12 +48,27 @@ public:
 
 private:
     using Samples = std::shared_ptr<const std::vector<std::vector<int32_t>>>;
+    /// Samples of packet k, decoding it (and queueing read-ahead) if needed.
     Samples packet_samples(size_t k) const;
+    /// Cached or in-flight packet k; otherwise queued on the pool, or with
+    /// `claimed` handed to the caller to decode. mu_ held.
+    std::shared_future<Samples> start(size_t k, std::shared_ptr<std::promise<Samples>>* claimed) const;
+    void fulfil(size_t k, std::promise<Samples>& promise) const;
+    void prefetch_after(size_t k) const;
+    Samples decode_packet(size_t k) const;
+    std::unique_ptr<Decoder> take_decoder() const;
+    void give_decoder(std::unique_ptr<Decoder> d) const;
 
     std::vector<Packet> packets_;
     mutable std::mutex mu_;
-    mutable std::unique_ptr<Decoder> dec_;                  // for random access, guarded by mu_
-    mutable std::vector<std::pair<size_t, Samples>> recent_;  // small LRU of decoded packets
+    mutable std::vector<std::unique_ptr<Decoder>> idle_;  // decoders not in use
+    struct Cached {
+        std::shared_future<Samples> samples;
+        uint64_t used;
+    };
+    mutable std::map<size_t, Cached> cache_;  // decoded (or decoding) packets
+    mutable uint64_t clock_ = 0;
+    mutable size_t last_packet_ = SIZE_MAX;  // most recent packet a reader asked for (mu_)
 };
 
 }  // namespace wm

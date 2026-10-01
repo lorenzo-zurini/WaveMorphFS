@@ -114,11 +114,16 @@ void fill_file(struct stat* st, uint64_t size, int64_t mtime, bool writable) {
     st->st_mtim = st->st_atim = st->st_ctim = ts(mtime);
 }
 
-void* op_init(struct fuse_conn_info*, struct fuse_config* cfg) {
+void* op_init(struct fuse_conn_info* conn, struct fuse_config* cfg) {
     cfg->entry_timeout = TTL;
     cfg->attr_timeout = TTL;
     cfg->negative_timeout = TTL;
-    cfg->kernel_cache = 0;
+    // keep the kernel's page cache across opens unless size or mtime changed
+    // (both change when the content does: sidecar edits, new processing results)
+    cfg->auto_cache = 1;
+    // 1 MiB requests and read-ahead instead of 128 KiB: fewer round trips
+    conn->max_write = 1u << 20;
+    conn->max_readahead = 1u << 20;
     return nullptr;
 }
 

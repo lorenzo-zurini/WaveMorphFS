@@ -17,6 +17,9 @@ constexpr uint64_t SECTOR = 2048;
 constexpr uint64_t MASTER_TOC = 510;
 constexpr uint64_t DSF_BLOCK = 4096;
 constexpr uint8_t DATA_AUDIO = 2;
+/// decoded chunks kept per disc, and decoded ahead of the reader
+constexpr size_t CACHE_CHUNKS = 160;
+constexpr uint64_t AHEAD_CHUNKS = 48;  // ~5 s of audio, decoded in parallel
 const char IDX_MAGIC_V1[8] = {'W', 'M', 'S', 'A', 'C', 'D', '0', '1'};  // frame starts only
 const char IDX_MAGIC[8] = {'W', 'M', 'S', 'A', 'C', 'D', '0', '2'};     // frame starts + end marker
 
@@ -403,15 +406,77 @@ std::vector<Bytes> SacdDisc::read_frames(uint64_t f0, uint64_t f1) const {
     return out;
 }
 
-std::pair<uint64_t, std::shared_ptr<const std::vector<Bytes>>> SacdDisc::channel_bytes(uint64_t f_first, uint64_t f_last) const {
+std::shared_future<SacdDisc::Chunk> SacdDisc::start(uint64_t c, std::shared_ptr<std::promise<Chunk>>* claimed) const {
+    if (auto it = chunks_.find(c); it != chunks_.end()) {
+        it->second.used = ++clock_;
+        return it->second.data;
+    }
+    auto p = std::make_shared<std::promise<Chunk>>();
+    std::shared_future<Chunk> f = p->get_future().share();
+    chunks_[c] = {f, ++clock_};
+    while (chunks_.size() > CACHE_CHUNKS) {
+        auto victim = chunks_.end();
+        for (auto it = chunks_.begin(); it != chunks_.end(); ++it)
+            if (it->first != c && it->second.data.wait_for(std::chrono::seconds(0)) == std::future_status::ready &&
+                (victim == chunks_.end() || it->second.used < victim->second.used))
+                victim = it;
+        if (victim == chunks_.end()) break;
+        chunks_.erase(victim);
+    }
+    if (claimed) {
+        *claimed = p;
+    } else {
+        submit([self = shared_from_this(), c, p] {
+            {
+                // read-ahead nobody is near any more (the reader seeked away): skip it
+                std::lock_guard g(self->mu_);
+                if (c + 1 < self->last_wanted_ || c > self->last_wanted_ + AHEAD_CHUNKS + 1) {
+                    self->chunks_.erase(c);
+                    p->set_exception(std::make_exception_ptr(Error("cancelled read-ahead")));
+                    return;
+                }
+            }
+            self->fulfil(c, *p);
+        }, Lane::Decode);
+    }
+    return f;
+}
+
+void SacdDisc::fulfil(uint64_t c, std::promise<Chunk>& p) const {
+    try {
+        uint64_t f0 = c * CHUNK_FRAMES, f1 = std::min<uint64_t>((c + 1) * CHUNK_FRAMES, frames_.size() - 1);
+        p.set_value(std::make_shared<const std::vector<Bytes>>(read_frames(f0, f1)));
+    } catch (...) {
+        p.set_exception(std::current_exception());
+        std::lock_guard g(mu_);
+        chunks_.erase(c);
+    }
+}
+
+SacdDisc::Chunk SacdDisc::chunk(uint64_t c) const {
+  for (int attempt = 0;; attempt++) {
+    std::shared_future<Chunk> f;
+    std::shared_ptr<std::promise<Chunk>> mine;
+    bool shared = !weak_from_this().expired();
     {
         std::lock_guard g(mu_);
-        if (recent_ && recent_->first <= f_first && recent_->first + (*recent_->second)[0].size() / SACD_FRAME_BYTES >= f_last) return *recent_;
+        // read-ahead only for a reader moving forward (not for one-off reads such as
+        // a music server's tag scan, or random seeks)
+        bool sequential = c == last_wanted_ + 1 || (c == last_wanted_ && c > 0);
+        last_wanted_ = c;
+        f = start(c, &mine);
+        // read-ahead: DST decoding is the slow part, and chunks decode in parallel
+        if (shared && sequential)
+            for (uint64_t k = c + 1; k < std::min(nchunks(), c + 1 + AHEAD_CHUNKS); k++) start(k, nullptr);
     }
-    auto v = std::make_shared<const std::vector<Bytes>>(read_frames(f_first, f_last));
-    std::lock_guard g(mu_);
-    recent_ = {f_first, v};
-    return *recent_;
+    if (mine) fulfil(c, *mine);
+    try {
+        return f.get();
+    } catch (const Error& e) {
+        // a read-ahead job for this chunk was cancelled before the reader came back to it
+        if (attempt > 2 || std::string(e.what()) != "cancelled read-ahead") throw;
+    }
+  }
 }
 
 DsfTrack::DsfTrack(std::shared_ptr<const SacdDisc> disc, size_t track, const Tags& tags) : disc_(std::move(disc)) {
@@ -444,26 +509,35 @@ DsfTrack::DsfTrack(std::shared_ptr<const SacdDisc> disc, size_t track, const Tag
 }
 
 void DsfTrack::read_data(uint64_t a, uint64_t b, Bytes& out) const {
-    uint64_t ch = disc_->channels, group = DSF_BLOCK * ch;
-    uint64_t g0 = a / group, g1 = (b - 1) / group;
-    // channel byte range needed
-    uint64_t j0 = g0 * DSF_BLOCK, j1 = std::min((g1 + 1) * DSF_BLOCK, bytes_per_ch_);
-    std::pair<uint64_t, std::shared_ptr<const std::vector<Bytes>>> frames{0, nullptr};
-    if (j0 < j1) frames = disc_->channel_bytes(f0_ + j0 / SACD_FRAME_BYTES, f0_ + (j1 + SACD_FRAME_BYTES - 1) / SACD_FRAME_BYTES);
+    const uint64_t ch = disc_->channels, group = DSF_BLOCK * ch;
+    const uint64_t chunk_bytes = SacdDisc::CHUNK_FRAMES * SACD_FRAME_BYTES;  // per channel
+    const uint64_t base = f0_ * SACD_FRAME_BYTES;  // the track's first byte within the area
+    size_t o = out.size();
+    out.resize(o + size_t(b - a));
+    uint8_t* dst = out.data() + o;
+    uint64_t have_chunk = UINT64_MAX;
+    SacdDisc::Chunk data;
     for (uint64_t pos = a; pos < b;) {
-        uint64_t g = pos / group, c = (pos % group) / DSF_BLOCK, i = pos % DSF_BLOCK;
+        uint64_t c = (pos % group) / DSF_BLOCK, i = pos % DSF_BLOCK;
         uint64_t run = std::min(DSF_BLOCK - i, b - pos);
-        uint64_t j = g * DSF_BLOCK + i;  // channel byte index
-        for (uint64_t k = 0; k < run; k++) {
-            uint64_t jj = j + k;
-            if (jj < bytes_per_ch_) {
-                uint64_t idx = (f0_ * SACD_FRAME_BYTES + jj) - frames.first * SACD_FRAME_BYTES;
-                out.push_back(BITREV[(*frames.second)[size_t(c)][size_t(idx)]]);
-            } else {
-                out.push_back(0);
+        uint64_t jj = (pos / group) * DSF_BLOCK + i;  // byte index within the track's channel
+        while (run > 0) {
+            if (jj >= bytes_per_ch_) {  // the last block is zero-padded
+                std::memset(dst, 0, size_t(run));
+                dst += run, pos += run, run = 0;
+                break;
             }
+            uint64_t J = base + jj, k = J / chunk_bytes, off = J - k * chunk_bytes;
+            if (k != have_chunk) {
+                data = disc_->chunk(k);
+                have_chunk = k;
+            }
+            const Bytes& src = (*data)[size_t(c)];
+            uint64_t n = std::min({run, uint64_t(src.size()) - off, bytes_per_ch_ - jj});
+            const uint8_t* s = src.data() + off;
+            for (uint64_t x = 0; x < n; x++) dst[x] = BITREV[s[x]];
+            dst += n, pos += n, jj += n, run -= n;
         }
-        pos += run;
     }
 }
 

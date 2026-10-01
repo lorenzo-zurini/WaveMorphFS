@@ -9,6 +9,8 @@
 // MSB-first, DSF LSB-first). Audio bits are untouched.
 #pragma once
 
+#include <future>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -32,7 +34,7 @@ struct SacdTrack {
     std::optional<std::string> title, performer, songwriter, composer, arranger;
 };
 
-class SacdDisc {
+class SacdDisc : public std::enable_shared_from_this<SacdDisc> {
 public:
     /// Open the stereo area, or with `multichannel` the multichannel area.
     static std::shared_ptr<SacdDisc> open(const fs::path& p, const Cache* cache, bool multichannel);
@@ -44,17 +46,30 @@ public:
     bool dst = false;
 
     Tags track_tags(size_t i) const;
-    /// Per-channel DSD bytes for frames [f_first, f_last) (with a small cache):
-    /// (first frame actually returned, bytes per channel).
-    std::pair<uint64_t, std::shared_ptr<const std::vector<Bytes>>> channel_bytes(uint64_t f_first, uint64_t f_last) const;
+
+    /// audio frames per decoded chunk
+    static constexpr uint64_t CHUNK_FRAMES = 8;
+    using Chunk = std::shared_ptr<const std::vector<Bytes>>;  // per-channel DSD bytes (MSB-first)
+    /// Chunk c (frames [c*CHUNK_FRAMES, ...)), decoded here if nobody has started
+    /// it; the following chunks are decoded ahead in the background.
+    Chunk chunk(uint64_t c) const;
 
 private:
     std::vector<Bytes> coded_frames(uint64_t f0, uint64_t f1) const;
     std::vector<Bytes> read_frames(uint64_t f0, uint64_t f1) const;
+    std::shared_future<Chunk> start(uint64_t c, std::shared_ptr<std::promise<Chunk>>* claimed) const;  // mu_ held
+    void fulfil(uint64_t c, std::promise<Chunk>& p) const;
+    uint64_t nchunks() const { return (frames_.size() - 1 + CHUNK_FRAMES - 1) / CHUNK_FRAMES; }
     /// per frame: (sector, byte offset of the frame's first audio packet); ends with an end marker
     std::vector<std::pair<uint32_t, uint16_t>> frames_;
     mutable std::mutex mu_;
-    mutable std::optional<std::pair<uint64_t, std::shared_ptr<const std::vector<Bytes>>>> recent_;
+    struct Cached {
+        std::shared_future<Chunk> data;
+        uint64_t used;
+    };
+    mutable std::map<uint64_t, Cached> chunks_;
+    mutable uint64_t clock_ = 0;
+    mutable uint64_t last_wanted_ = 0;  // most recent chunk a reader asked for (mu_)
 };
 
 /// One SACD track as a DSF file.
