@@ -84,7 +84,7 @@ The `Dockerfile` builds and tests it on Debian and runs the mount in a container
 ```sh
 # mount (roots default to ~/Storage/Music and ~/Storage/Classical Music)
 wavemorphfs --root "Music=~/Storage/Music" --root "Classical Music=~/Storage/Classical Music" \
-    mount ~/Storage/WaveMorph/mnt --allow-other
+    mount ~/Storage/Stacks/lgzcloud-navidrome/wavemorph/mnt --allow-other
 
 wavemorphfs ls <source dir>                  # what a folder looks like through the fs
 wavemorphfs verify <source dir>              # validate its virtual tracks with flac/ffmpeg

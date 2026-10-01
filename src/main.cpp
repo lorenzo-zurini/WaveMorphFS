@@ -45,8 +45,8 @@ commands:
 global options:
   --root NAME=PATH          library root (repeatable; default ~/Storage/Music, ~/Storage/Classical Music)
   --tags-dir DIR            sidecar tag trees: <tags-dir>/<root name>/<relative dir>/wavemorph.json
-                            (default ~/Storage/WaveMorph/tags)
-  --cache-dir DIR           frame/packet indexes (default ~/Storage/WaveMorph/cache)
+                            (default ~/Storage/Stacks/lgzcloud-navidrome/wavemorph/tags)
+  --cache-dir DIR           frame/packet indexes (default ~/Storage/Stacks/lgzcloud-navidrome/wavemorph/cache)
 
 environment: WAVEMORPH_LOG=debug|info|warn|error
 )USAGE";
@@ -68,8 +68,8 @@ bool env_true(const char* name) {
 
 struct Cli {
     std::vector<Root> roots;
-    std::string tags_dir = "~/Storage/WaveMorph/tags";
-    std::string cache_dir = "~/Storage/WaveMorph/cache";
+    std::string tags_dir = "~/Storage/Stacks/lgzcloud-navidrome/wavemorph/tags";
+    std::string cache_dir = "~/Storage/Stacks/lgzcloud-navidrome/wavemorph/cache";
     std::string cmd;
     std::vector<std::string> pos;
     size_t workers = 2, threads = 8;
