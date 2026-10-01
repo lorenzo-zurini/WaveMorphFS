@@ -17,6 +17,7 @@ static Tags table_to_tags(const json& t) {
     Tags tags;
     if (!t.is_object()) return tags;
     for (auto& [k, v] : t.items()) {
+        if (!k.empty() && k[0] == '_') continue;  // not a tag
         std::vector<std::string> vals;
         if (v.is_array())
             for (auto& x : v) vals.push_back(value_str(x));
@@ -39,8 +40,12 @@ Sidecar Sidecar::parse(const std::string& text) {
     for (auto [section, target] : {std::pair{"track", &sc.tracks}, std::pair{"file", &sc.files}}) {
         auto s = doc.find(section);
         if (s == doc.end() || !s->is_object()) continue;
-        for (auto& [k, v] : s->items())
-            if (v.is_object()) (*target)[k] = table_to_tags(v);
+        for (auto& [k, v] : s->items()) {
+            if (!v.is_object()) continue;
+            (*target)[k] = table_to_tags(v);
+            if (target == &sc.tracks)
+                if (auto n = v.find("_name"); n != v.end() && n->is_string() && !n->get<std::string>().empty()) sc.track_names[k] = n->get<std::string>();
+        }
     }
     return sc;
 }
@@ -59,6 +64,7 @@ std::optional<Sidecar> Sidecar::load(const fs::path& src_dir, const std::optiona
         out->album.overlay(sc.album);
         for (auto& [k, v] : sc.tracks) out->tracks[k].overlay(v);
         for (auto& [k, v] : sc.files) out->files[k].overlay(v);
+        for (auto& [k, v] : sc.track_names) out->track_names[k] = v;
         out->mtime = std::max(out->mtime.value_or(*m), *m);
         out->sources.push_back(p);
     }
@@ -74,6 +80,15 @@ const Tags* Sidecar::track(std::optional<uint32_t> disc, uint32_t n) const {
     }
     for (auto& k : keys)
         if (auto it = tracks.find(k); it != tracks.end()) return &it->second;
+    return nullptr;
+}
+
+const std::string* Sidecar::track_name(std::optional<uint32_t> disc, uint32_t n) const {
+    std::vector<std::string> keys;
+    if (disc) keys = {std::format("{}-{}", *disc, n), std::format("{}-{:02}", *disc, n), std::format("{}.{}", *disc, n)};
+    else keys = {std::to_string(n), std::format("{:02}", n)};
+    for (auto& k : keys)
+        if (auto it = track_names.find(k); it != track_names.end()) return &it->second;
     return nullptr;
 }
 

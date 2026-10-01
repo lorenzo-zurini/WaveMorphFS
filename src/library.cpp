@@ -345,6 +345,8 @@ void Library::apply_edit(const fs::path& dir, const std::string& file_name, cons
     if (!doc.contains(section) || !doc[section].is_object()) doc[section] = json::object();
     json& entry = doc[section][key];
     if (!entry.is_object()) entry = json::object();
+    // pin the file name: retitling must not move the file under the editor
+    if (section == "track" && !entry.contains("_name")) entry["_name"] = file_name;
     auto erase_field = [](json& obj, const std::string& k, const std::string& keep) {
         std::vector<std::string> drop;
         for (auto& [ek, ev] : obj.items())
@@ -801,6 +803,8 @@ std::optional<std::vector<Entry>> Library::image_tracks(const fs::path& dir, con
         std::string title = title_v ? sanitize_name(*title_v) : std::format("Track {:02}", t.number);
         std::string name = multi && disc ? std::format("{}-{:02} - {}.flac", *disc, t.number, title) : std::format("{:02} - {}.flac", t.number, title);
         if (sidecar)
+            if (auto pinned = sidecar->track_name(multi ? disc : std::nullopt, t.number)) name = *pinned;
+        if (sidecar)
             if (auto ft = sidecar->file(name)) tg.overlay(*ft);
         std::string key = multi && disc ? std::format("{}-{:02}", *disc, t.number) : std::to_string(t.number);
         if (ready.av) {
@@ -841,6 +845,8 @@ std::vector<Entry> Library::sacd_tracks(const std::shared_ptr<const SacdDisc>& d
         std::string title = title_v ? sanitize_name(*title_v) : std::format("Track {:02}", num);
         std::string prefix = mc ? "MC " : "";
         std::string name = disc_no ? std::format("{}{}-{:02} - {}.dsf", prefix, *disc_no, num, title) : std::format("{}{:02} - {}.dsf", prefix, num, title);
+        if (sidecar && !mc)
+            if (auto pinned = sidecar->track_name(disc_no, num)) name = *pinned;
         if (sidecar)
             if (auto ft = sidecar->file(name)) tg.overlay(*ft);
         std::string key = disc_no ? std::format("{}-{:02}", *disc_no, num) : std::to_string(num);
