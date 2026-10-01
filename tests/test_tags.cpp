@@ -75,6 +75,15 @@ TEST(sidecar_parse_and_lookup) {
     CHECK_MSG(base.get("COMMENT") == nullptr, "removal applied");
 }
 
+TEST(sidecar_pinned_track_names) {
+    auto sc = Sidecar::parse(R"({"track": {"3": {"_name": "03 - Old.flac", "TITLE": "New"}, "2-05": {"_name": "x.dsf"}}})");
+    CHECK(*sc.track_name(std::nullopt, 3) == "03 - Old.flac");
+    CHECK(*sc.track_name(2, 5) == "x.dsf");
+    CHECK(sc.track_name(std::nullopt, 4) == nullptr);
+    CHECK_MSG(sc.track(std::nullopt, 3)->get("_name") == nullptr, "_name is not a tag");
+    CHECK(*sc.track(std::nullopt, 3)->get("TITLE") == "New");
+}
+
 TEST(sidecar_names_kept_verbatim) {
     auto sc = Sidecar::parse(R"({"file": {"01 - Song.m4a": {"MusicBrainz Album Id": "abc", "album_artist": "Someone", "TXXX:Custom/Tag": "v"}}})");
     auto f = sc.file("01 - Song.m4a");
