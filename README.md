@@ -76,7 +76,10 @@ build/wavemorphfs-tests      # unit tests (need the flac tool)
 ```
 
 The `Dockerfile` builds and tests it on Debian and runs the mount in a container;
-see [Running with Docker](#running-with-docker).
+see [Running with Docker](#running-with-docker). Images for amd64 and arm64 are
+published as `ghcr.io/lorenzo-zurini/wavemorphfs`: `:latest` and `:X.Y.Z` for
+releases, `:edge` for the main branch. To build your own, replace `image:` in
+the compose file with `build: <path to this repository>`.
 
 ## Running with Docker
 
@@ -101,10 +104,8 @@ music-stack/
 # docker-compose.yml
 services:
   wavemorphfs:
-    build: ./WaveMorphFS          # a checkout of this repository
-    image: wavemorphfs:latest
+    image: ghcr.io/lorenzo-zurini/wavemorphfs:latest   # amd64 and arm64
     container_name: wavemorphfs
-    user: 1000:1000               # owner of wavemorph/ (see note below)
     devices:
       - /dev/fuse
     cap_add:
@@ -112,31 +113,26 @@ services:
     security_opt:
       - apparmor:unconfined       # AppArmor blocks FUSE mounts in containers
     environment:
-      - WAVEMORPH_LOG=info
-      - WAVEMORPH_MOUNT=/wavemorph/mnt
+      # the user the filesystem runs as: owner of wavemorph/, able to read the downloads
+      - PUID=1000
+      - PGID=1000
       # also expose SACD multichannel areas as "(Multichannel)" albums
       - WAVEMORPH_SACD_MULTICHANNEL=false
+    # one --root per library: NAME=PATH shows PATH as folder NAME of the mount
     command:
       - --root=Music=/music
       - --root=Classical Music=/classical
-      - --tags-dir=/wavemorph/tags
-      - --cache-dir=/wavemorph/cache
     volumes:
       # the downloads: read-only, WaveMorphFS never writes to them
       - /path/to/downloads/music:/music:ro
       - /path/to/downloads/classical:/classical:ro
-      # rshared: the FUSE mount made in here propagates back to the host
+      # mount (mnt/), sidecars (tags/) and indexes (cache/); rshared: the FUSE
+      # mount made in here propagates back to the host
       - type: bind
         source: ./wavemorph
         target: /wavemorph
         bind:
           propagation: rshared
-    healthcheck:
-      test: ["CMD", "mountpoint", "-q", "/wavemorph/mnt"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
     restart: unless-stopped
 
   navidrome:
@@ -206,9 +202,13 @@ Notes:
 
 * The host directory holding `wavemorph/` must be on a shared mount for `rshared`
   to work (the default on systemd hosts; otherwise `mount --make-rshared /`).
-* The image's built-in user is uid 1000 (`fusermount3` needs a passwd entry for
-  the user it runs as), so run it as `1000:1000`; the downloads must be readable
-  and `wavemorph/` writable by that user.
+* The container starts as root only to switch to `PUID`/`PGID`. Running it with
+  compose's `user:` instead works for uid 1000 only (`fusermount3` needs a passwd
+  entry for the user it runs as).
+* The image is healthy once the mount is up, which is what `depends_on:
+  condition: service_healthy` waits for. Its paths can be changed with
+  `WAVEMORPH_MOUNT`, `WAVEMORPH_TAGS_DIR` and `WAVEMORPH_CACHE_DIR`;
+  `WAVEMORPH_LOG=debug` logs more.
 * Only the folder of the mountpoint is bound into the other containers, never the
   mountpoint itself — a bind of the mountpoint goes stale
   ("Transport endpoint is not connected") when wavemorphfs restarts.

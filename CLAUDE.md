@@ -45,7 +45,8 @@ src/
   cache.cpp      on-disk index cache names = md5(path\nsize\nmtime\nextra)[:16]
   util.cpp       errors (wm::Error, WM_ENSURE, with_context), File/pread, atomic_write, logging, run(), worker pools
 tests/           tiny in-tree framework (TEST/CHECK); test_flac (splitting vs the flac tool), formats, tags
-docker/entrypoint.sh, Dockerfile (Debian trixie, builds + runs tests)
+docker/entrypoint.sh, Dockerfile (Debian trixie, builds + runs tests; PUID/PGID, /wavemorph defaults)
+.github/workflows/docker.yml  multi-arch (native amd64+arm64) image -> ghcr.io/<owner>/wavemorphfs
 ```
 
 Key types: `VFile` (size + read_at + describe), `Entry` in a `Listing` (name,
@@ -106,6 +107,13 @@ and `ffmpeg` binaries for tests/verify. Warnings must stay at zero.
   latency per file kind (passthrough, retagged, flac-image, encoded APE, DSF plain,
   DSF DST) on a scratch mount; compare before/after. Baseline after the perf
   pass: APE ~100 MB/s, DST ~70 MB/s (CPU-bound, all cores), plain DSF ~1.6 GB/s.
+
+## Releases
+
+The image is published by CI only: pushes to main -> `:edge`, tags `vX.Y.Z` ->
+`:X.Y.Z`, `:X.Y`, `:latest`. The README's compose example is the documented
+setup; keep it in sync with the entrypoint (PUID/PGID, WAVEMORPH_* env) and
+free of host-specific names or paths.
 
 ## Conventions
 

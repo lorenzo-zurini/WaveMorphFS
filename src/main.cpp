@@ -43,10 +43,11 @@ commands:
   tags-init <dir> [--force] write a sidecar pre-filled with the current effective tags of DIR
 
 global options:
-  --root NAME=PATH          library root (repeatable; default ~/Storage/Music, ~/Storage/Classical Music)
+  --root NAME=PATH          library root, shown as folder NAME of the mount (repeatable, required)
   --tags-dir DIR            sidecar tag trees: <tags-dir>/<root name>/<relative dir>/wavemorph.json
-                            (default ~/Storage/Stacks/lgzcloud-navidrome/wavemorph/tags)
-  --cache-dir DIR           frame/packet indexes (default ~/Storage/Stacks/lgzcloud-navidrome/wavemorph/cache)
+                            (env WAVEMORPH_TAGS_DIR; default $XDG_DATA_HOME/wavemorphfs/tags)
+  --cache-dir DIR           frame/packet indexes
+                            (env WAVEMORPH_CACHE_DIR; default $XDG_CACHE_HOME/wavemorphfs)
 
 environment: WAVEMORPH_LOG=debug|info|warn|error
 )USAGE";
@@ -59,6 +60,14 @@ fs::path expand(const std::string& p) {
     return p;
 }
 
+/// $VAR if set, else $XDG_VAR (falling back to ~/FALLBACK) / SUB.
+std::string env_dir(const char* var, const char* xdg, const char* fallback, const char* sub) {
+    if (const char* v = std::getenv(var); v && *v) return v;
+    const char* x = std::getenv(xdg);
+    fs::path base = x && *x ? fs::path(x) : expand(std::string("~/") + fallback);
+    return (base / sub).string();
+}
+
 bool env_true(const char* name) {
     const char* v = std::getenv(name);
     if (!v) return false;
@@ -68,8 +77,8 @@ bool env_true(const char* name) {
 
 struct Cli {
     std::vector<Root> roots;
-    std::string tags_dir = "~/Storage/Stacks/lgzcloud-navidrome/wavemorph/tags";
-    std::string cache_dir = "~/Storage/Stacks/lgzcloud-navidrome/wavemorph/cache";
+    std::string tags_dir = env_dir("WAVEMORPH_TAGS_DIR", "XDG_DATA_HOME", ".local/share", "wavemorphfs/tags");
+    std::string cache_dir = env_dir("WAVEMORPH_CACHE_DIR", "XDG_CACHE_HOME", ".cache", "wavemorphfs");
     std::string cmd;
     std::vector<std::string> pos;
     size_t workers = 2, threads = 8;
@@ -126,12 +135,12 @@ Cli parse_args(int argc, char** argv) {
         else c.pos.push_back(arg);
     }
     if (c.cmd.empty()) usage_error("no command given");
+    if (c.roots.empty()) usage_error("no --root given");
     return c;
 }
 
 std::shared_ptr<Library> library(const Cli& cli, size_t workers) {
     auto roots = cli.roots;
-    if (roots.empty()) roots = {{"Music", expand("~/Storage/Music")}, {"Classical Music", expand("~/Storage/Classical Music")}};
     for (auto& r : roots) WM_ENSURE(fs::is_directory(r.path), "root {} does not exist: {}", r.name, r.path.string());
     Config cfg;
     cfg.roots = roots;
