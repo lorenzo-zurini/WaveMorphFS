@@ -116,6 +116,13 @@ TEST(writeback_tag_changes) {
     CHECK(*c.get("My Tag") == "y");
     CHECK(c.get_all("COMMENT") && c.get_all("COMMENT")->empty());
     CHECK(tag_changes(before, before).empty());
+    // what beets/mediafile writes for an unchanged track: synonyms, placeholders, YEAR
+    auto src = Tags::from_pairs({{"TITLE", "T"}, {"TRACKNUMBER", "3"}, {"TRACKTOTAL", "12"}, {"ALBUMARTIST", "A"}, {"DATE", "2006"}});
+    auto beets = Tags::from_pairs({{"TITLE", "T"}, {"TRACKNUMBER", "3"}, {"TRACK", "3"}, {"TRACKTOTAL", "12"}, {"TOTALTRACKS", "12"},
+                                   {"TRACKC", "12"}, {"ALBUMARTIST", "A"}, {"ALBUM ARTIST", "A"}, {"DATE", "2006"}, {"YEAR", "2006"},
+                                   {"BPM", "0"}, {"COMPILATION", "0"}, {"DISC", "0"}, {"ORIGINALDATE", "0000"}});
+    auto n = tag_changes(src, beets);
+    CHECK_MSG(n.empty(), "{} spurious changes, first {}", n.m.size(), n.m.empty() ? "" : n.m.begin()->first);
 }
 
 namespace {
