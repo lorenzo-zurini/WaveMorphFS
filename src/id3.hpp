@@ -22,6 +22,12 @@ Bytes build(const Tags& tags);
 /// after its ID3v2 tag) starts.
 std::pair<Bytes, uint64_t> retag_mp3(const fs::path& p, const Tags& overlay);
 
+/// Tags of an ID3v2 tag (as written by this program or a tag editor), with
+/// frames mapped back to Vorbis-style names (TIT2 -> TITLE, TRCK -> TRACKNUMBER
+/// + TRACKTOTAL, TXXX -> its description, COMM -> COMMENT, other text frames by
+/// id). Pictures and binary frames are not tags and are skipped.
+Tags read_tags(std::span<const uint8_t> tag);
+
 // exposed for tests
 struct Frame {
     char id[4];

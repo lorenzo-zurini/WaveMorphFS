@@ -92,3 +92,50 @@ TEST(sidecar_render_roundtrip) {
     CHECK(sc.album == album);
     CHECK(*sc.file("01 - a.flac") == files[0].second);
 }
+
+#include <unistd.h>
+
+#include "writeback.hpp"
+
+TEST(writeback_tag_changes) {
+    auto before = Tags::from_pairs({{"TITLE", "Old"}, {"album_artist", "A"}, {"DATE", "1999"}, {"COMMENT", "x"}});
+    // an editor that respells names, changes the title, drops the comment, adds a tag
+    auto after = Tags::from_pairs({{"TITLE", "New"}, {"ALBUMARTIST", "A"}, {"DATE", "1999"}, {"My Tag", "y"}});
+    auto c = tag_changes(before, after);
+    CHECK(c.m.size() == 3);
+    CHECK(*c.get("TITLE") == "New");
+    CHECK(*c.get("My Tag") == "y");
+    CHECK(c.get_all("COMMENT") && c.get_all("COMMENT")->empty());
+    CHECK(tag_changes(before, before).empty());
+}
+
+namespace {
+struct MemFile : VFile {
+    Bytes data;
+    uint64_t size() const override { return data.size(); }
+    Bytes read_at(uint64_t off, size_t len) const override {
+        if (off >= data.size()) return {};
+        return Bytes(data.begin() + ptrdiff_t(off), data.begin() + ptrdiff_t(std::min<uint64_t>(data.size(), off + len)));
+    }
+    std::string describe() const override { return "mem"; }
+};
+}  // namespace
+
+TEST(writeback_session_overlay) {
+    auto f = std::make_shared<MemFile>();
+    for (int i = 0; i < 100; i++) f->data.push_back(uint8_t(i));
+    WriteSession ws(f, fs::temp_directory_path() / std::format("wm-edit-test-{}", ::getpid()));
+    CHECK(!ws.dirty() && ws.size() == 100);
+    Bytes w = {200, 201, 202};
+    ws.write(10, w);
+    ws.write(12, Bytes{203, 204});   // overlapping write extends the range
+    ws.write(150, Bytes{1});         // beyond the end: gap reads as zeros
+    CHECK(ws.dirty() && ws.size() == 151);
+    Bytes r = ws.read(8, 8);
+    CHECK((r == Bytes{8, 9, 200, 201, 203, 204, 14, 15}));
+    CHECK(ws.read(99, 3) == (Bytes{99, 0, 0}));
+    ws.truncate(11);
+    ws.write(13, Bytes{7});           // after shrinking, original bytes no longer show through
+    CHECK((ws.read(9, 5) == Bytes{9, 200, 0, 0, 7}));
+    fs::remove_all(fs::temp_directory_path() / std::format("wm-edit-test-{}", ::getpid()));
+}

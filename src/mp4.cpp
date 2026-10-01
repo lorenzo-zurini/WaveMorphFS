@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <map>
 
 namespace wm::mp4 {
 
@@ -352,6 +353,81 @@ void shift_offsets(Node& n, uint64_t from, int64_t delta) {
 
 }  // namespace
 
+Tags read_tags(const ByteReader& read, uint64_t size) {
+    static const std::map<std::string, std::string> names = {
+        {"\u00A9nam", "TITLE"}, {"\u00A9ART", "ARTIST"}, {"aART", "ALBUMARTIST"}, {"\u00A9alb", "ALBUM"}, {"\u00A9day", "DATE"},
+        {"\u00A9gen", "GENRE"}, {"\u00A9wrt", "COMPOSER"}, {"\u00A9cmt", "COMMENT"}, {"desc", "DESCRIPTION"}, {"ldes", "SYNOPSIS"},
+        {"\u00A9too", "ENCODER"}, {"cprt", "COPYRIGHT"}, {"\u00A9grp", "GROUPING"}, {"\u00A9lyr", "LYRICS"}, {"\u00A9wrk", "WORK"},
+        {"\u00A9mvn", "MOVEMENTNAME"}, {"sonm", "TITLESORT"}, {"soal", "ALBUMSORT"}, {"soar", "ARTISTSORT"}, {"soaa", "ALBUMARTISTSORT"},
+        {"socm", "COMPOSERSORT"}, {"tvsh", "SHOW"}, {"tvnn", "NETWORK"}, {"tven", "EPISODE_ID"}, {"purd", "PURCHASE_DATE"},
+        {"cpil", "COMPILATION"}, {"pgap", "GAPLESS_PLAYBACK"}, {"stik", "MEDIA_TYPE"}, {"rtng", "RATING"}, {"tmpo", "BPM"},
+    };
+    Tags t;
+    // find moov among the top-level boxes
+    std::optional<std::pair<uint64_t, uint64_t>> moov;
+    for (uint64_t pos = 0; pos + 8 <= size;) {
+        Bytes h = read(pos, 16);
+        if (h.size() < 8) break;
+        uint64_t sz = be32(h.data());
+        if (sz == 1 && h.size() >= 16) sz = be64(&h[8]);
+        else if (sz == 0) sz = size - pos;
+        if (sz < 8) break;
+        if (std::memcmp(&h[4], "moov", 4) == 0) moov = {pos, sz};
+        pos += sz;
+    }
+    if (!moov || moov->second > (64u << 20)) return t;
+    Bytes raw = read(moov->first, size_t(moov->second));
+    auto top = parse(raw);
+    if (top.empty()) return t;
+    Node* udta = top.back().child(T("udta"));
+    Node* meta = udta ? udta->child(T("meta")) : nullptr;
+    Node* ilst = meta ? meta->child(T("ilst")) : nullptr;
+    if (!ilst || ilst->container) return t;
+    for (auto& item : parse_ilst(ilst->data)) {
+        if (!item.container) continue;
+        std::vector<const Node*> data;
+        for (auto& c : item.children)
+            if (!c.container && c.typ == T("data") && c.data.size() >= 8) data.push_back(&c);
+        if (data.empty()) continue;
+        auto payload = [](const Node* d) { return std::span<const uint8_t>(d->data).subspan(8); };
+        uint32_t type = be32(data[0]->data.data()) & 0xFFFFFF;
+        std::string atom_name;
+        for (uint8_t c : item.typ) {
+            if (c == 0xA9) atom_name += "\u00A9";
+            else atom_name += char(c);
+        }
+        if (item.typ == T("trkn") || item.typ == T("disk")) {
+            auto p = payload(data[0]);
+            if (p.size() < 6) continue;
+            bool trk = item.typ == T("trkn");
+            if (uint16_t n = be16(&p[2])) t.add(trk ? "TRACKNUMBER" : "DISCNUMBER", std::to_string(n));
+            if (uint16_t n = be16(&p[4])) t.add(trk ? "TRACKTOTAL" : "DISCTOTAL", std::to_string(n));
+            continue;
+        }
+        if (item.typ == T("covr") || item.typ == T("gnre")) continue;
+        std::string name;
+        if (item.typ == T("----")) {
+            auto n = freeform_name(item);
+            if (!n) continue;
+            name = *n;
+        } else {
+            auto it = names.find(atom_name);
+            name = it != names.end() ? it->second : atom_name;
+        }
+        for (auto* d : data) {
+            auto p = payload(d);
+            if (type == 21 || type == 0) {  // integers (cpil, tmpo, rtng ...)
+                uint64_t v = 0;
+                for (auto b : p) v = v << 8 | b;
+                if (p.size() <= 8 && !p.empty()) t.add(name, std::to_string(v));
+            } else {
+                t.add(name, lossy_utf8(p));
+            }
+        }
+    }
+    return t;
+}
+
 Retagged retag_m4a(const fs::path& p, const Tags& overlay) {
     File f(p);
     uint64_t flen = f.size(), pos = 0;
@@ -397,6 +473,8 @@ Retagged retag_m4a(const fs::path& p, const Tags& overlay) {
     for (auto& i : items) i.write(body);
     if (ilst && !ilst->container) ilst->data = std::move(body);
     else meta->children.push_back(leaf(T("ilst"), std::move(body)));
+    // padding next to the item list, so tag editors can save in place
+    if (!meta->child(T("free"))) meta->children.push_back(leaf(T("free"), Bytes(2048, 0)));
 
     int64_t delta = int64_t(root.len()) - int64_t(mlen);
     if (delta != 0) shift_offsets(root, mpos + mlen, delta);

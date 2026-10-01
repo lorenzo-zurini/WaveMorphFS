@@ -50,8 +50,7 @@ void Cache::store_index(const fs::path& src, const SrcKey& key, const flac::Fram
 bool Cache::image_is_cached(const fs::path& src) const {
     auto key = SrcKey::try_of(src);
     if (!key) return false;
-    if (ext_lower(src) != "flac") return fs::exists(av_index_path(src, *key));
-    return fs::exists(idx_path(src, *key));
+    return fs::exists(av_index_path(src, *key)) || (ext_lower(src) == "flac" && fs::exists(idx_path(src, *key)));
 }
 
 flac::FrameIndex Cache::index_for(const fs::path& src, const flac::FlacMeta& meta) const {

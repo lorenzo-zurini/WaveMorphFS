@@ -131,6 +131,7 @@ FlacTrack::FlacTrack(std::shared_ptr<const FlacImage> img, uint64_t start, uint6
     if (md5) tsi.md5 = *md5;  // all-zero = unknown until the background job has computed it
     std::vector<flac::MetaBlock> meta = {{flac::BLOCK_VORBIS, flac::build_vorbis("WaveMorphFS", tags.to_pairs())}};
     meta.insert(meta.end(), pictures.begin(), pictures.end());
+    meta.push_back({flac::BLOCK_PADDING, Bytes(flac::EDIT_PADDING, 0)});
     header_ = flac::build_header(tsi.encode(0, 0), meta);
     size_ = header_.size() + (head_ ? head_->size : 0) + copy_size_ + (tail_ ? tail_->size : 0);
 }

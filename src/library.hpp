@@ -54,6 +54,10 @@ struct Entry {
     fs::path dir;   // source path (directories)
     VFilePtr file;  // contents (files)
     int64_t mtime = 0;
+    /// where tag edits of this file are stored: sidecar section ("track" or
+    /// "file") and key, and the file's tag format (flac, dsf, mp3, m4a); empty
+    /// section = not editable
+    std::string tag_section, tag_key, tag_ext;
 };
 
 struct Sig {
@@ -111,6 +115,9 @@ public:
     ReadyImage process_image(const fs::path& src) const;
     /// Human-readable summary of processing state, written next to the cache dir.
     void write_status() const;
+    /// Store tag changes made to file `file_name` of source folder `dir` in the
+    /// folder's sidecar, under `section`/`key`. Existing spellings are kept.
+    void apply_edit(const fs::path& dir, const std::string& file_name, const std::string& section, const std::string& key, const Tags& changes);
 
 private:
     explicit Library(Config cfg);
@@ -148,6 +155,7 @@ private:
     std::vector<Entry> sacd_tracks(const std::shared_ptr<const SacdDisc>& disc, std::optional<uint32_t> disc_no, size_t ndiscs, const Sidecar* sidecar,
                                    int64_t mtime, bool mc);
 
+    std::mutex edit_mu_;     // serializes sidecar writes
     mutable std::mutex mu_;  // guards the maps below
     std::map<fs::path, std::pair<SrcKey, Work<ReadyImage>>> images_;
     std::map<std::pair<fs::path, bool>, std::pair<SrcKey, Work<SacdDisc>>> sacds_;

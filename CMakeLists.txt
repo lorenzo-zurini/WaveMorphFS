@@ -15,7 +15,7 @@ pkg_check_modules(LIBAV REQUIRED IMPORTED_TARGET libavformat libavcodec libavuti
 find_package(nlohmann_json 3.10 REQUIRED)
 find_package(Threads REQUIRED)
 
-add_compile_options(-Wall -Wextra -Wno-unused-parameter)
+add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
 
 # everything except main(), shared by the program and the tests
 add_library(wmcore STATIC
@@ -36,6 +36,7 @@ add_library(wmcore STATIC
   src/sacd.cpp
   src/cache.cpp
   src/sidecar.cpp
+  src/writeback.cpp
   src/library.cpp
   src/fs.cpp
 )

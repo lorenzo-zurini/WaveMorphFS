@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <format>
+#include <functional>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -17,6 +18,8 @@ namespace fs = std::filesystem;
 namespace wm {
 
 using Bytes = std::vector<uint8_t>;
+/// Random-access read of a (virtual) file: up to `len` bytes at `off`.
+using ByteReader = std::function<Bytes(uint64_t off, size_t len)>;
 
 struct Error : std::runtime_error {
     using std::runtime_error::runtime_error;
