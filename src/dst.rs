@@ -33,7 +33,10 @@ impl<'a> Bits<'a> {
     }
     fn bit(&mut self) -> u32 {
         // reading past the end yields zeros, like FFmpeg's padded bit reader
-        let b = self.data.get(self.pos >> 3).map_or(0, |&x| (x >> (7 - (self.pos & 7))) & 1);
+        let b = self
+            .data
+            .get(self.pos >> 3)
+            .map_or(0, |&x| (x >> (7 - (self.pos & 7))) & 1);
         self.pos += 1;
         b as u32
     }
@@ -79,11 +82,20 @@ struct Table {
 
 impl Table {
     fn new() -> Self {
-        Table { elements: 0, length: [0; MAX_ELEMENTS], coeff: Box::new([[0; 128]; MAX_ELEMENTS]) }
+        Table {
+            elements: 0,
+            length: [0; MAX_ELEMENTS],
+            coeff: Box::new([[0; 128]; MAX_ELEMENTS]),
+        }
     }
 }
 
-fn read_map(gb: &mut Bits, t: &mut Table, map: &mut [usize; MAX_CHANNELS], channels: usize) -> Result<()> {
+fn read_map(
+    gb: &mut Bits,
+    t: &mut Table,
+    map: &mut [usize; MAX_CHANNELS],
+    channels: usize,
+) -> Result<()> {
     t.elements = 1;
     map[0] = 0;
     if gb.bit() == 0 {
@@ -104,12 +116,24 @@ fn read_map(gb: &mut Bits, t: &mut Table, map: &mut [usize; MAX_CHANNELS], chann
 }
 
 #[allow(clippy::needless_range_loop)] // mirrors FFmpeg's loop structure
-fn read_table(gb: &mut Bits, t: &mut Table, pred: &[[i32; 3]; 3], length_bits: u32, coeff_bits: u32, signed: bool, offset: i32) -> Result<()> {
+fn read_table(
+    gb: &mut Bits,
+    t: &mut Table,
+    pred: &[[i32; 3]; 3],
+    length_bits: u32,
+    coeff_bits: u32,
+    signed: bool,
+    offset: i32,
+) -> Result<()> {
     for i in 0..t.elements {
         t.length[i] = gb.bits(length_bits) as usize + 1;
         let uncoded = |gb: &mut Bits, n: usize, dst: &mut [i32; 128]| {
             for d in dst.iter_mut().take(n) {
-                *d = if signed { gb.sbits(coeff_bits) } else { gb.bits(coeff_bits) as i32 } + offset;
+                *d = if signed {
+                    gb.sbits(coeff_bits)
+                } else {
+                    gb.bits(coeff_bits) as i32
+                } + offset;
             }
         };
         if gb.bit() == 0 {
@@ -148,7 +172,10 @@ struct Ac {
 
 impl Ac {
     fn init(gb: &mut Bits) -> Ac {
-        Ac { a: 4095, c: gb.bits(12) }
+        Ac {
+            a: 4095,
+            c: gb.bits(12),
+        }
     }
     #[inline(always)]
     fn get(&mut self, gb: &mut Bits, p: u32) -> u32 {
@@ -185,8 +212,16 @@ pub struct DstDecoder {
 
 impl DstDecoder {
     pub fn new(channels: usize) -> Result<Self> {
-        ensure!((1..=MAX_CHANNELS).contains(&channels), "DST: unsupported channel count {channels}");
-        Ok(DstDecoder { channels, fsets: Table::new(), probs: Table::new(), filter: vec![[[0; 256]; 16]; MAX_ELEMENTS] })
+        ensure!(
+            (1..=MAX_CHANNELS).contains(&channels),
+            "DST: unsupported channel count {channels}"
+        );
+        Ok(DstDecoder {
+            channels,
+            fsets: Table::new(),
+            probs: Table::new(),
+            filter: vec![[[0; 256]; 16]; MAX_ELEMENTS],
+        })
     }
 
     /// Decode one DST frame into `out` (len = SAMPLES_PER_FRAME/8 * channels).
@@ -207,8 +242,14 @@ impl DstDecoder {
             return Ok(());
         }
         ensure!(gb.bit() == 1, "DST: 'not same segmentation' unsupported");
-        ensure!(gb.bit() == 1, "DST: 'not same segmentation for all channels' unsupported");
-        ensure!(gb.bit() == 1, "DST: 'not end of channel segmentation' unsupported");
+        ensure!(
+            gb.bit() == 1,
+            "DST: 'not same segmentation for all channels' unsupported"
+        );
+        ensure!(
+            gb.bit() == 1,
+            "DST: 'not end of channel segmentation' unsupported"
+        );
 
         let same_map = gb.bit() == 1;
         let mut map_f = [0usize; MAX_CHANNELS];
@@ -224,8 +265,24 @@ impl DstDecoder {
         for h in half_prob.iter_mut().take(channels) {
             *h = gb.bit() == 1;
         }
-        read_table(&mut gb, &mut self.fsets, &FSETS_CODE_PRED_COEFF, 7, 9, true, 0)?;
-        read_table(&mut gb, &mut self.probs, &PROBS_CODE_PRED_COEFF, 6, 7, false, 1)?;
+        read_table(
+            &mut gb,
+            &mut self.fsets,
+            &FSETS_CODE_PRED_COEFF,
+            7,
+            9,
+            true,
+            0,
+        )?;
+        read_table(
+            &mut gb,
+            &mut self.probs,
+            &PROBS_CODE_PRED_COEFF,
+            6,
+            7,
+            false,
+            1,
+        )?;
         ensure!(gb.bit() == 0, "DST: bad arithmetic-coding marker");
         let mut ac = Ac::init(&mut gb);
 

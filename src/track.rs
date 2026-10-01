@@ -43,7 +43,13 @@ impl FlacImage {
             _ => 0,
         };
         let sr_extra = h[ex + bs_extra..ex + hdr.extra_len].to_vec();
-        Ok(FlacImage { path, meta, index, sr_code: hdr.sr_code, sr_extra })
+        Ok(FlacImage {
+            path,
+            meta,
+            index,
+            sr_code: hdr.sr_code,
+            sr_extra,
+        })
     }
 
     pub fn si(&self) -> &StreamInfo {
@@ -172,11 +178,21 @@ pub struct FlacTrack {
 
 impl FlacTrack {
     /// Track covering samples [start, end) of `img`.
-    pub fn new(img: Arc<FlacImage>, start: u64, end: u64, tags: &Tags, pictures: &[MetaBlock], md5: Option<[u8; 16]>) -> Result<FlacTrack> {
+    pub fn new(
+        img: Arc<FlacImage>,
+        start: u64,
+        end: u64,
+        tags: &Tags,
+        pictures: &[MetaBlock],
+        md5: Option<[u8; 16]>,
+    ) -> Result<FlacTrack> {
         let total = img.total();
         let bs = img.bs();
         let nf = img.index.nframes();
-        ensure!(start < end && end <= total, "bad track range {start}..{end} (total {total})");
+        ensure!(
+            start < end && end <= total,
+            "bad track range {start}..{end} (total {total})"
+        );
 
         let mut k1 = start.div_ceil(bs);
         let mut k2 = if end == total { nf } else { end / bs };
@@ -214,7 +230,18 @@ impl FlacTrack {
         let si = img.si();
         let seg = |(s, e): (u64, u64)| {
             let out_sample = s - start;
-            Seg { s, e, out_sample, size: flac::verbatim_size((e - s) as u32, si.channels, si.bps, out_sample, img.sr_extra.len()) }
+            Seg {
+                s,
+                e,
+                out_sample,
+                size: flac::verbatim_size(
+                    (e - s) as u32,
+                    si.channels,
+                    si.bps,
+                    out_sample,
+                    img.sr_extra.len(),
+                ),
+            }
         };
         let head = head.map(seg);
         let tail = tail.map(seg);
@@ -240,7 +267,11 @@ impl FlacTrack {
         if let Some(t) = tail {
             blocks.push(t.e - t.s);
         }
-        let non_last = &blocks[..blocks.len().saturating_sub(1).max(if blocks.len() == 1 { 1 } else { 0 })];
+        let non_last =
+            &blocks[..blocks
+                .len()
+                .saturating_sub(1)
+                .max(if blocks.len() == 1 { 1 } else { 0 })];
         let min_b = non_last.iter().copied().min().unwrap_or(blocks[0]);
         let max_b = blocks.iter().copied().max().unwrap();
         let tsi = StreamInfo {
@@ -252,11 +283,17 @@ impl FlacTrack {
             total_samples: end - start,
             md5: md5.unwrap_or([0; 16]), // all-zero = unknown until the background job has computed it
         };
-        let mut meta = vec![MetaBlock { kind: flac::BLOCK_VORBIS, data: flac::build_vorbis("WaveMorphFS", &tags.to_pairs()) }];
+        let mut meta = vec![MetaBlock {
+            kind: flac::BLOCK_VORBIS,
+            data: flac::build_vorbis("WaveMorphFS", &tags.to_pairs()),
+        }];
         meta.extend(pictures.iter().cloned());
         let header = flac::build_header(&tsi.encode(0, 0), &meta);
 
-        let size = header.len() as u64 + head.map_or(0, |h| h.size) + copy_size + tail.map_or(0, |t| t.size);
+        let size = header.len() as u64
+            + head.map_or(0, |h| h.size)
+            + copy_size
+            + tail.map_or(0, |t| t.size);
         Ok(FlacTrack {
             img,
             start,
@@ -277,8 +314,19 @@ impl FlacTrack {
     fn verbatim(&self, seg: &Seg) -> Result<Vec<u8>> {
         let chans = self.img.decode_range(seg.s, seg.e)?;
         let refs: Vec<&[i32]> = chans.iter().map(|c| c.as_slice()).collect();
-        let fr = flac::encode_verbatim(&refs, self.img.si().bps, seg.out_sample, self.img.sr_code, &self.img.sr_extra);
-        ensure!(fr.len() as u64 == seg.size, "verbatim size mismatch {} != {}", fr.len(), seg.size);
+        let fr = flac::encode_verbatim(
+            &refs,
+            self.img.si().bps,
+            seg.out_sample,
+            self.img.sr_code,
+            &self.img.sr_extra,
+        );
+        ensure!(
+            fr.len() as u64 == seg.size,
+            "verbatim size mismatch {} != {}",
+            fr.len(),
+            seg.size
+        );
         Ok(fr)
     }
 
@@ -325,7 +373,11 @@ impl FlacTrack {
         let b = offs[k_last as usize];
         let mut raw = vec![0u8; (b - a) as usize];
         let f = File::open(&self.img.path)?;
-        ensure!(read_full_at(&f, &mut raw, a)? == raw.len(), "short read in {}", self.img.path.display());
+        ensure!(
+            read_full_at(&f, &mut raw, a)? == raw.len(),
+            "short read in {}",
+            self.img.path.display()
+        );
         let bs = self.img.bs();
         for (j, k) in (k_first..k_last).enumerate() {
             let fa = (offs[k as usize] - a) as usize;
@@ -380,12 +432,22 @@ impl VFile for FlacTrack {
             let b = self.seg_bytes(&self.tail_bytes, t)?;
             copy_overlap(&mut out, b, pos, off, len);
         }
-        ensure!(out.len() == len, "internal: produced {} of {} bytes at {off}", out.len(), len);
+        ensure!(
+            out.len() == len,
+            "internal: produced {} of {} bytes at {off}",
+            out.len(),
+            len
+        );
         Ok(out)
     }
 
     fn describe(&self) -> String {
-        format!("flac-image:{}#samples={}..{}", self.img.path.display(), self.start, self.end)
+        format!(
+            "flac-image:{}#samples={}..{}",
+            self.img.path.display(),
+            self.start,
+            self.end
+        )
     }
 }
 
@@ -402,10 +464,13 @@ mod tests {
             .map(|c| {
                 (0..n)
                     .map(|i| {
-                        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                        seed = seed
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407);
                         let noise = ((seed >> 33) as f64 / (1u64 << 31) as f64 - 0.5) * amp * 0.1;
                         let t = i as f64 / 44100.0;
-                        (amp * 0.8 * (t * 440.0 * (c as f64 + 1.0) * std::f64::consts::TAU).sin() + noise) as i32
+                        (amp * 0.8 * (t * 440.0 * (c as f64 + 1.0) * std::f64::consts::TAU).sin()
+                            + noise) as i32
                     })
                     .collect()
             })
@@ -425,11 +490,22 @@ mod tests {
 
     fn decode_raw(path: &std::path::Path) -> Vec<u8> {
         let o = Command::new("flac")
-            .args(["-d", "-c", "-s", "--force-raw-format", "--endian=little", "--sign=signed"])
+            .args([
+                "-d",
+                "-c",
+                "-s",
+                "--force-raw-format",
+                "--endian=little",
+                "--sign=signed",
+            ])
             .arg(path)
             .output()
             .unwrap();
-        assert!(o.status.success(), "flac -d failed: {}", String::from_utf8_lossy(&o.stderr));
+        assert!(
+            o.status.success(),
+            "flac -d failed: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
         o.stdout
     }
 
@@ -440,7 +516,13 @@ mod tests {
         let sig = signal(total, ch, bps);
         write_raw(&raw, &sig, bps);
         let st = Command::new("flac")
-            .args(["-s", "-f", "--force-raw-format", "--endian=little", "--sign=signed"])
+            .args([
+                "-s",
+                "-f",
+                "--force-raw-format",
+                "--endian=little",
+                "--sign=signed",
+            ])
             .arg(format!("--channels={ch}"))
             .arg(format!("--bps={bps}"))
             .arg(format!("--sample-rate={rate}"))
@@ -466,29 +548,43 @@ mod tests {
             assert_eq!(bytes.len() as u64, tr.size());
             let out = dir.path().join("t.flac");
             std::fs::write(&out, &bytes).unwrap();
-            let t = Command::new("flac").args(["-t", "-s"]).arg(&out).output().unwrap();
-            assert!(t.status.success(), "flac -t failed for {rate}/{ch}ch/{bps}bit/bs{bs} range {s}..{e}: {}", String::from_utf8_lossy(&t.stderr));
+            let t = Command::new("flac")
+                .args(["-t", "-s"])
+                .arg(&out)
+                .output()
+                .unwrap();
+            assert!(
+                t.status.success(),
+                "flac -t failed for {rate}/{ch}ch/{bps}bit/bs{bs} range {s}..{e}: {}",
+                String::from_utf8_lossy(&t.stderr)
+            );
             let got = decode_raw(&out);
             let want = &all[s as usize * frame_bytes..e as usize * frame_bytes];
-            assert!(got == want, "PCM mismatch for {rate}/{ch}ch/{bps}bit/bs{bs} range {s}..{e}");
-            eprintln!("  verified {rate}Hz {ch}ch {bps}bit bs{bs} range {s}..{e} ({} bytes)", bytes.len());
+            assert!(
+                got == want,
+                "PCM mismatch for {rate}/{ch}ch/{bps}bit/bs{bs} range {s}..{e}"
+            );
+            eprintln!(
+                "  verified {rate}Hz {ch}ch {bps}bit bs{bs} range {s}..{e} ({} bytes)",
+                bytes.len()
+            );
         }
     }
 
     fn edge_ranges(bs: u64, total: u64) -> Vec<(u64, u64)> {
         vec![
-            (0, total),                     // whole image
-            (0, bs),                        // exactly one frame
-            (bs, 3 * bs),                   // aligned both ends
-            (1, bs + 1),                    // off by one
-            (bs - 1, 3 * bs + 1),           // 1-sample head (merged), 1-sample tail (merged)
-            (bs - 15, 3 * bs + 15),         // 15-sample head/tail (merged)
-            (bs - 16, 3 * bs + 16),         // 16-sample head/tail (not merged)
-            (bs + 7, bs + 12),              // 5 samples inside one frame
-            (bs - 3, bs + 3),               // 6 samples straddling a boundary
-            (2 * bs + 100, total),          // to the end (tiny last frame)
-            (total - 5, total),             // last 5 samples only
-            (total - bs - 2, total),        // tail merge near the end
+            (0, total),              // whole image
+            (0, bs),                 // exactly one frame
+            (bs, 3 * bs),            // aligned both ends
+            (1, bs + 1),             // off by one
+            (bs - 1, 3 * bs + 1),    // 1-sample head (merged), 1-sample tail (merged)
+            (bs - 15, 3 * bs + 15),  // 15-sample head/tail (merged)
+            (bs - 16, 3 * bs + 16),  // 16-sample head/tail (not merged)
+            (bs + 7, bs + 12),       // 5 samples inside one frame
+            (bs - 3, bs + 3),        // 6 samples straddling a boundary
+            (2 * bs + 100, total),   // to the end (tiny last frame)
+            (total - 5, total),      // last 5 samples only
+            (total - bs - 2, total), // tail merge near the end
         ]
     }
 

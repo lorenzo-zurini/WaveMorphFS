@@ -26,7 +26,9 @@ pub const FRAME_BYTES: u64 = 2_822_400 / 8 / 75; // 4704
 const DSF_BLOCK: u64 = 4096;
 
 pub fn is_sacd(path: &Path) -> bool {
-    let Ok(f) = File::open(path) else { return false };
+    let Ok(f) = File::open(path) else {
+        return false;
+    };
     let mut b = [0u8; 8];
     f.read_exact_at(&mut b, MASTER_TOC * SECTOR).is_ok() && &b == b"SACDMTOC"
 }
@@ -93,15 +95,45 @@ fn cstr_at(b: &[u8], o: usize, charset: u8) -> Option<String> {
     if o == 0 || o >= b.len() {
         return None;
     }
-    let end = b[o..].iter().position(|&c| c == 0).map_or(b.len(), |e| o + e);
+    let end = b[o..]
+        .iter()
+        .position(|&c| c == 0)
+        .map_or(b.len(), |e| o + e);
     let s = decode_text(&b[o..end], charset);
     (!s.is_empty()).then_some(s)
 }
 
 const GENRES: &[&str] = &[
-    "", "", "", "Adult Contemporary", "Alternative Rock", "Children's Music", "Classical", "Contemporary Christian", "Country", "Dance",
-    "Easy Listening", "Erotic", "Folk", "Gospel", "Hip Hop", "Jazz", "Latin", "Musical", "New Age", "Opera", "Operetta", "Pop Music", "Rap",
-    "Reggae", "Rock Music", "Rhythm & Blues", "Sound Effects", "Soundtrack", "Spoken Word", "World Music",
+    "",
+    "",
+    "",
+    "Adult Contemporary",
+    "Alternative Rock",
+    "Children's Music",
+    "Classical",
+    "Contemporary Christian",
+    "Country",
+    "Dance",
+    "Easy Listening",
+    "Erotic",
+    "Folk",
+    "Gospel",
+    "Hip Hop",
+    "Jazz",
+    "Latin",
+    "Musical",
+    "New Age",
+    "Opera",
+    "Operetta",
+    "Pop Music",
+    "Rap",
+    "Reggae",
+    "Rock Music",
+    "Rhythm & Blues",
+    "Sound Effects",
+    "Soundtrack",
+    "Spoken Word",
+    "World Music",
 ];
 
 /// One parsed audio sector.
@@ -123,7 +155,11 @@ fn parse_sector(s: &[u8]) -> Result<AudioSector> {
     for _ in 0..npk {
         let w = be16(s, p);
         p += 2;
-        pk.push(((w >> 15) & 1 == 1, ((w >> 11) & 7) as u8, (w & 0x7FF) as usize));
+        pk.push((
+            (w >> 15) & 1 == 1,
+            ((w >> 11) & 7) as u8,
+            (w & 0x7FF) as usize,
+        ));
     }
     let mut tcs = Vec::with_capacity(nfi);
     for _ in 0..nfi {
@@ -136,7 +172,11 @@ fn parse_sector(s: &[u8]) -> Result<AudioSector> {
         packets.push((p, len, dt, fs));
         p += len;
     }
-    Ok(AudioSector { dst, packets, frame_tcs: tcs })
+    Ok(AudioSector {
+        dst,
+        packets,
+        frame_tcs: tcs,
+    })
 }
 
 const DATA_AUDIO: u8 = 2;
@@ -150,7 +190,10 @@ impl SacdDisc {
         let flen = f.metadata()?.len();
         let sec = |n: u64, count: u64| -> Result<Vec<u8>> {
             let mut b = vec![0u8; (SECTOR * count) as usize];
-            ensure!(read_full_at(&f, &mut b, n * SECTOR)? == b.len(), "short read at sector {n}");
+            ensure!(
+                read_full_at(&f, &mut b, n * SECTOR)? == b.len(),
+                "short read at sector {n}"
+            );
             Ok(b)
         };
         let m = sec(MASTER_TOC, 1)?;
@@ -161,17 +204,40 @@ impl SacdDisc {
         let set_size = be16(&m, 16);
         let set_seq = be16(&m, 18);
         let year = be16(&m, 120);
-        let genre = (m[104] == 1).then(|| GENRES.get(be16(&m, 106) as usize).copied()).flatten().filter(|g| !g.is_empty());
+        let genre = (m[104] == 1)
+            .then(|| GENRES.get(be16(&m, 106) as usize).copied())
+            .flatten()
+            .filter(|g| !g.is_empty());
         let master_charset = m[138]; // first locale: [lang, lang, charset, reserved] at 136
 
         // choose the stereo area, fall back to multichannel if it is the only one
-        let area_start = if multichannel { area2 } else if area1 != 0 { area1 } else { area2 };
-        ensure!(area_start != 0, "{}", if multichannel { "no multichannel area" } else { "no audio area" });
+        let area_start = if multichannel {
+            area2
+        } else if area1 != 0 {
+            area1
+        } else {
+            area2
+        };
+        ensure!(
+            area_start != 0,
+            "{}",
+            if multichannel {
+                "no multichannel area"
+            } else {
+                "no audio area"
+            }
+        );
         let at = sec(area_start, 1)?;
-        ensure!(&at[..8] == b"TWOCHTOC" || &at[..8] == b"MULCHTOC", "bad area TOC signature");
+        ensure!(
+            &at[..8] == b"TWOCHTOC" || &at[..8] == b"MULCHTOC",
+            "bad area TOC signature"
+        );
         let toc_size = be16(&at, 10) as u64;
         let frame_format = at[0x15] & 0x0F;
-        ensure!(matches!(frame_format, 0 | 2 | 3), "unknown frame format {frame_format}");
+        ensure!(
+            matches!(frame_format, 0 | 2 | 3),
+            "unknown frame format {frame_format}"
+        );
         let dst = frame_format == 0;
         ensure!(at[0x14] == 4, "unsupported sample rate code {}", at[0x14]);
         let channels = at[0x20] as u32;
@@ -179,19 +245,37 @@ impl SacdDisc {
         let ntracks = at[0x45] as usize;
         let area_audio_start = be32(&at, 0x48) as u64;
         let area_audio_end = be32(&at, 0x4C) as u64;
-        ensure!(ntracks >= 1 && area_audio_end > area_audio_start, "bad track info");
-        ensure!(flen >= (area_audio_end + 1) * SECTOR, "ISO is truncated (still downloading?)");
+        ensure!(
+            ntracks >= 1 && area_audio_end > area_audio_start,
+            "bad track info"
+        );
+        ensure!(
+            flen >= (area_audio_end + 1) * SECTOR,
+            "ISO is truncated (still downloading?)"
+        );
         let area_charset = at[0x5A];
 
         // locate SACDTRL2 and SACDTTxt inside the area TOC
         let toc = sec(area_start, toc_size.max(1))?;
-        let find = |sig: &[u8]| (0..toc_size as usize).map(|i| i * SECTOR as usize).find(|&o| &toc[o..o + 8] == sig);
+        let find = |sig: &[u8]| {
+            (0..toc_size as usize)
+                .map(|i| i * SECTOR as usize)
+                .find(|&o| &toc[o..o + 8] == sig)
+        };
         let trl2 = find(b"SACDTRL2").context("no SACDTRL2")?;
         let mut tracks = Vec::with_capacity(ntracks);
         for i in 0..ntracks {
             let start = tc(&toc, trl2 + 8 + 4 * i);
             let dur = tc(&toc, trl2 + 8 + 1020 + 4 * i);
-            tracks.push(SacdTrack { start, end: start + dur, title: None, performer: None, songwriter: None, composer: None, arranger: None });
+            tracks.push(SacdTrack {
+                start,
+                end: start + dur,
+                title: None,
+                performer: None,
+                songwriter: None,
+                composer: None,
+                arranger: None,
+            });
         }
         if let Some(tt) = find(b"SACDTTxt") {
             for (i, t) in tracks.iter_mut().enumerate() {
@@ -210,7 +294,10 @@ impl SacdDisc {
                         break;
                     }
                     let kind = toc[p];
-                    let end = toc[p + 2..].iter().position(|&c| c == 0).map_or(toc.len(), |e| p + 2 + e);
+                    let end = toc[p + 2..]
+                        .iter()
+                        .position(|&c| c == 0)
+                        .map_or(toc.len(), |e| p + 2 + e);
                     let text = decode_text(&toc[p + 2..end], area_charset);
                     let text = (!text.is_empty()).then_some(text);
                     match kind {
@@ -233,7 +320,11 @@ impl SacdDisc {
         let mut album = Tags::new();
         if &mt[..8] == b"SACDText" {
             let pos = |i: usize| be16(&mt, 16 + 2 * i) as usize;
-            let cs = if master_charset != 0 { master_charset } else { area_charset };
+            let cs = if master_charset != 0 {
+                master_charset
+            } else {
+                area_charset
+            };
             let album_title = cstr_at(&mt, pos(0), cs).or_else(|| cstr_at(&mt, pos(8), cs));
             let album_artist = cstr_at(&mt, pos(1), cs).or_else(|| cstr_at(&mt, pos(9), cs));
             let publisher = cstr_at(&mt, pos(2), cs).or_else(|| cstr_at(&mt, pos(10), cs));
@@ -267,11 +358,21 @@ impl SacdDisc {
         album.set("MEDIA", "SACD");
 
         let key = SrcKey::of(path)?;
-        let key = SrcKey { size: key.size, mtime_ns: key.mtime_ns ^ (multichannel as i128) << 100 };
+        let key = SrcKey {
+            size: key.size,
+            mtime_ns: key.mtime_ns ^ (multichannel as i128) << 100,
+        };
         let frames = match cache.and_then(|c| load_frames(c, path, key, area_audio_end)) {
             Some(fr) => fr,
             None => {
-                let fr = scan_frames(&f, area_audio_start, area_audio_end, channels, dst, tracks.last().unwrap().end)?;
+                let fr = scan_frames(
+                    &f,
+                    area_audio_start,
+                    area_audio_end,
+                    channels,
+                    dst,
+                    tracks.last().unwrap().end,
+                )?;
                 if let Some(c) = cache {
                     store_frames(c, path, key, &fr)?;
                 }
@@ -280,8 +381,21 @@ impl SacdDisc {
         };
         // frames ends with one extra entry: where the last needed frame ends
         let last = tracks.last().unwrap().end;
-        ensure!(last < frames.len() as u64, "track list ends at frame {last} but only {} frames were found", frames.len().saturating_sub(1));
-        Ok(SacdDisc { path: path.to_path_buf(), channels, tracks, album, frames, area_end: area_audio_end, dst, recent: Mutex::new(None) })
+        ensure!(
+            last < frames.len() as u64,
+            "track list ends at frame {last} but only {} frames were found",
+            frames.len().saturating_sub(1)
+        );
+        Ok(SacdDisc {
+            path: path.to_path_buf(),
+            channels,
+            tracks,
+            album,
+            frames,
+            area_end: area_audio_end,
+            dst,
+            recent: Mutex::new(None),
+        })
     }
 
     pub fn track_tags(&self, i: usize) -> Tags {
@@ -336,13 +450,20 @@ impl SacdDisc {
                 }
                 if dt == DATA_AUDIO {
                     if fs || out.is_empty() {
-                        out.push(Vec::with_capacity(FRAME_BYTES as usize * self.channels as usize));
+                        out.push(Vec::with_capacity(
+                            FRAME_BYTES as usize * self.channels as usize,
+                        ));
                     }
                     out.last_mut().unwrap().extend_from_slice(&sb[po..po + len]);
                 }
             }
         }
-        ensure!(out.len() as u64 == f1 - f0, "expected {} frames, found {}", f1 - f0, out.len());
+        ensure!(
+            out.len() as u64 == f1 - f0,
+            "expected {} frames, found {}",
+            f1 - f0,
+            out.len()
+        );
         Ok(out)
     }
 
@@ -352,16 +473,26 @@ impl SacdDisc {
         let per_frame = FRAME_BYTES as usize * ch;
         let coded = self.coded_frames(f0, f1)?;
         let mut out = vec![Vec::with_capacity(FRAME_BYTES as usize * coded.len()); ch];
-        let mut dec = if self.dst { Some(DstDecoder::new(ch)?) } else { None };
+        let mut dec = if self.dst {
+            Some(DstDecoder::new(ch)?)
+        } else {
+            None
+        };
         let mut raw = vec![0u8; per_frame];
         for (i, c) in coded.iter().enumerate() {
             let inter: &[u8] = match dec.as_mut() {
                 Some(d) => {
-                    d.decode(c, &mut raw).map_err(|e| anyhow::anyhow!("frame {}: {e}", f0 + i as u64))?;
+                    d.decode(c, &mut raw)
+                        .map_err(|e| anyhow::anyhow!("frame {}: {e}", f0 + i as u64))?;
                     &raw
                 }
                 None => {
-                    ensure!(c.len() == per_frame, "frame {} has {} bytes", f0 + i as u64, c.len());
+                    ensure!(
+                        c.len() == per_frame,
+                        "frame {} has {} bytes",
+                        f0 + i as u64,
+                        c.len()
+                    );
                     c
                 }
             };
@@ -391,24 +522,43 @@ impl SacdDisc {
 /// (one past the last track), which then doubles as the end marker. Some rips
 /// end the area with an unparseable sector; that is tolerated once every needed
 /// frame is complete, and the bad sector becomes the end marker.
-fn scan_frames(f: &File, start: u64, end: u64, channels: u32, dst: bool, needed: u64) -> Result<Vec<(u32, u16)>> {
+fn scan_frames(
+    f: &File,
+    start: u64,
+    end: u64,
+    channels: u32,
+    dst: bool,
+    needed: u64,
+) -> Result<Vec<(u32, u16)>> {
     let mut frames: Vec<(u32, u16)> = Vec::new();
     let frame_bytes = FRAME_BYTES as usize * channels as usize;
     let mut acc = 0usize; // audio bytes of the current frame seen so far
     const CHUNK: u64 = 2048; // sectors per read (4 MiB)
-    let complete = |frames: &Vec<(u32, u16)>, acc: usize| frames.len() as u64 == needed && (dst || acc == frame_bytes);
+    let complete = |frames: &Vec<(u32, u16)>, acc: usize| {
+        frames.len() as u64 == needed && (dst || acc == frame_bytes)
+    };
     let mut s = start;
     while s <= end {
         let n = CHUNK.min(end + 1 - s);
         let mut buf = vec![0u8; (n * SECTOR) as usize];
-        ensure!(read_full_at(f, &mut buf, s * SECTOR)? == buf.len(), "short read at sector {s}");
+        ensure!(
+            read_full_at(f, &mut buf, s * SECTOR)? == buf.len(),
+            "short read at sector {s}"
+        );
         for i in 0..n {
             let sec_no = s + i;
             let sb = &buf[(i * SECTOR) as usize..((i + 1) * SECTOR) as usize];
-            let parsed = parse_sector(sb).with_context(|| format!("sector {sec_no}")).and_then(|p| {
-                ensure!(p.dst == dst, "sector {sec_no}: DST flag {} in a {} area", p.dst, if dst { "DST" } else { "plain DSD" });
-                Ok(p)
-            });
+            let parsed = parse_sector(sb)
+                .with_context(|| format!("sector {sec_no}"))
+                .and_then(|p| {
+                    ensure!(
+                        p.dst == dst,
+                        "sector {sec_no}: DST flag {} in a {} area",
+                        p.dst,
+                        if dst { "DST" } else { "plain DSD" }
+                    );
+                    Ok(p)
+                });
             let p = match parsed {
                 Ok(p) => p,
                 Err(e) if complete(&frames, acc) => {
@@ -424,10 +574,17 @@ fn scan_frames(f: &File, start: u64, end: u64, channels: u32, dst: bool, needed:
                     continue;
                 }
                 if fs {
-                    ensure!(dst || frames.is_empty() || acc == frame_bytes, "frame {} has {acc} bytes, expected {frame_bytes}", frames.len() - 1);
+                    ensure!(
+                        dst || frames.is_empty() || acc == frame_bytes,
+                        "frame {} has {acc} bytes, expected {frame_bytes}",
+                        frames.len() - 1
+                    );
                     let expect = frames.len() as u64;
                     if let Some(&t) = tc_iter.next() {
-                        ensure!(t == expect, "sector {sec_no}: time code {t} where frame {expect} was expected");
+                        ensure!(
+                            t == expect,
+                            "sector {sec_no}: time code {t} where frame {expect} was expected"
+                        );
                     }
                     frames.push((sec_no as u32, po as u16));
                     acc = 0;
@@ -440,7 +597,11 @@ fn scan_frames(f: &File, start: u64, end: u64, channels: u32, dst: bool, needed:
         }
         s += n;
     }
-    ensure!(complete(&frames, acc), "area ended after {} of {needed} frames", frames.len());
+    ensure!(
+        complete(&frames, acc),
+        "area ended after {} of {needed} frames",
+        frames.len()
+    );
     frames.push(((end + 1) as u32, 0));
     Ok(frames)
 }
@@ -448,7 +609,10 @@ fn scan_frames(f: &File, start: u64, end: u64, channels: u32, dst: bool, needed:
 /// True if the frame table of this ISO area is cached (opening is then cheap).
 pub fn is_cached(c: &Cache, src: &Path, multichannel: bool) -> bool {
     SrcKey::of(src).is_ok_and(|k| {
-        let k = SrcKey { size: k.size, mtime_ns: k.mtime_ns ^ (multichannel as i128) << 100 };
+        let k = SrcKey {
+            size: k.size,
+            mtime_ns: k.mtime_ns ^ (multichannel as i128) << 100,
+        };
         frames_cache_path(c, src, k).exists()
     })
 }
@@ -471,7 +635,15 @@ fn load_frames(c: &Cache, src: &Path, key: SrcKey, area_end: u64) -> Option<Vec<
     if b.len() != 16 + n * 6 {
         return None;
     }
-    let mut fr: Vec<(u32, u16)> = b[16..].chunks_exact(6).map(|c| (u32::from_le_bytes(c[..4].try_into().unwrap()), u16::from_le_bytes([c[4], c[5]]))).collect();
+    let mut fr: Vec<(u32, u16)> = b[16..]
+        .chunks_exact(6)
+        .map(|c| {
+            (
+                u32::from_le_bytes(c[..4].try_into().unwrap()),
+                u16::from_le_bytes([c[4], c[5]]),
+            )
+        })
+        .collect();
     if &b[..8] == IDX_MAGIC_V1 {
         // v1 caches were only written for discs whose area ends cleanly
         fr.push(((area_end + 1) as u32, 0));
@@ -533,7 +705,14 @@ impl DsfTrack {
         h.extend_from_slice(&0u32.to_le_bytes());
         h.extend_from_slice(b"data");
         h.extend_from_slice(&(12 + data_len).to_le_bytes());
-        DsfTrack { f0: t.start, disc, bytes_per_ch, header: h, data_len, id3 }
+        DsfTrack {
+            f0: t.start,
+            disc,
+            bytes_per_ch,
+            header: h,
+            data_len,
+            id3,
+        }
     }
 
     /// Bytes [a, b) of the data region.
@@ -597,11 +776,20 @@ impl VFile for DsfTrack {
             self.read_data(a, b, &mut out)?;
         }
         copy_overlap(&mut out, &self.id3, h + self.data_len, off, len);
-        ensure!(out.len() == len, "internal: produced {} of {len}", out.len());
+        ensure!(
+            out.len() == len,
+            "internal: produced {} of {len}",
+            out.len()
+        );
         Ok(out)
     }
 
     fn describe(&self) -> String {
-        format!("sacd:{}#frames={}+{}", self.disc.path.display(), self.f0, self.bytes_per_ch / FRAME_BYTES)
+        format!(
+            "sacd:{}#frames={}+{}",
+            self.disc.path.display(),
+            self.f0,
+            self.bytes_per_ch / FRAME_BYTES
+        )
     }
 }

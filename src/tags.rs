@@ -37,9 +37,26 @@ pub struct Tags(pub BTreeMap<Key, Vec<String>>);
 /// Keys that describe a single track; they must not leak from an image file's
 /// own tags (which describe the whole disc) into the split tracks.
 pub const TRACK_SPECIFIC: &[&str] = &[
-    "TITLE", "TRACKNUMBER", "TRACKTOTAL", "TOTALTRACKS", "ISRC", "CUESHEET", "LYRICS", "UNSYNCEDLYRICS",
-    "MUSICBRAINZ_TRACKID", "MUSICBRAINZ_RELEASETRACKID", "MUSICBRAINZ_WORKID", "ACOUSTID_ID", "ACOUSTID_FINGERPRINT",
-    "REPLAYGAIN_TRACK_GAIN", "REPLAYGAIN_TRACK_PEAK", "LENGTH", "PART", "MOVEMENTNAME", "MOVEMENT", "WORK",
+    "TITLE",
+    "TRACKNUMBER",
+    "TRACKTOTAL",
+    "TOTALTRACKS",
+    "ISRC",
+    "CUESHEET",
+    "LYRICS",
+    "UNSYNCEDLYRICS",
+    "MUSICBRAINZ_TRACKID",
+    "MUSICBRAINZ_RELEASETRACKID",
+    "MUSICBRAINZ_WORKID",
+    "ACOUSTID_ID",
+    "ACOUSTID_FINGERPRINT",
+    "REPLAYGAIN_TRACK_GAIN",
+    "REPLAYGAIN_TRACK_PEAK",
+    "LENGTH",
+    "PART",
+    "MOVEMENTNAME",
+    "MOVEMENT",
+    "WORK",
 ];
 
 impl Tags {
@@ -73,7 +90,10 @@ impl Tags {
     }
 
     pub fn set_many(&mut self, key: &str, values: Vec<String>) {
-        let values: Vec<String> = values.into_iter().filter(|v| !v.trim().is_empty()).collect();
+        let values: Vec<String> = values
+            .into_iter()
+            .filter(|v| !v.trim().is_empty())
+            .collect();
         self.0.remove(&Key(key.to_string()));
         if !values.is_empty() {
             self.0.insert(Key(key.to_string()), values);
@@ -81,7 +101,9 @@ impl Tags {
     }
 
     pub fn get(&self, key: &str) -> Option<&str> {
-        self.get_all(key).and_then(|v| v.first()).map(|s| s.as_str())
+        self.get_all(key)
+            .and_then(|v| v.first())
+            .map(|s| s.as_str())
     }
 
     pub fn get_all(&self, key: &str) -> Option<&Vec<String>> {
@@ -106,7 +128,10 @@ impl Tags {
     }
 
     pub fn to_pairs(&self) -> Vec<(String, String)> {
-        self.0.iter().flat_map(|(k, vs)| vs.iter().map(move |v| (k.0.clone(), v.clone()))).collect()
+        self.0
+            .iter()
+            .flat_map(|(k, vs)| vs.iter().map(move |v| (k.0.clone(), v.clone())))
+            .collect()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -181,7 +206,11 @@ mod tests {
 
     #[test]
     fn overlay_replaces_whole_key() {
-        let mut a = Tags::from_pairs([("ARTIST".into(), "A".into()), ("ARTIST".into(), "B".into()), ("DATE".into(), "1990".into())]);
+        let mut a = Tags::from_pairs([
+            ("ARTIST".into(), "A".into()),
+            ("ARTIST".into(), "B".into()),
+            ("DATE".into(), "1990".into()),
+        ]);
         let b = Tags::from_pairs([("artist".into(), "C".into())]);
         a.overlay(&b);
         assert_eq!(a.get_all("ARTIST").unwrap(), &vec!["C".to_string()]);
@@ -190,16 +219,25 @@ mod tests {
 
     #[test]
     fn keys_keep_spelling_but_match_case_insensitively() {
-        let mut t = Tags::from_pairs([("MusicBrainz Album Id".into(), "x".into()), ("album_artist".into(), "y".into())]);
+        let mut t = Tags::from_pairs([
+            ("MusicBrainz Album Id".into(), "x".into()),
+            ("album_artist".into(), "y".into()),
+        ]);
         assert_eq!(t.get("MUSICBRAINZ ALBUM ID"), Some("x"));
         let names: Vec<_> = t.to_pairs().into_iter().map(|(k, _)| k).collect();
-        assert!(names.contains(&"MusicBrainz Album Id".to_string()) && names.contains(&"album_artist".to_string()));
+        assert!(
+            names.contains(&"MusicBrainz Album Id".to_string())
+                && names.contains(&"album_artist".to_string())
+        );
         t.overlay(&Tags::from_pairs([("ALBUM_ARTIST".into(), "z".into())]));
         assert_eq!(t.get_all("album_artist").unwrap(), &vec!["z".to_string()]);
     }
 
     #[test]
     fn sanitize() {
-        assert_eq!(sanitize_name("AC/DC: Back in Black."), "AC∕DC: Back in Black");
+        assert_eq!(
+            sanitize_name("AC/DC: Back in Black."),
+            "AC∕DC: Back in Black"
+        );
     }
 }

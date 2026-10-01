@@ -19,15 +19,28 @@ impl RetagFlac {
     pub fn new(path: PathBuf, meta: &FlacMeta, overlay: &Tags) -> Result<RetagFlac> {
         let mut tags = Tags::from_pairs(meta.vorbis_comments());
         tags.overlay(overlay);
-        let mut blocks = vec![MetaBlock { kind: BLOCK_VORBIS, data: flac::build_vorbis("WaveMorphFS", &tags.to_pairs()) }];
+        let mut blocks = vec![MetaBlock {
+            kind: BLOCK_VORBIS,
+            data: flac::build_vorbis("WaveMorphFS", &tags.to_pairs()),
+        }];
         // keep every other block (SEEKTABLE offsets are relative to the first frame, so still valid)
-        blocks.extend(meta.blocks.iter().filter(|b| b.kind != BLOCK_VORBIS).cloned());
+        blocks.extend(
+            meta.blocks
+                .iter()
+                .filter(|b| b.kind != BLOCK_VORBIS)
+                .cloned(),
+        );
         let si = meta.streaminfo;
         // min/max frame size fields are informational; keep them unknown rather than re-derive
         let header = flac::build_header(&si.encode(0, 0), &blocks);
         let flen = std::fs::metadata(&path)?.len();
         let size = header.len() as u64 + (flen - meta.audio_start);
-        Ok(RetagFlac { path, header, audio_start: meta.audio_start, size })
+        Ok(RetagFlac {
+            path,
+            header,
+            audio_start: meta.audio_start,
+            size,
+        })
     }
 }
 

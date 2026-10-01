@@ -23,7 +23,11 @@ const fn make_crc8() -> [u8; 256] {
         let mut c = i as u8;
         let mut j = 0;
         while j < 8 {
-            c = if c & 0x80 != 0 { (c << 1) ^ 0x07 } else { c << 1 };
+            c = if c & 0x80 != 0 {
+                (c << 1) ^ 0x07
+            } else {
+                c << 1
+            };
             j += 1;
         }
         t[i] = c;
@@ -39,7 +43,11 @@ const fn make_crc16() -> [u16; 256] {
         let mut c = (i as u16) << 8;
         let mut j = 0;
         while j < 8 {
-            c = if c & 0x8000 != 0 { (c << 1) ^ 0x8005 } else { c << 1 };
+            c = if c & 0x8000 != 0 {
+                (c << 1) ^ 0x8005
+            } else {
+                c << 1
+            };
             j += 1;
         }
         t[i] = c;
@@ -204,12 +212,16 @@ impl FrameHeader {
             len: p + 1,
         })
     }
-
 }
 
 /// Rewrite an existing header (`orig`, parsed as `h`) into a variable-blocksize
 /// header carrying `sample_number`. Optionally force an explicit bps code.
-pub fn rewrite_header(orig: &[u8], h: &FrameHeader, sample_number: u64, bps_code: Option<u8>) -> Vec<u8> {
+pub fn rewrite_header(
+    orig: &[u8],
+    h: &FrameHeader,
+    sample_number: u64,
+    bps_code: Option<u8>,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(h.len + 2);
     out.push(0xFF);
     out.push(0xF9);
@@ -312,7 +324,9 @@ impl FlacMeta {
             // leading ID3v2 (non-standard but seen in the wild): skip it
             let mut rest = [0u8; 6];
             f.read_exact(&mut rest)?;
-            let sz = rest[2..6].iter().fold(0u64, |a, &b| (a << 7) | (b & 0x7F) as u64);
+            let sz = rest[2..6]
+                .iter()
+                .fold(0u64, |a, &b| (a << 7) | (b & 0x7F) as u64);
             pos = 10 + sz;
             f.read_exact_at(&mut magic, pos)?;
             pos += 4;
@@ -354,14 +368,18 @@ impl FlacMeta {
     }
 
     pub fn pictures(&self) -> Vec<&MetaBlock> {
-        self.blocks.iter().filter(|b| b.kind == BLOCK_PICTURE).collect()
+        self.blocks
+            .iter()
+            .filter(|b| b.kind == BLOCK_PICTURE)
+            .collect()
     }
 }
 
 pub fn parse_vorbis(b: &[u8]) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let rd = |p: usize| -> Option<usize> {
-        b.get(p..p + 4).map(|s| u32::from_le_bytes(s.try_into().unwrap()) as usize)
+        b.get(p..p + 4)
+            .map(|s| u32::from_le_bytes(s.try_into().unwrap()) as usize)
     };
     let Some(vlen) = rd(0) else { return out };
     let mut p = 4 + vlen;
@@ -426,7 +444,10 @@ pub struct FrameIndex {
 impl FrameIndex {
     pub fn build(path: &Path, meta: &FlacMeta) -> Result<FrameIndex> {
         let si = &meta.streaminfo;
-        ensure!(si.total_samples > 0, "STREAMINFO has unknown total sample count");
+        ensure!(
+            si.total_samples > 0,
+            "STREAMINFO has unknown total sample count"
+        );
         let f = File::open(path)?;
         let flen = f.metadata()?.len();
         let mut first = [0u8; 16];
@@ -435,13 +456,22 @@ impl FrameIndex {
         ensure!(!h0.variable, "variable-blocksize images are not supported");
         ensure!(h0.number == 0, "first frame number is not 0");
         let bs = h0.block_size;
-        ensure!(si.min_block == si.max_block || si.max_block as u32 == bs, "inconsistent block size");
+        ensure!(
+            si.min_block == si.max_block || si.max_block as u32 == bs,
+            "inconsistent block size"
+        );
         let nframes = si.total_samples.div_ceil(bs as u64);
 
         let mut offsets = Vec::with_capacity(nframes as usize + 1);
         offsets.push(meta.audio_start);
 
-        let mut w = Window { f: &f, flen, buf: Vec::new(), off: meta.audio_start, eof: false };
+        let mut w = Window {
+            f: &f,
+            flen,
+            buf: Vec::new(),
+            off: meta.audio_start,
+            eof: false,
+        };
         w.fill()?;
 
         let mut cur = 0usize; // start of current frame within w.buf
@@ -449,9 +479,14 @@ impl FrameIndex {
             if w.buf.len() - cur < 64 && !w.eof {
                 w.compact(&mut cur, None)?;
             }
-            let hdr = FrameHeader::parse(&w.buf[cur..])
-                .with_context(|| format!("frame {k} header invalid at byte {}", w.off + cur as u64))?;
-            ensure!(hdr.number == k, "frame {k}: header says frame {}", hdr.number);
+            let hdr = FrameHeader::parse(&w.buf[cur..]).with_context(|| {
+                format!("frame {k} header invalid at byte {}", w.off + cur as u64)
+            })?;
+            ensure!(
+                hdr.number == k,
+                "frame {k}: header says frame {}",
+                hdr.number
+            );
             let is_last = k + 1 == nframes;
             let mut crc = crc16_update(0, &w.buf[cur..cur + hdr.len]);
             let mut p = cur + hdr.len;
@@ -498,7 +533,9 @@ impl FrameIndex {
                     .rev()
                     .copied()
                     .find(|&e| trailing_is_tag(&f, e, flen))
-                    .context("last frame: no valid end followed by EOF or a tag (incomplete file?)")?
+                    .context(
+                        "last frame: no valid end followed by EOF or a tag (incomplete file?)",
+                    )?
             } else {
                 end.with_context(|| format!("frame {k}: no valid end found (incomplete file?)"))?
             };
@@ -574,7 +611,9 @@ fn trailing_is_tag(f: &File, end: u64, flen: u64) -> bool {
         return false;
     }
     // No allowance for zero padding on purpose: an unfinished download also ends in zeros.
-    (tail == 128 && &head[..3] == b"TAG") || head.starts_with(b"APETAGEX") || head.starts_with(b"ID3")
+    (tail == 128 && &head[..3] == b"TAG")
+        || head.starts_with(b"APETAGEX")
+        || head.starts_with(b"ID3")
 }
 
 // ---------------------------------------------------------------------------
@@ -606,7 +645,13 @@ impl BitWriter {
 }
 
 /// Size in bytes of a VERBATIM frame produced by `encode_verbatim`.
-pub fn verbatim_size(samples: u32, channels: u32, bps: u32, sample_number: u64, sr_extra: usize) -> u64 {
+pub fn verbatim_size(
+    samples: u32,
+    channels: u32,
+    bps: u32,
+    sample_number: u64,
+    sr_extra: usize,
+) -> u64 {
     let bs_extra = if samples <= 256 { 1 } else { 2 };
     let header = 4 + coded_len(sample_number) + bs_extra + sr_extra + 1;
     let bits = channels as u64 * (8 + samples as u64 * bps as u64);
@@ -616,9 +661,18 @@ pub fn verbatim_size(samples: u32, channels: u32, bps: u32, sample_number: u64, 
 /// Encode interleaved-by-channel samples (`chans[c][i]`) as one VERBATIM frame
 /// with a variable-blocksize header. `sr_bytes` = (sample-rate code, explicit bytes)
 /// copied from the source frames so the header stays self-describing.
-pub fn encode_verbatim(chans: &[&[i32]], bps: u32, sample_number: u64, sr_code: u8, sr_extra: &[u8]) -> Vec<u8> {
+pub fn encode_verbatim(
+    chans: &[&[i32]],
+    bps: u32,
+    sample_number: u64,
+    sr_code: u8,
+    sr_extra: &[u8],
+) -> Vec<u8> {
     let n = chans[0].len() as u32;
-    assert!((1..=65535).contains(&n), "FLAC block size must be 1..=65535");
+    assert!(
+        (1..=65535).contains(&n),
+        "FLAC block size must be 1..=65535"
+    );
     let mut h = vec![0xFF, 0xF9];
     let bs_code = if n <= 256 { 6u8 } else { 7u8 };
     h.push((bs_code << 4) | sr_code);
@@ -631,7 +685,11 @@ pub fn encode_verbatim(chans: &[&[i32]], bps: u32, sample_number: u64, sr_code: 
     }
     h.extend_from_slice(sr_extra);
     h.push(crc8(&h));
-    let mut w = BitWriter { buf: h, acc: 0, nbits: 0 };
+    let mut w = BitWriter {
+        buf: h,
+        acc: 0,
+        nbits: 0,
+    };
     for ch in chans {
         w.put(0b0000_0010, 8); // zero pad bit, SUBFRAME_VERBATIM, no wasted bits
         for &s in ch.iter() {
@@ -671,7 +729,9 @@ pub fn decode_frame(frame: &[u8], bps: u32) -> Result<Vec<Vec<i32>>> {
         Ok(None) => bail!("empty frame"),
         Err(e) => bail!("decode error: {e}"),
     };
-    Ok((0..block.channels()).map(|c| block.channel(c).to_vec()).collect())
+    Ok((0..block.channels())
+        .map(|c| block.channel(c).to_vec())
+        .collect())
 }
 
 #[cfg(test)]
@@ -680,7 +740,23 @@ mod tests {
 
     #[test]
     fn number_roundtrip() {
-        for &v in &[0u64, 1, 0x7F, 0x80, 0x7FF, 0x800, 0xFFFF, 0x10000, 0x1FFFFF, 0x200000, 0x3FFFFFF, 0x4000000, 0x7FFFFFFF, 0x80000000, 0xF_FFFF_FFFF] {
+        for &v in &[
+            0u64,
+            1,
+            0x7F,
+            0x80,
+            0x7FF,
+            0x800,
+            0xFFFF,
+            0x10000,
+            0x1FFFFF,
+            0x200000,
+            0x3FFFFFF,
+            0x4000000,
+            0x7FFFFFFF,
+            0x80000000,
+            0xF_FFFF_FFFF,
+        ] {
             let mut b = Vec::new();
             encode_number(v, &mut b);
             assert_eq!(b.len(), coded_len(v), "len {v:#x}");
@@ -697,12 +773,25 @@ mod tests {
 
     #[test]
     fn verbatim_roundtrip() {
-        for &(bps, n) in &[(16u32, 1u32), (16, 17), (16, 300), (24, 4096), (8, 5), (24, 65535)] {
+        for &(bps, n) in &[
+            (16u32, 1u32),
+            (16, 17),
+            (16, 300),
+            (24, 4096),
+            (8, 5),
+            (24, 65535),
+        ] {
             let max = 1i64 << (bps - 1);
-            let l: Vec<i32> = (0..n as i64).map(|i| ((i * 7919) % (2 * max) - max) as i32).collect();
+            let l: Vec<i32> = (0..n as i64)
+                .map(|i| ((i * 7919) % (2 * max) - max) as i32)
+                .collect();
             let r: Vec<i32> = l.iter().map(|s| (-(*s as i64) - 1) as i32).collect();
             let fr = encode_verbatim(&[&l, &r], bps, 123_456, 9, &[]);
-            assert_eq!(fr.len() as u64, verbatim_size(n, 2, bps, 123_456, 0), "size bps={bps} n={n}");
+            assert_eq!(
+                fr.len() as u64,
+                verbatim_size(n, 2, bps, 123_456, 0),
+                "size bps={bps} n={n}"
+            );
             let h = FrameHeader::parse(&fr).unwrap();
             assert!(h.variable && h.number == 123_456 && h.block_size == n);
             assert_eq!(crc16(&fr), 0);

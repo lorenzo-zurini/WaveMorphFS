@@ -4,6 +4,7 @@ mod dst;
 mod flac;
 mod fs;
 mod id3;
+mod mp4;
 mod retag;
 mod sacd;
 mod scan;
@@ -21,7 +22,10 @@ use std::time::Duration;
 use vfile::VFile;
 
 #[derive(Parser)]
-#[command(name = "wavemorphfs", about = "Present pristine audio downloads as split, tagged tracks via FUSE")]
+#[command(
+    name = "wavemorphfs",
+    about = "Present pristine audio downloads as split, tagged tracks via FUSE"
+)]
 struct Cli {
     /// Library root as NAME=PATH (repeatable)
     #[arg(long = "root", global = true, value_parser = parse_root)]
@@ -79,23 +83,51 @@ fn expand(p: &str) -> PathBuf {
 
 fn parse_root(s: &str) -> Result<Root, String> {
     let (n, p) = s.split_once('=').ok_or("expected NAME=PATH")?;
-    Ok(Root { name: n.to_string(), path: expand(p) })
+    Ok(Root {
+        name: n.to_string(),
+        path: expand(p),
+    })
 }
 
 fn default_roots() -> Vec<Root> {
     let home = expand("~/Storage");
-    vec![Root { name: "Music".into(), path: home.join("Music") }, Root { name: "Classical Music".into(), path: home.join("Classical Music") }]
+    vec![
+        Root {
+            name: "Music".into(),
+            path: home.join("Music"),
+        },
+        Root {
+            name: "Classical Music".into(),
+            path: home.join("Classical Music"),
+        },
+    ]
 }
 
 fn library(cli: &Cli, workers: usize) -> Result<Arc<Library>> {
-    let sacd_multichannel = matches!(cli.cmd, Cmd::Mount { sacd_multichannel: true, .. });
-    let roots = if cli.roots.is_empty() { default_roots() } else { cli.roots.clone() };
+    let sacd_multichannel = matches!(
+        cli.cmd,
+        Cmd::Mount {
+            sacd_multichannel: true,
+            ..
+        }
+    );
+    let roots = if cli.roots.is_empty() {
+        default_roots()
+    } else {
+        cli.roots.clone()
+    };
     for r in &roots {
         if !r.path.is_dir() {
             bail!("root {} does not exist: {}", r.name, r.path.display());
         }
     }
-    Library::new(Config { roots, tags_dir: expand(&cli.tags_dir), cache_dir: expand(&cli.cache_dir), workers, sacd_multichannel })
+    Library::new(Config {
+        roots,
+        tags_dir: expand(&cli.tags_dir),
+        cache_dir: expand(&cli.cache_dir),
+        workers,
+        sacd_multichannel,
+    })
 }
 
 fn abs(p: &Path) -> Result<PathBuf> {
@@ -103,10 +135,19 @@ fn abs(p: &Path) -> Result<PathBuf> {
 }
 
 fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).format_timestamp_secs().init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format_timestamp_secs()
+        .init();
     let cli = Cli::parse();
     match &cli.cmd {
-        Cmd::Mount { mountpoint, workers, threads, allow_other, prescan, .. } => {
+        Cmd::Mount {
+            mountpoint,
+            workers,
+            threads,
+            allow_other,
+            prescan,
+            ..
+        } => {
             let lib = library(&cli, *workers)?;
             lib.start_workers();
             lib.start_prescan(Duration::from_secs(*prescan));
@@ -130,7 +171,13 @@ fn main() -> Result<()> {
             for e in &l.entries {
                 match &e.kind {
                     EntryKind::Dir(_) => println!("{:>14}  {}/", "<dir>", e.name.to_string_lossy()),
-                    EntryKind::File(vf) => println!("{:>14}  {}\n{:>16}{}", vf.size(), e.name.to_string_lossy(), "", vf.describe()),
+                    EntryKind::File(vf) => println!(
+                        "{:>14}  {}\n{:>16}{}",
+                        vf.size(),
+                        e.name.to_string_lossy(),
+                        "",
+                        vf.describe()
+                    ),
                 }
             }
         }
@@ -140,23 +187,70 @@ fn main() -> Result<()> {
             let tmp = tempdir()?;
             let (mut ok, mut n) = (0, 0);
             for e in &l.entries {
-                let EntryKind::File(vf) = &e.kind else { continue };
+                let EntryKind::File(vf) = &e.kind else {
+                    continue;
+                };
                 let d = vf.describe();
-                if !(d.starts_with("flac-image:") || d.starts_with("sacd:") || d.starts_with("retagged-flac:")) {
+                if !(d.starts_with("flac-image:")
+                    || d.starts_with("sacd:")
+                    || d.starts_with("retagged-flac:")
+                    || d.starts_with("retagged-mp3:")
+                    || d.starts_with("retagged-m4a:"))
+                {
                     continue;
                 }
                 n += 1;
                 let out = tmp.join(&e.name);
                 dump(vf.as_ref(), &out)?;
-                let good = if d.starts_with("sacd:") {
-                    run_ok("ffmpeg", &["-v", "error", "-xerror", "-i", &out.to_string_lossy(), "-f", "null", "-"], true)
+                let good = if let Some(src) = d
+                    .strip_prefix("retagged-mp3:")
+                    .or_else(|| d.strip_prefix("retagged-m4a:"))
+                {
+                    // same compressed audio as the source, and it decodes
+                    let a = stream_md5(&out);
+                    a.is_some()
+                        && a == stream_md5(Path::new(src))
+                        && run_ok(
+                            "ffmpeg",
+                            &[
+                                "-v",
+                                "error",
+                                "-xerror",
+                                "-i",
+                                &out.to_string_lossy(),
+                                "-f",
+                                "null",
+                                "-",
+                            ],
+                            false,
+                        )
+                } else if d.starts_with("sacd:") {
+                    run_ok(
+                        "ffmpeg",
+                        &[
+                            "-v",
+                            "error",
+                            "-xerror",
+                            "-i",
+                            &out.to_string_lossy(),
+                            "-f",
+                            "null",
+                            "-",
+                        ],
+                        true,
+                    )
                 } else {
                     run_ok("flac", &["-t", "-s", &out.to_string_lossy()], false)
                 };
                 if good {
                     ok += 1;
                 }
-                println!("{}  {:>11}  {}", if good { "OK  " } else { "FAIL" }, vf.size(), e.name.to_string_lossy());
+                println!(
+                    "{}  {:>11}  {}",
+                    if good { "OK  " } else { "FAIL" },
+                    vf.size(),
+                    e.name.to_string_lossy()
+                );
                 std::fs::remove_file(&out).ok();
             }
             println!("{ok}/{n} virtual tracks valid");
@@ -171,18 +265,27 @@ fn main() -> Result<()> {
                 .entries
                 .iter()
                 .filter_map(|e| match &e.kind {
-                    EntryKind::File(vf) if vf.describe().starts_with("flac-image:") => Some((e.name.clone(), Arc::clone(vf))),
+                    EntryKind::File(vf) if vf.describe().starts_with("flac-image:") => {
+                        Some((e.name.clone(), Arc::clone(vf)))
+                    }
                     _ => None,
                 })
                 .collect();
             let mut split: Vec<PathBuf> = std::fs::read_dir(split_dir)?
                 .flatten()
                 .map(|d| d.path())
-                .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("flac")))
+                .filter(|p| {
+                    p.extension()
+                        .is_some_and(|e| e.eq_ignore_ascii_case("flac"))
+                })
                 .collect();
             split.sort();
             if virt.len() != split.len() {
-                bail!("{} virtual tracks vs {} split files", virt.len(), split.len());
+                bail!(
+                    "{} virtual tracks vs {} split files",
+                    virt.len(),
+                    split.len()
+                );
             }
             let tmp = tempdir()?;
             let mut same = 0;
@@ -211,7 +314,9 @@ fn main() -> Result<()> {
         Cmd::TagsInit { dir, force } => {
             let lib = library(&cli, 0)?;
             let dir = abs(dir)?;
-            let ov = lib.overlay_dir(&dir).context("directory is not inside a configured root")?;
+            let ov = lib
+                .overlay_dir(&dir)
+                .context("directory is not inside a configured root")?;
             let target = ov.join(sidecar::FILE_NAME);
             if target.exists() && !force {
                 bail!("{} exists (use --force)", target.display());
@@ -219,7 +324,9 @@ fn main() -> Result<()> {
             let l = lib.list_dir(&dir)?;
             let mut per: Vec<(String, tags::Tags)> = Vec::new();
             for e in &l.entries {
-                let EntryKind::File(vf) = &e.kind else { continue };
+                let EntryKind::File(vf) = &e.kind else {
+                    continue;
+                };
                 let name = e.name.to_string_lossy().to_string();
                 if let Some(t) = read_tags(vf.as_ref(), &name) {
                     per.push((name, t));
@@ -229,7 +336,10 @@ fn main() -> Result<()> {
                 bail!("no taggable audio files in {}", dir.display());
             }
             let mut album = per[0].1.clone();
-            album.0.retain(|k, v| per.iter().all(|(_, t)| t.0.get(k) == Some(v)) && !tags::TRACK_SPECIFIC.iter().any(|n| k.is(n)));
+            album.0.retain(|k, v| {
+                per.iter().all(|(_, t)| t.0.get(k) == Some(v))
+                    && !tags::TRACK_SPECIFIC.iter().any(|n| k.is(n))
+            });
             let files: Vec<(String, tags::Tags)> = per
                 .into_iter()
                 .map(|(n, mut t)| {
@@ -275,6 +385,19 @@ fn run_ok(cmd: &str, args: &[&str], strict_stderr: bool) -> bool {
         .unwrap_or(false)
 }
 
+/// MD5 of a file's audio packets (stream copy, no decoding).
+fn stream_md5(p: &Path) -> Option<String> {
+    let o = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(p)
+        .args(["-map", "0:a", "-c", "copy", "-f", "md5", "-"])
+        .output()
+        .ok()?;
+    o.status
+        .success()
+        .then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
+}
+
 fn pcm_md5(p: &Path) -> Result<String> {
     let o = std::process::Command::new("sh")
         .arg("-c")
@@ -285,7 +408,11 @@ fn pcm_md5(p: &Path) -> Result<String> {
     if !o.status.success() {
         return Ok(String::new());
     }
-    Ok(String::from_utf8_lossy(&o.stdout).split_whitespace().next().unwrap_or("").to_string())
+    Ok(String::from_utf8_lossy(&o.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_string())
 }
 
 /// Tags of a (virtual) FLAC file, read from its generated header.
@@ -303,7 +430,9 @@ fn read_tags(vf: &dyn VFile, name: &str) -> Option<tags::Tags> {
         let last = h[0] & 0x80 != 0;
         let len = u32::from_be_bytes([0, h[1], h[2], h[3]]) as usize;
         if h[0] & 0x7F == flac::BLOCK_VORBIS {
-            return Some(tags::Tags::from_pairs(flac::parse_vorbis(head.get(p + 4..p + 4 + len)?)));
+            return Some(tags::Tags::from_pairs(flac::parse_vorbis(
+                head.get(p + 4..p + 4 + len)?,
+            )));
         }
         if last {
             return None;
