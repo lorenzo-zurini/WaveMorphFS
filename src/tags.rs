@@ -3,8 +3,36 @@
 
 use std::collections::BTreeMap;
 
+/// A tag name. Compared case-insensitively (as Vorbis comments define), but the
+/// spelling it was written with is kept and used for output: names from sidecars
+/// are never rewritten.
+#[derive(Debug, Clone)]
+pub struct Key(pub String);
+
+impl PartialEq for Key {
+    fn eq(&self, o: &Self) -> bool {
+        self.0.eq_ignore_ascii_case(&o.0)
+    }
+}
+impl Eq for Key {}
+impl PartialOrd for Key {
+    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+impl Ord for Key {
+    fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+        self.0.to_ascii_uppercase().cmp(&o.0.to_ascii_uppercase())
+    }
+}
+impl Key {
+    pub fn is(&self, name: &str) -> bool {
+        self.0.eq_ignore_ascii_case(name)
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Tags(pub BTreeMap<String, Vec<String>>);
+pub struct Tags(pub BTreeMap<Key, Vec<String>>);
 
 /// Keys that describe a single track; they must not leak from an image file's
 /// own tags (which describe the whole disc) into the split tracks.
@@ -32,41 +60,40 @@ impl Tags {
         if v.trim().is_empty() {
             return;
         }
-        self.0.entry(key.to_ascii_uppercase()).or_default().push(v);
+        self.0.entry(Key(key.to_string())).or_default().push(v);
     }
 
-    /// Replace all values of `key`.
+    /// Replace all values of `key` (any spelling).
     pub fn set(&mut self, key: &str, value: impl Into<String>) {
         let v = value.into();
-        let k = key.to_ascii_uppercase();
-        if v.trim().is_empty() {
-            self.0.remove(&k);
-        } else {
-            self.0.insert(k, vec![v]);
+        self.0.remove(&Key(key.to_string()));
+        if !v.trim().is_empty() {
+            self.0.insert(Key(key.to_string()), vec![v]);
         }
     }
 
     pub fn set_many(&mut self, key: &str, values: Vec<String>) {
-        let k = key.to_ascii_uppercase();
         let values: Vec<String> = values.into_iter().filter(|v| !v.trim().is_empty()).collect();
-        if values.is_empty() {
-            self.0.remove(&k);
-        } else {
-            self.0.insert(k, values);
+        self.0.remove(&Key(key.to_string()));
+        if !values.is_empty() {
+            self.0.insert(Key(key.to_string()), values);
         }
     }
 
     pub fn get(&self, key: &str) -> Option<&str> {
-        self.0.get(&key.to_ascii_uppercase()).and_then(|v| v.first()).map(|s| s.as_str())
+        self.get_all(key).and_then(|v| v.first()).map(|s| s.as_str())
     }
 
+    pub fn get_all(&self, key: &str) -> Option<&Vec<String>> {
+        self.0.get(&Key(key.to_string()))
+    }
 
-    /// Overlay `other` on top of self: every key present in `other` replaces ours.
+    /// Overlay `other` on top of self: every key present in `other` replaces ours
+    /// (including its spelling); an empty value list deletes the key.
     pub fn overlay(&mut self, other: &Tags) {
         for (k, v) in &other.0 {
-            if v.is_empty() {
-                self.0.remove(k);
-            } else {
+            self.0.remove(k);
+            if !v.is_empty() {
                 self.0.insert(k.clone(), v.clone());
             }
         }
@@ -74,14 +101,12 @@ impl Tags {
 
     pub fn without_track_specific(&self) -> Tags {
         let mut t = self.clone();
-        for k in TRACK_SPECIFIC {
-            t.0.remove(*k);
-        }
+        t.0.retain(|k, _| !TRACK_SPECIFIC.iter().any(|n| k.is(n)));
         t
     }
 
     pub fn to_pairs(&self) -> Vec<(String, String)> {
-        self.0.iter().flat_map(|(k, vs)| vs.iter().map(move |v| (k.clone(), v.clone()))).collect()
+        self.0.iter().flat_map(|(k, vs)| vs.iter().map(move |v| (k.0.clone(), v.clone()))).collect()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -159,8 +184,18 @@ mod tests {
         let mut a = Tags::from_pairs([("ARTIST".into(), "A".into()), ("ARTIST".into(), "B".into()), ("DATE".into(), "1990".into())]);
         let b = Tags::from_pairs([("artist".into(), "C".into())]);
         a.overlay(&b);
-        assert_eq!(a.0["ARTIST"], vec!["C"]);
+        assert_eq!(a.get_all("ARTIST").unwrap(), &vec!["C".to_string()]);
         assert_eq!(a.get("date"), Some("1990"));
+    }
+
+    #[test]
+    fn keys_keep_spelling_but_match_case_insensitively() {
+        let mut t = Tags::from_pairs([("MusicBrainz Album Id".into(), "x".into()), ("album_artist".into(), "y".into())]);
+        assert_eq!(t.get("MUSICBRAINZ ALBUM ID"), Some("x"));
+        let names: Vec<_> = t.to_pairs().into_iter().map(|(k, _)| k).collect();
+        assert!(names.contains(&"MusicBrainz Album Id".to_string()) && names.contains(&"album_artist".to_string()));
+        t.overlay(&Tags::from_pairs([("ALBUM_ARTIST".into(), "z".into())]));
+        assert_eq!(t.get_all("album_artist").unwrap(), &vec!["z".to_string()]);
     }
 
     #[test]

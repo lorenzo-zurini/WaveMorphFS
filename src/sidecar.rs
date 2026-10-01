@@ -47,8 +47,8 @@ fn table_to_tags(t: &toml::Table) -> Tags {
             toml::Value::Array(a) => a.iter().map(value_str).collect(),
             other => vec![value_str(other)],
         };
-        // keep explicit removals as an empty Vec so overlay() deletes the key
-        tags.0.insert(k.to_ascii_uppercase(), vals.into_iter().filter(|s| !s.is_empty()).collect());
+        // names are kept exactly as written; explicit removals stay as an empty Vec so overlay() deletes the key
+        tags.0.insert(crate::tags::Key(k.clone()), vals.into_iter().filter(|s| !s.is_empty()).collect());
     }
     tags
 }
@@ -129,6 +129,7 @@ impl Sidecar {
         fn table(t: &Tags) -> toml::Table {
             let mut tab = toml::Table::new();
             for (k, v) in &t.0 {
+                let k = &k.0;
                 let val = if v.len() == 1 {
                     toml::Value::String(v[0].clone())
                 } else {
@@ -163,6 +164,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn quoted_names_kept_verbatim() {
+        let sc = Sidecar::parse(
+            r#"
+[file."01 - Song.m4a"]
+"MusicBrainz Album Id" = "abc"
+album_artist = "Someone"
+"TXXX:Custom/Tag" = "v"
+"#,
+        )
+        .unwrap();
+        let f = sc.file("01 - Song.m4a").unwrap();
+        let names: Vec<String> = f.to_pairs().into_iter().map(|(k, _)| k).collect();
+        assert!(names.contains(&"MusicBrainz Album Id".to_string()));
+        assert!(names.contains(&"album_artist".to_string()));
+        assert!(names.contains(&"TXXX:Custom/Tag".to_string()));
+        assert_eq!(f.get("MUSICBRAINZ ALBUM ID"), Some("abc"));
+    }
+
+    #[test]
     fn parse_and_lookup() {
         let sc = Sidecar::parse(
             r#"
@@ -179,8 +199,8 @@ TITLE = "File"
 "#,
         )
         .unwrap();
-        assert_eq!(sc.album.0["ARTIST"], vec!["A", "B"]);
-        assert!(sc.album.0["COMMENT"].is_empty(), "explicit removal kept as empty");
+        assert_eq!(sc.album.get_all("ARTIST").unwrap(), &vec!["A".to_string(), "B".to_string()]);
+        assert!(sc.album.get_all("COMMENT").unwrap().is_empty(), "explicit removal kept as empty");
         assert_eq!(sc.track(None, 3).unwrap().get("TITLE"), Some("Three"));
         assert_eq!(sc.track(Some(2), 5).unwrap().get("TITLE"), Some("Disc two five"));
         assert_eq!(sc.file("a b.flac").unwrap().get("TITLE"), Some("File"));

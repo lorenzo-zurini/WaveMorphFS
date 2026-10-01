@@ -290,7 +290,7 @@ impl SacdDisc {
         if let Some(v) = &t.title {
             tg.set("TITLE", v);
         }
-        match (&t.performer, tg.0.get("ALBUMARTIST").cloned()) {
+        match (&t.performer, tg.get_all("ALBUMARTIST").cloned()) {
             (Some(p), _) => tg.set("ARTIST", p),
             (None, Some(aa)) => tg.set_many("ARTIST", aa),
             _ => {}
