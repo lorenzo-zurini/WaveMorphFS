@@ -46,7 +46,7 @@ global options:
   --root NAME=PATH          library root (repeatable; default ~/Storage/Music, ~/Storage/Classical Music)
   --tags-dir DIR            sidecar tag trees: <tags-dir>/<root name>/<relative dir>/wavemorph.json
                             (default ~/Storage/WaveMorph/tags)
-  --cache-dir DIR           frame indexes, converted images (default ~/Storage/WaveMorph/cache)
+  --cache-dir DIR           frame/packet indexes (default ~/Storage/WaveMorph/cache)
 
 environment: WAVEMORPH_LOG=debug|info|warn|error
 )USAGE";
@@ -228,7 +228,7 @@ int cmd_verify(const Cli& cli) {
         if (e.is_dir) continue;
         std::string d = e.file->describe();
         bool retag_other = starts_with(d, "retagged-mp3:") || starts_with(d, "retagged-m4a:");
-        if (!(starts_with(d, "flac-image:") || starts_with(d, "sacd:") || starts_with(d, "retagged-flac:") || retag_other)) continue;
+        if (!(starts_with(d, "flac-image:") || starts_with(d, "flac-encoded:") || starts_with(d, "sacd:") || starts_with(d, "retagged-flac:") || retag_other)) continue;
         n++;
         fs::path out = tmp / e.name;
         dump(*e.file, out);
@@ -258,7 +258,7 @@ int cmd_compare(const Cli& cli) {
     auto l = lib->list_dir(abs_path(cli.pos[0]));
     std::vector<const Entry*> virt;
     for (auto& e : l->entries)
-        if (!e.is_dir && starts_with(e.file->describe(), "flac-image:")) virt.push_back(&e);
+        if (!e.is_dir && (starts_with(e.file->describe(), "flac-image:") || starts_with(e.file->describe(), "flac-encoded:"))) virt.push_back(&e);
     std::vector<fs::path> split_files;
     for (auto& de : fs::directory_iterator(cli.pos[1]))
         if (de.is_regular_file() && iequals(de.path().extension().string(), ".flac")) split_files.push_back(de.path());

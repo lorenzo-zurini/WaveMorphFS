@@ -3,9 +3,10 @@
 // source invalidates them:
 //   flacidx/<key>.idx      frame index of a FLAC image
 //   flacidx/<key>.sacdidx  audio frame table of an SACD area
-//   images/<key>.flac      lossless FLAC conversion of a non-FLAC image (APE, WV, ...)
-//   images/<key>.json      the source image's tags (ffprobe)
-//   md5/<key>.txt          per-track audio MD5s of an image
+//   flacidx/<key>.avidx    packet index of a non-FLAC image (APE, WV, ...)
+//   flacidx/<key>.encidx   frame sizes + MD5s of its tracks as encoded FLAC
+//   md5/<key>.txt          per-track audio MD5s of a FLAC image
+// Only positions and sizes: audio is always read from the source.
 #pragma once
 
 #include <array>
@@ -34,19 +35,11 @@ public:
     void store_index(const fs::path& src, const SrcKey& key, const flac::FrameIndex& idx) const;
     /// Index for a FLAC file, from cache or built (and cached) now.
     flac::FrameIndex index_for(const fs::path& src, const flac::FlacMeta& meta) const;
-    /// True if everything needed to present this image is cached (index, and for
-    /// non-FLAC sources the verified conversion), so it opens in milliseconds.
+    /// True if this image's index is cached, so it opens in milliseconds.
     bool image_is_cached(const fs::path& src) const;
 
     Md5Map load_md5s(const fs::path& flac) const;
     void store_md5s(const fs::path& flac, const Md5Map& entries) const;
-
-    fs::path converted_path(const fs::path& src, const SrcKey& key) const;
-    /// Losslessly convert a non-FLAC image to FLAC in the cache, verifying the
-    /// decoded PCM MD5 against the source. Returns the cached FLAC path.
-    fs::path convert_image(const fs::path& src) const;
-    /// Tags of the original (non-FLAC) image saved during conversion.
-    std::vector<std::pair<std::string, std::string>> converted_tags(const fs::path& converted) const;
 
     fs::path sacd_frames_path(const fs::path& src, const SrcKey& key, bool multichannel) const;
 
@@ -56,7 +49,5 @@ private:
     fs::path dir_;
 };
 
-/// ffprobe `-show_entries format_tags -of json` output -> (name, value), names as reported.
-std::vector<std::pair<std::string, std::string>> parse_ffprobe_tags(std::string_view json);
 
 }  // namespace wm

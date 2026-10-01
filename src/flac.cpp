@@ -2,6 +2,7 @@
 #include "flac.hpp"
 
 #include <FLAC/stream_decoder.h>
+#include <FLAC/stream_encoder.h>
 
 #include <algorithm>
 #include <cstring>
@@ -475,6 +476,57 @@ Bytes encode_verbatim(const std::vector<std::span<const int32_t>>& chans, uint32
     return std::move(w.buf);
 }
 
+// ------------------------------------------------------------------ encoding (libFLAC)
+
+namespace {
+struct FrameSink {
+    Bytes frame;
+};
+
+FLAC__StreamEncoderWriteStatus enc_write(const FLAC__StreamEncoder*, const FLAC__byte buffer[], size_t bytes, uint32_t samples, uint32_t, void* cd) {
+    // metadata is written with samples == 0; only the audio frame is kept
+    if (samples > 0) static_cast<FrameSink*>(cd)->frame.insert(static_cast<FrameSink*>(cd)->frame.end(), buffer, buffer + bytes);
+    return FLAC__STREAM_ENCODER_WRITE_STATUS_OK;
+}
+}  // namespace
+
+Bytes encode_frame(const std::vector<std::span<const int32_t>>& chans, uint32_t bps, uint32_t sample_rate, uint32_t block_size, uint64_t frame_number) {
+    size_t n = chans[0].size();
+    WM_ENSURE(n >= 1 && n <= block_size, "bad block of {} samples", n);
+    FLAC__StreamEncoder* e = FLAC__stream_encoder_new();
+    WM_ENSURE(e, "out of memory");
+    struct Free {
+        FLAC__StreamEncoder* e;
+        ~Free() { FLAC__stream_encoder_delete(e); }
+    } guard{e};
+    FLAC__stream_encoder_set_channels(e, uint32_t(chans.size()));
+    FLAC__stream_encoder_set_bits_per_sample(e, bps);
+    FLAC__stream_encoder_set_sample_rate(e, sample_rate);
+    FLAC__stream_encoder_set_compression_level(e, 5);
+    // per-frame stereo decisions only (loose mid-side would carry state between frames)
+    FLAC__stream_encoder_set_loose_mid_side_stereo(e, false);
+    FLAC__stream_encoder_set_blocksize(e, block_size);
+    FLAC__stream_encoder_set_total_samples_estimate(e, n);
+    FrameSink sink;
+    if (FLAC__stream_encoder_init_stream(e, enc_write, nullptr, nullptr, nullptr, &sink) != FLAC__STREAM_ENCODER_INIT_STATUS_OK)
+        fail("FLAC encoder init failed");
+    std::vector<const FLAC__int32*> ptrs;
+    for (auto& c : chans) ptrs.push_back(c.data());
+    bool ok = FLAC__stream_encoder_process(e, ptrs.data(), uint32_t(n)) && FLAC__stream_encoder_finish(e);
+    WM_ENSURE(ok, "FLAC encoding failed: {}", FLAC__StreamEncoderStateString[FLAC__stream_encoder_get_state(e)]);
+    // the frame was numbered 0; renumber it
+    auto h = FrameHeader::parse(sink.frame);
+    WM_ENSURE(h.has_value() && !h->variable && h->number == 0, "unexpected encoder output");
+    Bytes out(sink.frame.begin(), sink.frame.begin() + 4);
+    encode_number(frame_number, out);
+    size_t es = 4 + h->number_len;
+    out.insert(out.end(), sink.frame.begin() + ptrdiff_t(es), sink.frame.begin() + ptrdiff_t(es + h->extra_len));
+    out.push_back(crc8(out));
+    out.insert(out.end(), sink.frame.begin() + ptrdiff_t(h->len), sink.frame.end() - 2);
+    put_be16(out, crc16(out));
+    return out;
+}
+
 // ------------------------------------------------------------------ decoding (libFLAC)
 
 namespace {
@@ -544,7 +596,8 @@ std::vector<std::vector<int32_t>> decode_frame(std::span<const uint8_t> frame, u
     }
     Decoder dec;
     WM_ENSURE(dec.d, "out of memory");
-    MemSource src{frame};
+    MemSource src;
+    src.data = frame;
     if (FLAC__stream_decoder_init_stream(dec.d, mem_read, nullptr, nullptr, nullptr, nullptr, mem_write, nullptr, on_error, &src) !=
         FLAC__STREAM_DECODER_INIT_STATUS_OK)
         fail("FLAC decoder init failed");
@@ -588,7 +641,8 @@ void file_error(const FLAC__StreamDecoder*, FLAC__StreamDecoderErrorStatus st, v
 void decode_file(const fs::path& p, uint64_t expected, const std::function<void(uint64_t, const std::vector<std::span<const int32_t>>&)>& sink) {
     Decoder dec;
     WM_ENSURE(dec.d, "out of memory");
-    FileSink s{&sink};
+    FileSink s;
+    s.sink = &sink;
     if (FLAC__stream_decoder_init_file(dec.d, p.c_str(), file_write, nullptr, file_error, &s) != FLAC__STREAM_DECODER_INIT_STATUS_OK)
         fail("cannot open {} for decoding", p.string());
     bool ok = FLAC__stream_decoder_process_until_end_of_stream(dec.d);

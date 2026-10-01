@@ -7,7 +7,7 @@ stay **exactly as downloaded**, so torrents keep seeding.
 | On disk (pristine)                         | What the mount shows                                   |
 |--------------------------------------------|--------------------------------------------------------|
 | `Album.cue` + `Album.flac` (image rip)     | `01 - Title.flac`, `02 - Title.flac`, …                |
-| `Album.cue` + `Album.ape` / `.wv` / `.wav` | same, via a verified lossless FLAC conversion in cache |
+| `Album.cue` + `Album.ape` / `.wv` / `.wav` | same, encoded to FLAC on the fly from the decoded image |
 | `Disc.iso` (SACD, plain DSD **or DST**)    | `01 - Title.dsf`, `02 - Title.dsf`, …                  |
 | `*.flac`, `*.mp3`, `*.m4a`                 | the same file with sidecar tags applied                |
 | any other file                             | passed through untouched                               |
@@ -28,9 +28,14 @@ you control — never written into the downloads.
   seen, one sequential pass checks every frame's CRC and numbering and records its
   offset (cached on disk). BitTorrent downloads pieces in random order, so this is
   also what keeps half-finished downloads out of the library.
-* **Non-FLAC images** (APE, WavPack, TTA, TAK, WAV, ALAC) are converted once to FLAC
-  in the cache; the conversion is accepted only if the decoded PCM MD5 matches the
-  source. The source file is never modified.
+* **Non-FLAC images** (APE, WavPack, TTA, TAK, WAV, ALAC) cannot be cut without
+  re-encoding (APE frames are seconds long and must all be full length), so their
+  tracks are served as compressed FLAC encoded on the fly. Nothing is stored but
+  positions and sizes: the first time an image is seen it is decoded once with
+  checksum verification (FFmpeg's decoders) and every track frame is encoded once
+  to learn its size, so file sizes are exact. Reads then decode just the packets
+  they need and encode just those frames; FLAC frames are independent, so a frame
+  re-encoded later is byte-identical.
 * **SACD ISOs** (Scarlet Book) are parsed for track lists and text; the stereo area
   is exposed as DSF. With `--sacd-multichannel` the multichannel area is exposed too,
   as `MC NN - Title.dsf` tagged `<album> (Multichannel)`. Plain DSD is only
@@ -61,8 +66,8 @@ Everything that produces audio is checked against independent references:
 
 ## Building
 
-Needs a C++20 compiler, CMake, libfuse3, libFLAC and nlohmann/json; at run time
-`flac`, `ffmpeg` and `ffprobe` (image conversion and `verify`).
+Needs a C++20 compiler, CMake, libfuse3, libFLAC, FFmpeg's libavformat/libavcodec
+and nlohmann/json; `flac` and `ffmpeg` are used by `verify`, `compare` and the tests.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release

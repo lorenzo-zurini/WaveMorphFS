@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // The library: turns a source directory into the list of entries the filesystem
 // exposes, and runs background workers for the slow parts (indexing images,
-// converting non-FLAC images, scanning SACD ISOs, per-track MD5s).
+// verifying non-FLAC images and measuring their tracks, scanning SACD ISOs,
+// per-track MD5s). Audio is never copied: every read goes to the source file.
 //
 // Rules per source directory:
 //  * X.cue + existing single-file image   -> virtual per-track FLAC files; cue and image hidden
@@ -24,6 +25,7 @@
 
 #include "cache.hpp"
 #include "cue.hpp"
+#include "encoded.hpp"
 #include "sacd.hpp"
 #include "sidecar.hpp"
 #include "track.hpp"
@@ -72,9 +74,11 @@ struct Listing {
     const Entry* find(std::string_view name) const;
 };
 
-/// A processed image: the FLAC data to split plus the source's own tags.
+/// A processed image: a FLAC image (split by copying frames) or a decoded one
+/// (tracks encoded on the fly), plus the source's own tags.
 struct ReadyImage {
     std::shared_ptr<const FlacImage> flac;
+    std::shared_ptr<const AvImage> av;
     Tags source_tags;
     std::vector<flac::MetaBlock> pictures;
 };
@@ -103,7 +107,7 @@ public:
     /// Root this source path belongs to and the path relative to it.
     std::optional<std::pair<const Root*, fs::path>> root_of(const fs::path& p) const;
     std::optional<fs::path> overlay_dir(const fs::path& dir) const;
-    /// Index (and if needed convert) an image.
+    /// Verify and index an image.
     ReadyImage process_image(const fs::path& src) const;
     /// Human-readable summary of processing state, written next to the cache dir.
     void write_status() const;
@@ -122,7 +126,12 @@ private:
         std::vector<std::pair<uint64_t, uint64_t>> ranges;
         fs::path dir;
     };
-    using Job = std::variant<ImageJob, SacdJob, Md5Job>;
+    struct EncodeJob {  // measure the encoded tracks of a decoded image
+        std::shared_ptr<const AvImage> image;
+        Ranges ranges;
+        fs::path dir;
+    };
+    using Job = std::variant<ImageJob, SacdJob, Md5Job, EncodeJob>;
 
     void worker_loop();
     void run_job(Job job);
@@ -133,7 +142,8 @@ private:
     Work<SacdDisc> sacd_state(const fs::path& src, const fs::path& dir, bool mc);
     Sig signature(const fs::path& dir) const;
     std::shared_ptr<Listing> build_listing(const fs::path& dir, const Sig& sig);
-    std::vector<Entry> image_tracks(const fs::path& dir, const CueSheet& cue, const ReadyImage& ready, std::optional<uint32_t> disc, bool multi,
+    /// nullopt while the tracks are still being measured
+    std::optional<std::vector<Entry>> image_tracks(const fs::path& dir, const CueSheet& cue, const ReadyImage& ready, std::optional<uint32_t> disc, bool multi,
                                     size_t ndiscs, const Sidecar* sidecar, int64_t mtime);
     std::vector<Entry> sacd_tracks(const std::shared_ptr<const SacdDisc>& disc, std::optional<uint32_t> disc_no, size_t ndiscs, const Sidecar* sidecar,
                                    int64_t mtime, bool mc);
@@ -144,7 +154,7 @@ private:
     std::map<fs::path, std::shared_ptr<Listing>> listings_;
     std::map<fs::path, std::pair<uint64_t, int64_t>> generations_;
     std::map<fs::path, std::shared_ptr<std::mutex>> dir_locks_;
-    std::set<fs::path> md5_queued_;
+    std::set<fs::path> md5_queued_, encode_queued_;
 
     std::mutex jobs_mu_;
     std::condition_variable jobs_cv_;
