@@ -140,7 +140,8 @@ fn parse_sector(s: &[u8]) -> Result<AudioSector> {
 }
 
 const DATA_AUDIO: u8 = 2;
-const IDX_MAGIC: &[u8; 8] = b"WMSACD01";
+const IDX_MAGIC_V1: &[u8; 8] = b"WMSACD01"; // frame starts only
+const IDX_MAGIC: &[u8; 8] = b"WMSACD02"; // frame starts + end marker
 
 impl SacdDisc {
     /// Open the stereo area, or with `multichannel` the multichannel area.
@@ -267,18 +268,19 @@ impl SacdDisc {
 
         let key = SrcKey::of(path)?;
         let key = SrcKey { size: key.size, mtime_ns: key.mtime_ns ^ (multichannel as i128) << 100 };
-        let frames = match cache.and_then(|c| load_frames(c, path, key)) {
+        let frames = match cache.and_then(|c| load_frames(c, path, key, area_audio_end)) {
             Some(fr) => fr,
             None => {
-                let fr = scan_frames(&f, area_audio_start, area_audio_end, channels, dst)?;
+                let fr = scan_frames(&f, area_audio_start, area_audio_end, channels, dst, tracks.last().unwrap().end)?;
                 if let Some(c) = cache {
                     store_frames(c, path, key, &fr)?;
                 }
                 fr
             }
         };
+        // frames ends with one extra entry: where the last needed frame ends
         let last = tracks.last().unwrap().end;
-        ensure!(last <= frames.len() as u64, "track list ends at frame {last} but the area has {} frames", frames.len());
+        ensure!(last < frames.len() as u64, "track list ends at frame {last} but only {} frames were found", frames.len().saturating_sub(1));
         Ok(SacdDisc { path: path.to_path_buf(), channels, tracks, album, frames, area_end: area_audio_end, dst, recent: Mutex::new(None) })
     }
 
@@ -307,7 +309,7 @@ impl SacdDisc {
     /// variable for DST).
     fn coded_frames(&self, f0: u64, f1: u64) -> Result<Vec<Vec<u8>>> {
         let start = self.frames[f0 as usize];
-        let end = self.frames.get(f1 as usize).copied().unwrap_or((self.area_end as u32 + 1, 0));
+        let end = self.frames[f1 as usize]; // always present: the list ends with an end marker
         let (s0, s1) = (start.0 as u64, end.0 as u64);
         let count = s1 - s0 + 1;
         let file = File::open(&self.path)?;
@@ -385,11 +387,16 @@ impl SacdDisc {
     }
 }
 
-fn scan_frames(f: &File, start: u64, end: u64, channels: u32, dst: bool) -> Result<Vec<(u32, u16)>> {
+/// Record where every audio frame starts. Stops at the start of frame `needed`
+/// (one past the last track), which then doubles as the end marker. Some rips
+/// end the area with an unparseable sector; that is tolerated once every needed
+/// frame is complete, and the bad sector becomes the end marker.
+fn scan_frames(f: &File, start: u64, end: u64, channels: u32, dst: bool, needed: u64) -> Result<Vec<(u32, u16)>> {
     let mut frames: Vec<(u32, u16)> = Vec::new();
     let frame_bytes = FRAME_BYTES as usize * channels as usize;
     let mut acc = 0usize; // audio bytes of the current frame seen so far
     const CHUNK: u64 = 2048; // sectors per read (4 MiB)
+    let complete = |frames: &Vec<(u32, u16)>, acc: usize| frames.len() as u64 == needed && (dst || acc == frame_bytes);
     let mut s = start;
     while s <= end {
         let n = CHUNK.min(end + 1 - s);
@@ -398,8 +405,19 @@ fn scan_frames(f: &File, start: u64, end: u64, channels: u32, dst: bool) -> Resu
         for i in 0..n {
             let sec_no = s + i;
             let sb = &buf[(i * SECTOR) as usize..((i + 1) * SECTOR) as usize];
-            let p = parse_sector(sb).with_context(|| format!("sector {sec_no}"))?;
-            ensure!(p.dst == dst, "sector {sec_no}: DST flag {} in a {} area", p.dst, if dst { "DST" } else { "plain DSD" });
+            let parsed = parse_sector(sb).with_context(|| format!("sector {sec_no}")).and_then(|p| {
+                ensure!(p.dst == dst, "sector {sec_no}: DST flag {} in a {} area", p.dst, if dst { "DST" } else { "plain DSD" });
+                Ok(p)
+            });
+            let p = match parsed {
+                Ok(p) => p,
+                Err(e) if complete(&frames, acc) => {
+                    log::info!("{e:#}: ignored, all {needed} frames already found");
+                    frames.push((sec_no as u32, 0));
+                    return Ok(frames);
+                }
+                Err(e) => return Err(e),
+            };
             let mut tc_iter = p.frame_tcs.iter();
             for &(po, len, dt, fs) in &p.packets {
                 if dt != DATA_AUDIO {
@@ -413,18 +431,21 @@ fn scan_frames(f: &File, start: u64, end: u64, channels: u32, dst: bool) -> Resu
                     }
                     frames.push((sec_no as u32, po as u16));
                     acc = 0;
+                    if frames.len() as u64 == needed + 1 {
+                        return Ok(frames); // start of the frame after the last track = end marker
+                    }
                 }
                 acc += len;
             }
         }
         s += n;
     }
-    ensure!(!frames.is_empty(), "no audio frames found");
-    ensure!(dst || acc == frame_bytes, "last frame incomplete ({acc} bytes)");
+    ensure!(complete(&frames, acc), "area ended after {} of {needed} frames", frames.len());
+    frames.push(((end + 1) as u32, 0));
     Ok(frames)
 }
 
-/// True if the frame table of this ISO is cached (opening is then cheap).
+/// True if the frame table of this ISO area is cached (opening is then cheap).
 pub fn is_cached(c: &Cache, src: &Path, multichannel: bool) -> bool {
     SrcKey::of(src).is_ok_and(|k| {
         let k = SrcKey { size: k.size, mtime_ns: k.mtime_ns ^ (multichannel as i128) << 100 };
@@ -441,16 +462,21 @@ fn frames_cache_path(c: &Cache, src: &Path, key: SrcKey) -> PathBuf {
     dir.join(format!("{:016x}.sacdidx", std::hash::Hasher::finish(&h)))
 }
 
-fn load_frames(c: &Cache, src: &Path, key: SrcKey) -> Option<Vec<(u32, u16)>> {
+fn load_frames(c: &Cache, src: &Path, key: SrcKey, area_end: u64) -> Option<Vec<(u32, u16)>> {
     let b = std::fs::read(frames_cache_path(c, src, key)).ok()?;
-    if b.len() < 16 || &b[..8] != IDX_MAGIC {
+    if b.len() < 16 || (&b[..8] != IDX_MAGIC && &b[..8] != IDX_MAGIC_V1) {
         return None;
     }
     let n = u64::from_le_bytes(b[8..16].try_into().ok()?) as usize;
     if b.len() != 16 + n * 6 {
         return None;
     }
-    Some(b[16..].chunks_exact(6).map(|c| (u32::from_le_bytes(c[..4].try_into().unwrap()), u16::from_le_bytes([c[4], c[5]]))).collect())
+    let mut fr: Vec<(u32, u16)> = b[16..].chunks_exact(6).map(|c| (u32::from_le_bytes(c[..4].try_into().unwrap()), u16::from_le_bytes([c[4], c[5]]))).collect();
+    if &b[..8] == IDX_MAGIC_V1 {
+        // v1 caches were only written for discs whose area ends cleanly
+        fr.push(((area_end + 1) as u32, 0));
+    }
+    Some(fr)
 }
 
 fn store_frames(c: &Cache, src: &Path, key: SrcKey, fr: &[(u32, u16)]) -> Result<()> {

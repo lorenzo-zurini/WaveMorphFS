@@ -52,7 +52,8 @@ enum Cmd {
         #[arg(long, default_value_t = 900)]
         prescan: u64,
         /// Also expose SACD multichannel areas as separate "(Multichannel)" albums
-        #[arg(long)]
+        /// (env WAVEMORPH_SACD_MULTICHANNEL=1; default off)
+        #[arg(long, env = "WAVEMORPH_SACD_MULTICHANNEL")]
         sacd_multichannel: bool,
     },
     /// Show what a source directory looks like through the filesystem
