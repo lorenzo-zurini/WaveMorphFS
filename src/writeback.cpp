@@ -53,22 +53,46 @@ Tags read_file_tags(const std::string& ext, const ByteReader& read, uint64_t siz
 Tags tag_changes(const Tags& before, const Tags& after) {
     struct Field {
         std::string name;
-        std::vector<std::string> values;
+        std::vector<std::string> values;  // de-duplicated across synonyms, in order
     };
     auto group = [](const Tags& t) {
         std::map<std::string, Field> g;
         for (auto& [k, v] : t.m) {
             auto& f = g[canonical_field(k)];
             if (f.name.empty()) f.name = k;
-            f.values.insert(f.values.end(), v.begin(), v.end());
+            for (auto& x : v)
+                if (std::find(f.values.begin(), f.values.end(), x) == f.values.end()) f.values.push_back(x);
         }
         return g;
     };
+    // values editors write for "unknown" (beets writes BPM 0, DISC 0, ORIGINALDATE 0000...)
+    auto placeholder = [](const std::vector<std::string>& vs) {
+        return std::all_of(vs.begin(), vs.end(), [](const std::string& v) {
+            return v.empty() || v.find_first_not_of("0/-") == std::string::npos;
+        });
+    };
     auto b = group(before), a = group(after);
+    auto year_of = [&](const char* date_field) -> std::string {
+        for (auto* g : {&a, &b})
+            if (auto it = g->find(date_field); it != g->end() && !it->second.values.empty()) return it->second.values[0].substr(0, 4);
+        return "";
+    };
     Tags out;
     for (auto& [c, f] : a) {
         auto it = b.find(c);
-        if (it == b.end() || it->second.values != f.values) out.m.emplace(f.name, f.values);
+        if (it != b.end()) {
+            auto x = it->second.values, y = f.values;
+            std::sort(x.begin(), x.end());
+            std::sort(y.begin(), y.end());
+            if (x == y) continue;
+        } else {
+            if (placeholder(f.values)) continue;
+            // a YEAR that only repeats DATE's year is redundant, not an edit
+            if ((c == "YEAR" && f.values.size() == 1 && f.values[0] == year_of("DATE")) ||
+                (c == "ORIGINALYEAR" && f.values.size() == 1 && f.values[0] == year_of("ORIGINALDATE")))
+                continue;
+        }
+        out.m.emplace(f.name, f.values);
     }
     for (auto& [c, f] : b)
         if (!a.contains(c)) out.m.emplace(f.name, std::vector<std::string>{});
