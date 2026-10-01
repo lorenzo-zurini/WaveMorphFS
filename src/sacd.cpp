@@ -104,7 +104,9 @@ Frames scan_frames(const File& f, uint64_t start, uint64_t end, uint32_t channel
     size_t frame_bytes = SACD_FRAME_BYTES * channels;
     size_t acc = 0;  // audio bytes of the current frame seen so far
     constexpr uint64_t CHUNK = 2048;  // sectors per read (4 MiB)
-    auto complete = [&] { return frames.size() == needed && (dst || acc == frame_bytes); };
+    // a final frame cut short by a broken last sector is accepted (and padded with
+    // silence when read): it is well under a millisecond at the very end of the disc
+    auto complete = [&] { return frames.size() == needed && (dst || (acc > 0 && acc <= frame_bytes)); };
     Bytes buf;
     for (uint64_t s = start; s <= end;) {
         uint64_t n = std::min(CHUNK, end + 1 - s);
@@ -382,10 +384,15 @@ std::vector<Bytes> SacdDisc::read_frames(uint64_t f0, uint64_t f1) const {
     for (size_t i = 0; i < coded.size(); i++) {
         const Bytes* inter = &coded[i];
         if (dec) {
+            raw.resize(per_frame);
             with_context(std::format("frame {}", f0 + i), [&] { dec->decode(coded[i], raw); });
             inter = &raw;
-        } else {
-            WM_ENSURE(coded[i].size() == per_frame, "frame {} has {} bytes", f0 + i, coded[i].size());
+        } else if (coded[i].size() != per_frame) {
+            bool last = f0 + i + 2 == frames_.size();  // frames_ ends with the end marker
+            WM_ENSURE(last && coded[i].size() < per_frame, "frame {} has {} bytes", f0 + i, coded[i].size());
+            raw.assign(coded[i].begin(), coded[i].end());
+            raw.resize(per_frame, 0x69);  // DSD silence
+            inter = &raw;
         }
         // de-interleave (byte-interleaved channels)
         for (size_t j = 0; j < inter->size(); j++) out[j % ch].push_back((*inter)[j]);
