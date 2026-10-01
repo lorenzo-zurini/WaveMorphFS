@@ -121,6 +121,8 @@ TEST(writeback_tag_changes) {
     auto beets = Tags::from_pairs({{"TITLE", "T"}, {"TRACKNUMBER", "3"}, {"TRACK", "3"}, {"TRACKTOTAL", "12"}, {"TOTALTRACKS", "12"},
                                    {"TRACKC", "12"}, {"ALBUMARTIST", "A"}, {"ALBUM ARTIST", "A"}, {"DATE", "2006"}, {"YEAR", "2006"},
                                    {"BPM", "0"}, {"COMPILATION", "0"}, {"DISC", "0"}, {"ORIGINALDATE", "0000"}});
+    src.set("DISCNUMBER", "04");
+    beets.set("DISCNUMBER", "4");
     auto n = tag_changes(src, beets);
     CHECK_MSG(n.empty(), "{} spurious changes, first {}", n.m.size(), n.m.empty() ? "" : n.m.begin()->first);
 }

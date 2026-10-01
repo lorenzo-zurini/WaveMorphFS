@@ -82,6 +82,11 @@ Tags tag_changes(const Tags& before, const Tags& after) {
         auto it = b.find(c);
         if (it != b.end()) {
             auto x = it->second.values, y = f.values;
+            // numbers compare as numbers ("04" == "4")
+            if (c == "TRACKNUMBER" || c == "TRACKTOTAL" || c == "DISCNUMBER" || c == "DISCTOTAL")
+                for (auto* vs : {&x, &y})
+                    for (auto& v : *vs)
+                        if (auto n = parse_u64(split(v, '/')[0])) v = std::to_string(*n);
             std::sort(x.begin(), x.end());
             std::sort(y.begin(), y.end());
             if (x == y) continue;
