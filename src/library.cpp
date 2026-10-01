@@ -561,6 +561,7 @@ std::shared_ptr<Listing> Library::build_listing(const fs::path& dir, const Sig& 
         std::optional<uint32_t> disc_no = multi_iso ? std::optional<uint32_t>(uint32_t(ii + 1)) : std::nullopt;
         auto st = sacd_state(p, dir, false);
         int64_t mt = max_mtime({mtime_ns(p), sidecar_mtime});
+        if (auto k = SrcKey::try_of(p)) mt = std::max(mt, mtime_ns(cache.sacd_frames_path(p, *k, false)).value_or(0));
         if (st.st == Work<SacdDisc>::Ready) {
             for (auto& e : sacd_tracks(st.ready, disc_no, isos.size(), sc, mt, false)) virtuals.push_back(std::move(e));
             hidden.insert(n);
@@ -640,6 +641,8 @@ std::shared_ptr<Listing> Library::build_listing(const fs::path& dir, const Sig& 
     auto l = std::make_shared<Listing>();
     l->entries = std::move(entries);
     l->mtime = max_mtime({sig.dir_mtime, sig.sidecar_mtime, sig.overlay_mtime, gen_time});
+    for (auto& e : l->entries)
+        if (!e.is_dir) l->mtime = std::max(l->mtime, e.mtime);
     l->sig = sig;
     l->checked = Clock::now();
     l->retry_at = retry_at;
@@ -696,6 +699,14 @@ std::optional<std::vector<Entry>> Library::image_tracks(const fs::path& dir, con
             std::lock_guard g(mu_);
             md5_queued_.erase(img->path);
         }
+    }
+    // the content changes when processing results land (layout, MD5s): make that
+    // visible in the timestamps, also across restarts of this process
+    if (ready.av) {
+        auto k = SrcKey::of(ready.av->path);
+        mt = std::max({mt, mtime_ns(cache.av_index_path(ready.av->path, k)).value_or(0), mtime_ns(layout_path(*ready.av, ranges, cache)).value_or(0)});
+    } else if (auto k = SrcKey::try_of(img->path)) {
+        mt = std::max({mt, mtime_ns(cache.idx_path(img->path, *k)).value_or(0), mtime_ns(cache.md5_path(img->path, *k)).value_or(0)});
     }
     std::vector<Entry> out;
     for (size_t i = 0; i < ntracks; i++) {

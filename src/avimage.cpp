@@ -146,7 +146,7 @@ std::shared_ptr<AvImage> AvImage::open(const fs::path& p, const Cache* cache) {
         const AVDictionaryEntry* e = nullptr;
         while ((e = av_dict_iterate(d.fmt->metadata, e))) img->tags.add(e->key, e->value);
     }
-    fs::path idx_path = cache ? cache->dir() / "flacidx" / (Cache::name_for(p, key, "av") + ".avidx") : fs::path();
+    fs::path idx_path = cache ? cache->av_index_path(p, key) : fs::path();
     if (cache)
         if (auto b = try_read_file(idx_path); b && b->size() >= 32 && std::memcmp(b->data(), INDEX_MAGIC, 8) == 0) {
             uint64_t n = le64(&(*b)[24]);

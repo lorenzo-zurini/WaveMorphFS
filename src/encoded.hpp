@@ -29,6 +29,7 @@ struct TrackLayout {
 
 using Ranges = std::vector<std::pair<uint64_t, uint64_t>>;
 
+fs::path layout_path(const AvImage& img, const Ranges& ranges, const Cache& cache);
 /// The cached layout of these tracks, if present.
 std::optional<std::vector<TrackLayout>> load_layout(const AvImage& img, const Ranges& ranges, const Cache& cache);
 /// Encode every track once to measure it; stores the result in the cache.

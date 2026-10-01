@@ -42,10 +42,11 @@ public:
     void store_md5s(const fs::path& flac, const Md5Map& entries) const;
 
     fs::path sacd_frames_path(const fs::path& src, const SrcKey& key, bool multichannel) const;
-
-private:
     fs::path idx_path(const fs::path& src, const SrcKey& key) const;
     fs::path md5_path(const fs::path& flac, const SrcKey& key) const;
+    fs::path av_index_path(const fs::path& src, const SrcKey& key) const;
+
+private:
     fs::path dir_;
 };
 

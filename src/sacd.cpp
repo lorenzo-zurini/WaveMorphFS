@@ -245,7 +245,10 @@ std::shared_ptr<SacdDisc> SacdDisc::open(const fs::path& path, const Cache* cach
     for (size_t i = 0; i < ntracks; i++) {
         uint64_t start = tc(&toc[*trl2 + 8 + 4 * i]);
         uint64_t dur = tc(&toc[*trl2 + 8 + 1020 + 4 * i]);
-        disc->tracks.push_back({start, start + dur});
+        SacdTrack t;
+        t.start = start;
+        t.end = start + dur;
+        disc->tracks.push_back(t);
     }
     if (auto tt = find("SACDTTxt")) {
         for (size_t i = 0; i < disc->tracks.size(); i++) {

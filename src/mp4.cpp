@@ -181,7 +181,7 @@ Item item_for(const std::string& key) {
         {{"EPISODE_ID"}, "tven"},
         {{"PURCHASE_DATE"}, "purd"},
     };
-    if (k == "MAJOR_BRAND" || k == "MINOR_VERSION" || k == "COMPATIBLE_BRANDS" || k == "CREATION_TIME") return {Item::Ignore};
+    if (k == "MAJOR_BRAND" || k == "MINOR_VERSION" || k == "COMPATIBLE_BRANDS" || k == "CREATION_TIME") return {Item::Ignore, {}, Kind::Text, ""};
     for (auto& [names, at] : text)
         if (in(names, k)) return a(at);
     if (k == "COMPILATION") return {Item::Atom, T("cpil"), Kind::U8, ""};
