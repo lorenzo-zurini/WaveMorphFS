@@ -194,8 +194,13 @@ void run_decoded_case(const char* codec, const char* ext, uint32_t rate, size_t 
         auto [s, e] = ranges[i];
         Tags tags;
         tags.set("TITLE", std::format("{}-{}", s, e));
-        EncodedTrack tr(image, s, e, tags, layout[i]);
-        Bytes bytes = tr.read_at(0, size_t(tr.size()));
+        auto trp = std::make_shared<EncodedTrack>(image, s, e, tags, layout[i]);  // shared: exercises read-ahead
+        auto& tr = *trp;
+        Bytes bytes;
+        for (uint64_t o = 0; o < tr.size(); o += 131072) {  // FUSE-sized sequential reads
+            Bytes part = tr.read_at(o, 131072);
+            bytes.insert(bytes.end(), part.begin(), part.end());
+        }
         CHECK(bytes.size() == tr.size());
         fs::path out = dir / "t.flac";
         atomic_write(out, bytes);

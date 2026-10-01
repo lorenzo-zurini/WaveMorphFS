@@ -11,6 +11,8 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -284,6 +286,54 @@ std::optional<SrcKey> SrcKey::try_of(const fs::path& p) {
     if (::stat(p.c_str(), &st) != 0) return std::nullopt;
     return SrcKey{uint64_t(st.st_size), int64_t(st.st_mtim.tv_sec) * 1'000'000'000 + st.st_mtim.tv_nsec};
 }
+
+// ---------------------------------------------------------------- worker pool
+
+namespace {
+struct Pool {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<std::function<void()>> q;
+    size_t n;
+    Pool() : n(std::max(2u, std::thread::hardware_concurrency())) {
+        for (size_t i = 0; i < n; i++)
+            std::thread([this] {
+                while (true) {
+                    std::function<void()> t;
+                    {
+                        std::unique_lock g(mu);
+                        cv.wait(g, [&] { return !q.empty(); });
+                        t = std::move(q.front());
+                        q.pop_front();
+                    }
+                    try {
+                        t();
+                    } catch (const std::exception& e) {
+                        warn("background task: {}", e.what());
+                    }
+                }
+            }).detach();
+    }
+};
+Pool& pool(Lane lane = Lane::Decode) {
+    // never destroyed: workers wait on it until the process ends (destroying a
+    // condition variable with waiters blocks exit)
+    static Pool* decode = new Pool;
+    static Pool* encode = new Pool;
+    return lane == Lane::Decode ? *decode : *encode;
+}
+}  // namespace
+
+void submit(std::function<void()> task, Lane lane) {
+    auto& p = pool(lane);
+    {
+        std::lock_guard g(p.mu);
+        p.q.push_back(std::move(task));
+    }
+    p.cv.notify_one();
+}
+
+size_t pool_size() { return pool().n; }
 
 // ---------------------------------------------------------------- logging
 

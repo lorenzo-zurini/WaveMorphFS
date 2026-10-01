@@ -26,9 +26,19 @@ struct Bits {
         pos++;
         return b;
     }
+    /// n <= 25 bits at once (a 32-bit window from the current byte)
     uint32_t bits(uint32_t n) {
-        uint32_t v = 0;
-        for (uint32_t i = 0; i < n; i++) v = v << 1 | bit();
+        if (n == 0) return 0;
+        size_t byte = pos >> 3;
+        uint32_t w;
+        if (byte + 4 <= data.size()) {
+            w = uint32_t(data[byte]) << 24 | uint32_t(data[byte + 1]) << 16 | uint32_t(data[byte + 2]) << 8 | data[byte + 3];
+        } else {  // past the end reads as zeros
+            w = 0;
+            for (size_t k = 0; k < 4; k++) w = w << 8 | (byte + k < data.size() ? data[byte + k] : 0);
+        }
+        uint32_t v = (w << (pos & 7)) >> (32 - n);
+        pos += n;
         return v;
     }
     int32_t sbits(uint32_t n) {

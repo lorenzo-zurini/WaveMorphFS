@@ -18,7 +18,10 @@ fs::path layout_path(const AvImage& img, const Ranges& ranges, const Cache& cach
 namespace {
 
 const char LAYOUT_MAGIC[8] = {'W', 'M', 'E', 'N', 'C', '0', '0', '1'};
-constexpr size_t RECENT = 8;
+/// frames encoded per job, frames kept per track, frames encoded ahead of the reader
+constexpr uint64_t JOB_FRAMES = 32;
+constexpr size_t CACHE_FRAMES = 1024;
+constexpr uint64_t AHEAD_FRAMES = 256;  // ~24 s at 44.1 kHz
 /// frames decoded per batch while measuring
 constexpr uint64_t BATCH = 64;
 
@@ -118,6 +121,56 @@ EncodedTrack::EncodedTrack(std::shared_ptr<const AvImage> img, uint64_t start, u
     size_ = header_.size() + pos;
 }
 
+EncodedTrack::Promises EncodedTrack::claim(uint64_t a, uint64_t b) const {
+    Promises ps;
+    for (uint64_t j = a; j < b; j++) {
+        if (auto it = frames_.find(j); it != frames_.end()) {
+            it->second.used = ++clock_;
+            continue;
+        }
+        auto p = std::make_shared<std::promise<Frame>>();
+        frames_[j] = {p->get_future().share(), ++clock_};
+        ps.emplace_back(j, std::move(p));
+    }
+    // bounded: drop the least recently used finished frames
+    while (frames_.size() > CACHE_FRAMES) {
+        auto victim = frames_.end();
+        for (auto it = frames_.begin(); it != frames_.end(); ++it)
+            if (it->second.frame.wait_for(std::chrono::seconds(0)) == std::future_status::ready &&
+                (victim == frames_.end() || it->second.used < victim->second.used))
+                victim = it;
+        if (victim == frames_.end()) break;
+        frames_.erase(victim);
+    }
+    return ps;
+}
+
+void EncodedTrack::produce(const Promises& ps) const {
+    if (ps.empty()) return;
+    uint64_t fa = ps.front().first, fb = ps.back().first + 1;
+    try {
+        uint64_t sa = start_ + fa * ENCODED_BLOCK, sb = std::min(end_, start_ + fb * ENCODED_BLOCK);
+        auto pcm = img_->decode_range(sa, sb);
+        for (auto& [j, p] : ps) {
+            size_t from = size_t((j - fa) * ENCODED_BLOCK);
+            size_t n = size_t(std::min<uint64_t>(ENCODED_BLOCK, sb - sa - from));
+            auto fr = std::make_shared<const Bytes>(flac::encode_frame(slice(pcm, from, n), img_->bps, img_->sample_rate, ENCODED_BLOCK, j));
+            if (fr->size() != offsets_[j + 1] - offsets_[j])
+                fail("frame {} encoded to {} bytes, layout says {}", j, fr->size(), offsets_[j + 1] - offsets_[j]);
+            p->set_value(fr);
+        }
+    } catch (...) {
+        std::lock_guard g(mu_);
+        for (auto& [j, p] : ps) {
+            try {
+                p->set_exception(std::current_exception());
+            } catch (const std::future_error&) {  // already fulfilled
+            }
+            frames_.erase(j);
+        }
+    }
+}
+
 Bytes EncodedTrack::read_at(uint64_t off, size_t len) const {
     Bytes out;
     if (off >= size_) return out;
@@ -127,34 +180,33 @@ Bytes EncodedTrack::read_at(uint64_t off, size_t len) const {
     uint64_t h = header_.size(), end = off + len;
     if (end <= h) return out;
     uint64_t a = std::max(off, h) - h, b = end - h;  // audio-relative
-    size_t j0 = size_t(std::upper_bound(offsets_.begin(), offsets_.end(), a) - offsets_.begin()) - 1;
-    size_t j1 = size_t(std::lower_bound(offsets_.begin(), offsets_.end(), b) - offsets_.begin());  // exclusive
-    std::vector<std::shared_ptr<const Bytes>> frames(j1 - j0);
-    size_t first_missing = j1, last_missing = j0;
+    uint64_t nframes = offsets_.size() - 1;
+    uint64_t j0 = uint64_t(std::upper_bound(offsets_.begin(), offsets_.end(), a) - offsets_.begin()) - 1;
+    uint64_t j1 = uint64_t(std::lower_bound(offsets_.begin(), offsets_.end(), b) - offsets_.begin());  // exclusive
+    // claim what is needed (first job done here, the rest in parallel), then read-ahead
+    // background work needs a shared owner; without one (tests) everything is done here
+    auto self = weak_from_this().lock();
+    std::vector<Promises> jobs, ahead;
+    std::vector<std::shared_future<Frame>> need;
     {
         std::lock_guard g(mu_);
-        for (size_t j = j0; j < j1; j++) {
-            for (auto& [k, v] : recent_)
-                if (k == j) frames[j - j0] = v;
-            if (!frames[j - j0]) first_missing = std::min(first_missing, j), last_missing = std::max(last_missing, j + 1);
-        }
+        for (uint64_t s = j0; s < j1; s += JOB_FRAMES)
+            if (auto ps = claim(s, std::min(j1, s + JOB_FRAMES)); !ps.empty()) jobs.push_back(std::move(ps));
+        // read-ahead only for a reader moving forward
+        bool sequential = last_end_ != UINT64_MAX && j0 + 1 >= last_end_ && j0 <= last_end_;
+        last_end_ = j1;
+        if (self && sequential)
+            for (uint64_t s = j1; s < std::min(nframes, j1 + AHEAD_FRAMES); s += JOB_FRAMES)
+                if (auto ps = claim(s, std::min(nframes, s + JOB_FRAMES)); !ps.empty()) ahead.push_back(std::move(ps));
+        for (uint64_t j = j0; j < j1; j++) need.push_back(frames_.at(j).frame);
     }
-    if (first_missing < j1) {
-        uint64_t sa = start_ + uint64_t(first_missing) * ENCODED_BLOCK, sb = std::min(end_, start_ + uint64_t(last_missing) * ENCODED_BLOCK);
-        auto pcm = img_->decode_range(sa, sb);
-        for (size_t j = first_missing; j < last_missing; j++) {
-            if (frames[j - j0]) continue;
-            size_t from = (j - first_missing) * ENCODED_BLOCK;
-            size_t n = size_t(std::min<uint64_t>(ENCODED_BLOCK, sb - sa - from));
-            auto fr = std::make_shared<const Bytes>(flac::encode_frame(slice(pcm, from, n), img_->bps, img_->sample_rate, ENCODED_BLOCK, j));
-            WM_ENSURE(fr->size() == offsets_[j + 1] - offsets_[j], "frame {} encoded to {} bytes, layout says {}", j, fr->size(), offsets_[j + 1] - offsets_[j]);
-            frames[j - j0] = fr;
-            std::lock_guard g(mu_);
-            recent_.emplace_back(j, fr);
-            if (recent_.size() > RECENT) recent_.erase(recent_.begin());
-        }
+    for (size_t i = 1; i < jobs.size(); i++) {
+        if (self) submit([self, ps = std::move(jobs[i])] { self->produce(ps); }, Lane::Encode);
+        else produce(jobs[i]);
     }
-    for (size_t j = j0; j < j1; j++) copy_overlap(out, *frames[j - j0], h + offsets_[j], off, len);
+    for (auto& ps : ahead) submit([self, ps = std::move(ps)] { self->produce(ps); }, Lane::Encode);
+    if (!jobs.empty()) produce(jobs[0]);
+    for (uint64_t j = j0; j < j1; j++) copy_overlap(out, *need[j - j0].get(), h + offsets_[j], off, len);
     WM_ENSURE(out.size() == len, "internal: produced {} of {} bytes at {}", out.size(), len, off);
     return out;
 }

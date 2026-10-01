@@ -124,6 +124,14 @@ struct SrcKey {
     bool operator==(const SrcKey&) const = default;
 };
 
+// ---- background work
+/// Background worker lanes. Decode jobs never wait on other jobs; encode jobs may
+/// wait on decode jobs only. With that rule neither lane can deadlock.
+enum class Lane { Decode, Encode };
+/// Run `task` on a worker pool (each lane has as many threads as the CPU).
+void submit(std::function<void()> task, Lane lane = Lane::Decode);
+size_t pool_size();
+
 // ---- logging (level from WAVEMORPH_LOG: debug, info, warn, error)
 enum class Level { Debug, Info, Warn, Error };
 void log_init();
