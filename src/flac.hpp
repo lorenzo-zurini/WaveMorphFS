@@ -87,6 +87,8 @@ struct FlacMeta {
 /// Vorbis comment pairs; names keep the spelling stored in the file.
 std::vector<std::pair<std::string, std::string>> parse_vorbis(std::span<const uint8_t> b);
 Bytes build_vorbis(const std::string& vendor, const std::vector<std::pair<std::string, std::string>>& tags);
+/// Padding added to generated headers so tag editors can save in place.
+constexpr size_t EDIT_PADDING = 8192;
 /// "fLaC" + STREAMINFO + blocks.
 Bytes build_header(const std::array<uint8_t, 34>& si, const std::vector<MetaBlock>& blocks);
 

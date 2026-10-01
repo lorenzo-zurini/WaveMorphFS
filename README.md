@@ -133,9 +133,22 @@ Both are merged, the separate tree winning.
 Edits are picked up within seconds. A `cover.jpg`/`cover.png` in the sidecar folder
 is shown in the album folder if it has no cover of its own.
 
+### Editing tags on the mount
+
+FLAC, DSF, MP3 and M4A files on the mount can be edited in place with any tag
+editor (Picard, Kid3, Mp3tag, mutagen...). The edit never reaches the download:
+writes go to a scratch overlay, and when the editor closes the file the tags are
+read back from it, compared field by field with what the mount generated, and
+only the differences are stored in the folder's sidecar — `track."N"` for split
+tracks (their names change with the title), `file."<name>"` for regular files.
+Names already used in the sidecar keep their spelling; removed tags become `""`.
+Changes to the audio itself are discarded, and files cannot be created, renamed
+or deleted. Generated files carry tag padding, so editors save in place quickly.
+
 ## Limitations
 
-* Variable-blocksize FLAC images are not split (they are shown as-is).
+* Variable-blocksize FLAC images cannot be split by copying frames; their tracks
+  are encoded on the fly like non-FLAC images.
 * Fragmented MP4 files are not retagged (they are passed through).
 
 ## License

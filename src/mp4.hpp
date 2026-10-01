@@ -21,4 +21,9 @@ struct Retagged {
 
 Retagged retag_m4a(const fs::path& p, const Tags& overlay);
 
+/// Tags of an MP4 file's ilst, with atoms mapped back to Vorbis-style names
+/// (©nam -> TITLE, trkn -> TRACKNUMBER + TRACKTOTAL, freeform items by their
+/// name). Cover art is not a tag and is skipped.
+Tags read_tags(const ByteReader& read, uint64_t size);
+
 }  // namespace wm::mp4

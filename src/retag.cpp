@@ -17,6 +17,7 @@ std::shared_ptr<Spliced> retag_file(const fs::path& p, const std::string& ext, c
         // keep every other block (SEEKTABLE offsets are relative to the first frame, so still valid)
         for (auto& b : meta.blocks)
             if (b.kind != flac::BLOCK_VORBIS) blocks.push_back(b);
+        blocks.push_back({flac::BLOCK_PADDING, Bytes(flac::EDIT_PADDING, 0)});
         // min/max frame size fields are informational; keep them unknown rather than re-derive
         Bytes header = flac::build_header(meta.streaminfo.encode(0, 0), blocks);
         return std::make_shared<Spliced>(p, "retagged-flac", std::vector<Seg>{std::move(header), SrcRange{meta.audio_start, len - meta.audio_start}});

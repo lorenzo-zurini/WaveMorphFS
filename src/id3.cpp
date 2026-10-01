@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <map>
 
 namespace wm::id3 {
 
@@ -329,10 +330,68 @@ Bytes serialize(uint8_t flags, const std::vector<Frame>& frames) {
         body.push_back(f.flags[1]);
         append(body, f.data);
     }
+    body.insert(body.end(), 4096, 0);  // padding, so tag editors can save in place
     Bytes out = {'I', 'D', '3', 4, 0, flags};
     append(out, synchsafe(uint32_t(body.size())));
     append(out, body);
     return out;
+}
+
+Tags read_tags(std::span<const uint8_t> tag) {
+    static const std::map<std::string, std::string> names = {
+        {"TIT2", "TITLE"}, {"TPE1", "ARTIST"}, {"TPE2", "ALBUMARTIST"}, {"TPE3", "CONDUCTOR"}, {"TPE4", "REMIXER"},
+        {"TALB", "ALBUM"}, {"TDRC", "DATE"}, {"TDOR", "ORIGINALDATE"}, {"TDRL", "RELEASEDATE"}, {"TCON", "GENRE"},
+        {"TCOM", "COMPOSER"}, {"TEXT", "LYRICIST"}, {"TPUB", "LABEL"}, {"TCOP", "COPYRIGHT"}, {"TSRC", "ISRC"},
+        {"TIT1", "GROUPING"}, {"TIT3", "SUBTITLE"}, {"TBPM", "BPM"}, {"TMOO", "MOOD"}, {"TENC", "ENCODEDBY"},
+        {"TSSE", "ENCODER"}, {"TCMP", "COMPILATION"}, {"TSOA", "ALBUMSORT"}, {"TSOP", "ARTISTSORT"}, {"TSOT", "TITLESORT"},
+        {"TSO2", "ALBUMARTISTSORT"}, {"TSOC", "COMPOSERSORT"}, {"MVNM", "MOVEMENTNAME"}, {"TMED", "MEDIA"},
+        {"TLAN", "LANGUAGE"}, {"TSST", "DISCSUBTITLE"}, {"TDEN", "CREATION_TIME"},
+    };
+    Tags t;
+    if (tag.size() < 10 || std::memcmp(tag.data(), "ID3", 3) != 0) return t;
+    auto frames = parse_tag(tag).first.frames;
+    auto values = [](std::span<const uint8_t> b) {
+        std::vector<std::string> out;
+        if (b.empty()) return out;
+        uint8_t enc = b[0];
+        auto rest = b.subspan(1);
+        while (!rest.empty()) {
+            auto [v, next] = split_terminated(enc, rest);
+            std::string s = decode_text(enc, v);
+            if (!s.empty()) out.push_back(s);
+            if (next.size() == rest.size()) break;
+            rest = next;
+        }
+        return out;
+    };
+    for (auto& f : frames) {
+        auto body = body_of(f);
+        if (!body || body->empty()) continue;
+        std::string id(f.sid());
+        if (id == "TXXX") {
+            uint8_t enc = (*body)[0];
+            auto [d, rest] = split_terminated(enc, body->subspan(1));
+            std::vector<uint8_t> tmp = {enc};
+            tmp.insert(tmp.end(), rest.begin(), rest.end());
+            for (auto& v : values(tmp)) t.add(decode_text(enc, d), v);
+        } else if (id == "COMM" || id == "USLT") {
+            uint8_t enc = (*body)[0];
+            if (body->size() < 4) continue;
+            auto [d, text] = split_terminated(enc, body->subspan(4));
+            if (id == "COMM" && !decode_text(enc, d).empty()) continue;  // described comments are not "the" comment
+            t.add(id == "COMM" ? "COMMENT" : "LYRICS", decode_text(enc, text));
+        } else if (id == "TRCK" || id == "TPOS") {
+            auto vs = values(*body);
+            if (vs.empty()) continue;
+            auto p = split(vs[0], '/');
+            t.add(id == "TRCK" ? "TRACKNUMBER" : "DISCNUMBER", trim(p[0]));
+            if (p.size() > 1) t.add(id == "TRCK" ? "TRACKTOTAL" : "DISCTOTAL", trim(p[1]));
+        } else if (id[0] == 'T' || id == "MVNM") {
+            auto it = names.find(id);
+            for (auto& v : values(*body)) t.add(it != names.end() ? it->second : id, v);
+        }
+    }
+    return t;
 }
 
 Bytes build(const Tags& tags) {

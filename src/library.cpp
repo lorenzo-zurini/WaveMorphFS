@@ -8,6 +8,8 @@
 #include <cstring>
 #include <thread>
 
+#include <nlohmann/json.hpp>
+
 #include "cue.hpp"
 #include "retag.hpp"
 
@@ -19,7 +21,8 @@ namespace {
 /// change alters what they contain (tag rendering, encoding...), so that music
 /// servers re-read them once. 2026-10-01 13:00 UTC: C++ rewrite (tag synonyms,
 /// SACD genres, kept tag spelling, APE served as encoded FLAC).
-constexpr int64_t OUTPUT_EPOCH_NS = 1790859600LL * 1'000'000'000;
+/// 2026-10-01 16:00 UTC: padding in generated tag areas (editable mount).
+constexpr int64_t OUTPUT_EPOCH_NS = 1790870400LL * 1'000'000'000;
 
 const std::vector<std::string_view> AUDIO_IMAGE_EXT = {"flac", "ape", "wv", "tta", "tak", "wav", "m4a", "aiff", "aif"};
 /// A file modified more recently than this is assumed to still be written.
@@ -262,7 +265,18 @@ ReadyImage Library::process_image(const fs::path& src) const {
     }
     fs::path flac_path = src;
     auto meta = flac::FlacMeta::read(flac_path);
-    auto idx = cache.index_for(flac_path, meta);
+    flac::FrameIndex idx;
+    try {
+        idx = cache.index_for(flac_path, meta);
+    } catch (const Error& e) {
+        // frames can only be copied from fixed-blocksize images; others are
+        // decoded and re-encoded on the fly like non-FLAC images
+        if (std::string(e.what()).find("variable-blocksize") == std::string::npos) throw;
+        auto av = AvImage::open(src, &cache);
+        r.source_tags = Tags::from_pairs(meta.vorbis_comments());
+        r.av = av;
+        return r;
+    }
     r.source_tags = Tags::from_pairs(meta.vorbis_comments());
     for (auto* b : meta.pictures())
         if (b->data.size() <= (2 << 20) && picture_type(b->data) == 3) {
@@ -317,6 +331,51 @@ void Library::write_status() const {
         atomic_write((parent.empty() ? cfg.cache_dir : parent) / "status.txt", out);
     } catch (...) {
     }
+}
+
+void Library::apply_edit(const fs::path& dir, const std::string& file_name, const std::string& section, const std::string& key, const Tags& changes) {
+    using json = nlohmann::ordered_json;
+    auto ov = overlay_dir(dir);
+    WM_ENSURE(ov.has_value(), "{} is not inside a library root", dir.string());
+    fs::path p = *ov / SIDECAR_NAME;
+    std::lock_guard g(edit_mu_);
+    json doc = json::object();
+    if (auto text = try_read_text(p)) doc = json::parse(*text, nullptr, true, /*ignore_comments=*/true);
+    WM_ENSURE(doc.is_object(), "{} is not a JSON object", p.string());
+    if (!doc.contains(section) || !doc[section].is_object()) doc[section] = json::object();
+    json& entry = doc[section][key];
+    if (!entry.is_object()) entry = json::object();
+    auto erase_field = [](json& obj, const std::string& k, const std::string& keep) {
+        std::vector<std::string> drop;
+        for (auto& [ek, ev] : obj.items())
+            if (ek != keep && same_field(ek, k)) drop.push_back(ek);
+        for (auto& d : drop) obj.erase(d);
+    };
+    for (auto& [k, vals] : changes.m) {
+        // keep the spelling already used in this entry, else in the album table
+        std::string name = k;
+        bool found = false;
+        for (auto& [ek, ev] : entry.items())
+            if (same_field(ek, k)) {
+                name = ek;
+                found = true;
+                break;
+            }
+        if (!found && doc.contains("album") && doc["album"].is_object())
+            for (auto& [ak, av] : doc["album"].items())
+                if (same_field(ak, k)) {
+                    name = ak;
+                    break;
+                }
+        erase_field(entry, k, name);
+        entry[name] = vals.empty() ? json("") : vals.size() == 1 ? json(vals[0]) : json(vals);
+        // a per-file entry would override the track entry: drop the field there
+        if (section == "track" && doc.contains("file") && doc["file"].contains(file_name) && doc["file"][file_name].is_object())
+            erase_field(doc["file"][file_name], k, "");
+    }
+    fs::create_directories(*ov);
+    atomic_write(p, doc.dump(2, ' ', false, json::error_handler_t::replace) + "\n");
+    bump(dir);
 }
 
 void Library::bump(const fs::path& dir) {
@@ -609,7 +668,9 @@ std::shared_ptr<Listing> Library::build_listing(const fs::path& dir, const Sig& 
         if (!vf) vf = std::make_shared<Passthrough>(p, n.size);
         int64_t mt = taggable ? std::max(n.mtime, sidecar_mtime.value_or(n.mtime)) : n.mtime;
         if (retagged) mt = std::max(mt, OUTPUT_EPOCH_NS);
-        entries.push_back({n.name, false, {}, vf, mt});
+        Entry e{n.name, false, {}, vf, mt};
+        if (taggable) e.tag_section = "file", e.tag_key = n.name, e.tag_ext = ext;
+        entries.push_back(std::move(e));
     }
 
     // cover art exported into the sidecar tree
@@ -741,13 +802,14 @@ std::optional<std::vector<Entry>> Library::image_tracks(const fs::path& dir, con
         std::string name = multi && disc ? std::format("{}-{:02} - {}.flac", *disc, t.number, title) : std::format("{:02} - {}.flac", t.number, title);
         if (sidecar)
             if (auto ft = sidecar->file(name)) tg.overlay(*ft);
+        std::string key = multi && disc ? std::format("{}-{:02}", *disc, t.number) : std::to_string(t.number);
         if (ready.av) {
-            out.push_back({name, false, {}, std::make_shared<EncodedTrack>(ready.av, s, e, tg, (*layout)[i]), mt});
+            out.push_back({name, false, {}, std::make_shared<EncodedTrack>(ready.av, s, e, tg, (*layout)[i]), mt, "track", key, "flac"});
             continue;
         }
         std::optional<std::array<uint8_t, 16>> md5;
         if (auto it = md5s.find({s, e}); it != md5s.end()) md5 = it->second;
-        out.push_back({name, false, {}, std::make_shared<FlacTrack>(img, s, e, tg, ready.pictures, md5), mt});
+        out.push_back({name, false, {}, std::make_shared<FlacTrack>(img, s, e, tg, ready.pictures, md5), mt, "track", key, "flac"});
     }
     return out;
 }
@@ -781,7 +843,8 @@ std::vector<Entry> Library::sacd_tracks(const std::shared_ptr<const SacdDisc>& d
         std::string name = disc_no ? std::format("{}{}-{:02} - {}.dsf", prefix, *disc_no, num, title) : std::format("{}{:02} - {}.dsf", prefix, num, title);
         if (sidecar)
             if (auto ft = sidecar->file(name)) tg.overlay(*ft);
-        out.push_back({name, false, {}, std::make_shared<DsfTrack>(disc, i, tg), mt});
+        std::string key = disc_no ? std::format("{}-{:02}", *disc_no, num) : std::to_string(num);
+        out.push_back({name, false, {}, std::make_shared<DsfTrack>(disc, i, tg), mt, "track", key, "dsf"});
     }
     return out;
 }

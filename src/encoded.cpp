@@ -113,7 +113,8 @@ EncodedTrack::EncodedTrack(std::shared_ptr<const AvImage> img, uint64_t start, u
     si.total_samples = len;
     si.md5 = layout.md5;
     auto [mn, mx] = std::minmax_element(layout.frame_sizes.begin(), layout.frame_sizes.end());
-    header_ = flac::build_header(si.encode(*mn, *mx), {{flac::BLOCK_VORBIS, flac::build_vorbis("WaveMorphFS", tags.to_pairs())}});
+    header_ = flac::build_header(si.encode(*mn, *mx), {{flac::BLOCK_VORBIS, flac::build_vorbis("WaveMorphFS", tags.to_pairs())},
+                                                       {flac::BLOCK_PADDING, Bytes(flac::EDIT_PADDING, 0)}});
     size_ = header_.size() + pos;
 }
 
