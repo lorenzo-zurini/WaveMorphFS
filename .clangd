@@ -1,0 +1,2 @@
+CompileFlags:
+  Add: [-std=c++20, -DFUSE_USE_VERSION=312, -I/usr/include/fuse3]
