@@ -15,6 +15,12 @@ namespace wm {
 
 namespace {
 
+/// Generated and retagged files are never older than this: bump it whenever a
+/// change alters what they contain (tag rendering, encoding...), so that music
+/// servers re-read them once. 2026-10-01 13:00 UTC: C++ rewrite (tag synonyms,
+/// SACD genres, kept tag spelling, APE served as encoded FLAC).
+constexpr int64_t OUTPUT_EPOCH_NS = 1790859600LL * 1'000'000'000;
+
 const std::vector<std::string_view> AUDIO_IMAGE_EXT = {"flac", "ape", "wv", "tta", "tak", "wav", "m4a", "aiff", "aif"};
 /// A file modified more recently than this is assumed to still be written.
 constexpr auto SETTLE = std::chrono::seconds(60);
@@ -599,8 +605,10 @@ std::shared_ptr<Listing> Library::build_listing(const fs::path& dir, const Sig& 
                 warn("retag {}: {}", p.string(), e.what());
             }
         }
+        bool retagged = vf != nullptr;
         if (!vf) vf = std::make_shared<Passthrough>(p, n.size);
         int64_t mt = taggable ? std::max(n.mtime, sidecar_mtime.value_or(n.mtime)) : n.mtime;
+        if (retagged) mt = std::max(mt, OUTPUT_EPOCH_NS);
         entries.push_back({n.name, false, {}, vf, mt});
     }
 
@@ -708,6 +716,7 @@ std::optional<std::vector<Entry>> Library::image_tracks(const fs::path& dir, con
     } else if (auto k = SrcKey::try_of(img->path)) {
         mt = std::max({mt, mtime_ns(cache.idx_path(img->path, *k)).value_or(0), mtime_ns(cache.md5_path(img->path, *k)).value_or(0)});
     }
+    mt = std::max(mt, OUTPUT_EPOCH_NS);
     std::vector<Entry> out;
     for (size_t i = 0; i < ntracks; i++) {
         const auto& t = cue.tracks[i];
@@ -746,6 +755,7 @@ std::optional<std::vector<Entry>> Library::image_tracks(const fs::path& dir, con
 std::vector<Entry> Library::sacd_tracks(const std::shared_ptr<const SacdDisc>& disc, std::optional<uint32_t> disc_no, size_t ndiscs,
                                         const Sidecar* sidecar, int64_t mt, bool mc) {
     size_t n = disc->tracks.size();
+    mt = std::max(mt, OUTPUT_EPOCH_NS);
     std::vector<Entry> out;
     for (size_t i = 0; i < n; i++) {
         uint32_t num = uint32_t(i + 1);
