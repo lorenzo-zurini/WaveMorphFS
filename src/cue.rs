@@ -56,7 +56,9 @@ impl CueSheet {
                     let name = if let Some(r) = rest.strip_prefix('"') {
                         r.rsplit_once('"').map(|(n, _)| n).unwrap_or(r)
                     } else {
-                        rest.rsplit_once(char::is_whitespace).map(|(n, _)| n).unwrap_or(rest)
+                        rest.rsplit_once(char::is_whitespace)
+                            .map(|(n, _)| n)
+                            .unwrap_or(rest)
                     };
                     sheet.files.push(name.trim().to_string());
                 }
@@ -67,7 +69,10 @@ impl CueSheet {
                     let (num, kind) = split_word(rest);
                     // Only audio tracks matter (data tracks on enhanced CDs are skipped)
                     let number = num.parse().unwrap_or(sheet.tracks.len() as u32 + 1);
-                    let mut t = CueTrack { number, ..Default::default() };
+                    let mut t = CueTrack {
+                        number,
+                        ..Default::default()
+                    };
                     if !kind.eq_ignore_ascii_case("AUDIO") {
                         t.fields.insert("__NONAUDIO".into(), kind.to_string());
                     }
@@ -99,7 +104,8 @@ impl CueSheet {
                         }
                     }
                 }
-                "TITLE" | "PERFORMER" | "SONGWRITER" | "ISRC" | "CATALOG" | "COMPOSER" | "ARRANGER" => {
+                "TITLE" | "PERFORMER" | "SONGWRITER" | "ISRC" | "CATALOG" | "COMPOSER"
+                | "ARRANGER" => {
                     let v = unquote(rest);
                     if v.is_empty() {
                         continue;
@@ -119,7 +125,9 @@ impl CueSheet {
         if let Some(t) = cur.take() {
             sheet.tracks.push(t);
         }
-        sheet.tracks.retain(|t| !t.fields.contains_key("__NONAUDIO"));
+        sheet
+            .tracks
+            .retain(|t| !t.fields.contains_key("__NONAUDIO"));
         if sheet.tracks.is_empty() {
             bail!("no audio tracks");
         }
@@ -127,7 +135,11 @@ impl CueSheet {
         if sheet.files.len() == 1 {
             for w in sheet.tracks.windows(2) {
                 if w[1].index01 <= w[0].index01 {
-                    bail!("track {} INDEX 01 is not after track {}", w[1].number, w[0].number);
+                    bail!(
+                        "track {} INDEX 01 is not after track {}",
+                        w[1].number,
+                        w[0].number
+                    );
                 }
             }
         }
@@ -150,7 +162,10 @@ fn split_word(s: &str) -> (&str, &str) {
 
 fn unquote(s: &str) -> String {
     let s = s.trim();
-    let s = s.strip_prefix('"').and_then(|r| r.strip_suffix('"')).unwrap_or(s);
+    let s = s
+        .strip_prefix('"')
+        .and_then(|r| r.strip_suffix('"'))
+        .unwrap_or(s);
     s.trim().to_string()
 }
 

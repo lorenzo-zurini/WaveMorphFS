@@ -48,7 +48,10 @@ fn table_to_tags(t: &toml::Table) -> Tags {
             other => vec![value_str(other)],
         };
         // names are kept exactly as written; explicit removals stay as an empty Vec so overlay() deletes the key
-        tags.0.insert(crate::tags::Key(k.clone()), vals.into_iter().filter(|s| !s.is_empty()).collect());
+        tags.0.insert(
+            crate::tags::Key(k.clone()),
+            vals.into_iter().filter(|s| !s.is_empty()).collect(),
+        );
     }
     tags
 }
@@ -86,10 +89,16 @@ impl Sidecar {
     /// Merge the sidecars that apply to `src_dir`.
     pub fn load(src_dir: &Path, overlay_dir: Option<&Path>) -> Result<Option<Sidecar>> {
         let mut out: Option<Sidecar> = None;
-        let candidates = [Some(src_dir.join(FILE_NAME)), overlay_dir.map(|d| d.join(FILE_NAME))];
+        let candidates = [
+            Some(src_dir.join(FILE_NAME)),
+            overlay_dir.map(|d| d.join(FILE_NAME)),
+        ];
         for p in candidates.into_iter().flatten() {
-            let Ok(md) = std::fs::metadata(&p) else { continue };
-            let text = std::fs::read_to_string(&p).with_context(|| format!("read {}", p.display()))?;
+            let Ok(md) = std::fs::metadata(&p) else {
+                continue;
+            };
+            let text =
+                std::fs::read_to_string(&p).with_context(|| format!("read {}", p.display()))?;
             let sc = Sidecar::parse(&text).with_context(|| format!("parse {}", p.display()))?;
             let acc = out.get_or_insert_with(Sidecar::default);
             acc.album.overlay(&sc.album);
@@ -155,7 +164,10 @@ impl Sidecar {
             }
             doc.insert("file".into(), toml::Value::Table(t));
         }
-        format!("# WaveMorphFS sidecar tags — edit freely; the filesystem picks up changes within seconds.\n{}", toml::to_string_pretty(&doc).unwrap_or_default())
+        format!(
+            "# WaveMorphFS sidecar tags — edit freely; the filesystem picks up changes within seconds.\n{}",
+            toml::to_string_pretty(&doc).unwrap_or_default()
+        )
     }
 }
 
@@ -199,10 +211,19 @@ TITLE = "File"
 "#,
         )
         .unwrap();
-        assert_eq!(sc.album.get_all("ARTIST").unwrap(), &vec!["A".to_string(), "B".to_string()]);
-        assert!(sc.album.get_all("COMMENT").unwrap().is_empty(), "explicit removal kept as empty");
+        assert_eq!(
+            sc.album.get_all("ARTIST").unwrap(),
+            &vec!["A".to_string(), "B".to_string()]
+        );
+        assert!(
+            sc.album.get_all("COMMENT").unwrap().is_empty(),
+            "explicit removal kept as empty"
+        );
         assert_eq!(sc.track(None, 3).unwrap().get("TITLE"), Some("Three"));
-        assert_eq!(sc.track(Some(2), 5).unwrap().get("TITLE"), Some("Disc two five"));
+        assert_eq!(
+            sc.track(Some(2), 5).unwrap().get("TITLE"),
+            Some("Disc two five")
+        );
         assert_eq!(sc.file("a b.flac").unwrap().get("TITLE"), Some("File"));
         let mut base = Tags::from_pairs([("COMMENT".into(), "rip info".into())]);
         base.overlay(&sc.album);

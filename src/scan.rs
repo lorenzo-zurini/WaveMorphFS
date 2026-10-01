@@ -18,7 +18,7 @@ use crate::sacd::{self, SacdDisc};
 use crate::sidecar::Sidecar;
 use crate::tags::{self, Tags};
 use crate::track::{FlacImage, FlacTrack};
-use crate::vfile::{Passthrough, VFile};
+use crate::vfile::{Passthrough, Seg, Spliced, VFile};
 use anyhow::{Context, Result, bail};
 use log::{info, warn};
 use parking_lot::Mutex;
@@ -29,7 +29,9 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant, SystemTime};
 
-pub const AUDIO_IMAGE_EXT: &[&str] = &["flac", "ape", "wv", "tta", "tak", "wav", "m4a", "aiff", "aif"];
+pub const AUDIO_IMAGE_EXT: &[&str] = &[
+    "flac", "ape", "wv", "tta", "tak", "wav", "m4a", "aiff", "aif",
+];
 /// A file modified more recently than this is assumed to still be written.
 const SETTLE: Duration = Duration::from_secs(60);
 const RECHECK: Duration = Duration::from_millis(1500);
@@ -114,9 +116,20 @@ pub struct ReadyImage {
 }
 
 enum Job {
-    Image { src: PathBuf, dir: PathBuf },
-    Sacd { src: PathBuf, dir: PathBuf, mc: bool },
-    Md5 { image: Arc<FlacImage>, ranges: Vec<(u64, u64)>, dir: PathBuf },
+    Image {
+        src: PathBuf,
+        dir: PathBuf,
+    },
+    Sacd {
+        src: PathBuf,
+        dir: PathBuf,
+        mc: bool,
+    },
+    Md5 {
+        image: Arc<FlacImage>,
+        ranges: Vec<(u64, u64)>,
+        dir: PathBuf,
+    },
 }
 
 pub struct Library {
@@ -194,7 +207,9 @@ impl Library {
 
     fn walk(&self, dir: &Path, n: &mut usize) {
         *n += 1;
-        let Ok(listing) = self.list_dir(dir) else { return };
+        let Ok(listing) = self.list_dir(dir) else {
+            return;
+        };
         for e in &listing.entries {
             if let EntryKind::Dir(p) = &e.kind {
                 self.walk(p, n);
@@ -242,7 +257,13 @@ impl Library {
                 let area = if mc { "multichannel" } else { "stereo" };
                 let state = match SacdDisc::open(&src, Some(&self.cache), mc) {
                     Ok(d) => {
-                        info!("SACD {area} area ready: {} ({} tracks, {} ch{})", src.display(), d.tracks.len(), d.channels, if d.dst { ", DST" } else { "" });
+                        info!(
+                            "SACD {area} area ready: {} ({} tracks, {} ch{})",
+                            src.display(),
+                            d.tracks.len(),
+                            d.channels,
+                            if d.dst { ", DST" } else { "" }
+                        );
                         Work::Ready(Arc::new(d))
                     }
                     Err(e) => {
@@ -284,16 +305,28 @@ impl Library {
             .cloned()
             .collect();
         let img = FlacImage::open(flac_path, meta, idx)?;
-        Ok(ReadyImage { flac: Arc::new(img), source_tags, pictures })
+        Ok(ReadyImage {
+            flac: Arc::new(img),
+            source_tags,
+            pictures,
+        })
     }
 
     /// Human-readable summary of processing state, written next to the cache dir.
     pub fn write_status(&self) {
         let mut out = String::new();
         let now = SystemTime::now();
-        let ts = now.duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let ts = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         out.push_str(&format!("WaveMorphFS status (unix time {ts})\n\n"));
-        let mut sections: Vec<(&str, Vec<String>)> = vec![("ready", vec![]), ("pending", vec![]), ("settling (still being written)", vec![]), ("FAILED", vec![])];
+        let mut sections: Vec<(&str, Vec<String>)> = vec![
+            ("ready", vec![]),
+            ("pending", vec![]),
+            ("settling (still being written)", vec![]),
+            ("FAILED", vec![]),
+        ];
         let mut push = |w: &str, label: String| {
             let i = match w {
                 "ready" => 0,
@@ -315,7 +348,15 @@ impl Library {
         for ((p, mc), (_, st)) in self.sacds.lock().iter() {
             let label = format!("SACD{} {}", if *mc { "/MC" } else { "   " }, p.display());
             match st {
-                Work::Ready(d) => push("ready", format!("{label}  ({} tracks, {} ch{})", d.tracks.len(), d.channels, if d.dst { ", DST" } else { "" })),
+                Work::Ready(d) => push(
+                    "ready",
+                    format!(
+                        "{label}  ({} tracks, {} ch{})",
+                        d.tracks.len(),
+                        d.channels,
+                        if d.dst { ", DST" } else { "" }
+                    ),
+                ),
                 Work::Pending => push("pending", label),
                 Work::Settling(_) => push("settling", label),
                 Work::Failed(e) if e.contains("no multichannel area") => {}
@@ -332,7 +373,12 @@ impl Library {
             }
             out.push('\n');
         }
-        let path = self.cfg.cache_dir.parent().unwrap_or(&self.cfg.cache_dir).join("status.txt");
+        let path = self
+            .cfg
+            .cache_dir
+            .parent()
+            .unwrap_or(&self.cfg.cache_dir)
+            .join("status.txt");
         let _ = crate::cache::atomic_write(&path, out.as_bytes());
     }
 
@@ -353,7 +399,9 @@ impl Library {
     /// Current state of an image; queues work if needed. Without workers the
     /// work is done inline.
     fn image_state(&self, src: &Path, dir: &Path) -> Work<ReadyImage> {
-        let Ok(key) = SrcKey::of(src) else { return Work::Failed("stat failed".into()) };
+        let Ok(key) = SrcKey::of(src) else {
+            return Work::Failed("stat failed".into());
+        };
         {
             let map = self.images.lock();
             if let Some((k, st)) = map.get(src)
@@ -368,14 +416,23 @@ impl Library {
         }
         if recently_modified(src) {
             let st = Work::Settling(Instant::now() + SETTLE);
-            self.images.lock().insert(src.to_path_buf(), (key, st.clone()));
+            self.images
+                .lock()
+                .insert(src.to_path_buf(), (key, st.clone()));
             return st;
         }
         // Cached work is cheap to reopen: do it inline so albums never vanish
         // from a listing just because the process restarted.
         let cached = self.cache.image_is_cached(src);
-        self.images.lock().insert(src.to_path_buf(), (key, Work::Pending));
-        if !cached && self.enqueue(Job::Image { src: src.to_path_buf(), dir: dir.to_path_buf() }) {
+        self.images
+            .lock()
+            .insert(src.to_path_buf(), (key, Work::Pending));
+        if !cached
+            && self.enqueue(Job::Image {
+                src: src.to_path_buf(),
+                dir: dir.to_path_buf(),
+            })
+        {
             return Work::Pending;
         }
         // inline mode
@@ -383,13 +440,17 @@ impl Library {
             Ok(r) => Work::Ready(Arc::new(r)),
             Err(e) => Work::Failed(format!("{e:#}")),
         };
-        self.images.lock().insert(src.to_path_buf(), (key, st.clone()));
+        self.images
+            .lock()
+            .insert(src.to_path_buf(), (key, st.clone()));
         st
     }
 
     fn sacd_state(&self, src: &Path, dir: &Path, mc: bool) -> Work<SacdDisc> {
         let mkey = (src.to_path_buf(), mc);
-        let Ok(key) = SrcKey::of(src) else { return Work::Failed("stat failed".into()) };
+        let Ok(key) = SrcKey::of(src) else {
+            return Work::Failed("stat failed".into());
+        };
         {
             let map = self.sacds.lock();
             if let Some((k, st)) = map.get(&mkey)
@@ -409,7 +470,13 @@ impl Library {
         }
         let cached = sacd::is_cached(&self.cache, src, mc);
         self.sacds.lock().insert(mkey.clone(), (key, Work::Pending));
-        if !cached && self.enqueue(Job::Sacd { src: src.to_path_buf(), dir: dir.to_path_buf(), mc }) {
+        if !cached
+            && self.enqueue(Job::Sacd {
+                src: src.to_path_buf(),
+                dir: dir.to_path_buf(),
+                mc,
+            })
+        {
             return Work::Pending;
         }
         let st = match SacdDisc::open(src, Some(&self.cache), mc) {
@@ -422,7 +489,11 @@ impl Library {
 
     /// Root this source path belongs to and the path relative to it.
     pub fn root_of(&self, p: &Path) -> Option<(&Root, PathBuf)> {
-        self.cfg.roots.iter().find_map(|r| p.strip_prefix(&r.path).ok().map(|rel| (r, rel.to_path_buf())))
+        self.cfg.roots.iter().find_map(|r| {
+            p.strip_prefix(&r.path)
+                .ok()
+                .map(|rel| (r, rel.to_path_buf()))
+        })
     }
 
     pub fn overlay_dir(&self, dir: &Path) -> Option<PathBuf> {
@@ -447,7 +518,12 @@ impl Library {
         {
             return Ok(l);
         }
-        let lock = self.dir_locks.lock().entry(dir.to_path_buf()).or_default().clone();
+        let lock = self
+            .dir_locks
+            .lock()
+            .entry(dir.to_path_buf())
+            .or_default()
+            .clone();
         let _g = lock.lock();
         let sig = self.signature(dir);
         if let Some(l) = self.listings.lock().get(dir).cloned()
@@ -458,7 +534,9 @@ impl Library {
             return Ok(l);
         }
         let l = Arc::new(self.build_listing(dir, sig)?);
-        self.listings.lock().insert(dir.to_path_buf(), Arc::clone(&l));
+        self.listings
+            .lock()
+            .insert(dir.to_path_buf(), Arc::clone(&l));
         Ok(l)
     }
 
@@ -466,12 +544,19 @@ impl Library {
         let mut names: Vec<(OsString, std::fs::Metadata)> = Vec::new();
         for de in std::fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))? {
             let de = de?;
-            let Ok(md) = std::fs::metadata(de.path()) else { continue };
+            let Ok(md) = std::fs::metadata(de.path()) else {
+                continue;
+            };
             names.push((de.file_name(), md));
         }
         names.sort_by(|a, b| a.0.cmp(&b.0));
-        let name_set: HashSet<String> = names.iter().map(|(n, _)| n.to_string_lossy().to_string()).collect();
-        let downloading = |n: &str| name_set.contains(&format!("{n}.!qB")) || name_set.contains(&format!("{n}.!qb"));
+        let name_set: HashSet<String> = names
+            .iter()
+            .map(|(n, _)| n.to_string_lossy().to_string())
+            .collect();
+        let downloading = |n: &str| {
+            name_set.contains(&format!("{n}.!qB")) || name_set.contains(&format!("{n}.!qb"))
+        };
 
         let overlay = self.overlay_dir(dir);
         let sidecar = match Sidecar::load(dir, overlay.as_deref()) {
@@ -486,7 +571,8 @@ impl Library {
         let mut virtuals: Vec<Entry> = Vec::new();
         let mut pending = false;
         let mut retry_at: Option<Instant> = None;
-        let mut note_settle = |until: Instant| retry_at = Some(retry_at.map_or(until, |r: Instant| r.min(until)));
+        let mut note_settle =
+            |until: Instant| retry_at = Some(retry_at.map_or(until, |r: Instant| r.min(until)));
 
         // --- CUE + image groups
         let mut groups: Vec<(OsString, CueSheet, OsString)> = Vec::new();
@@ -504,7 +590,15 @@ impl Library {
             };
             if let Some(img) = resolve_image(&cue, n, &names) {
                 groups.push((n.clone(), cue, img));
-            } else if cue.files.first().is_some_and(|f| downloading(Path::new(f).file_name().map(|x| x.to_string_lossy().to_string()).as_deref().unwrap_or(""))) {
+            } else if cue.files.first().is_some_and(|f| {
+                downloading(
+                    Path::new(f)
+                        .file_name()
+                        .map(|x| x.to_string_lossy().to_string())
+                        .as_deref()
+                        .unwrap_or(""),
+                )
+            }) {
                 // image still downloading under its final name + .!qB
                 hidden.insert(n.clone());
                 pending = true;
@@ -521,8 +615,21 @@ impl Library {
             }
             match self.image_state(&img_path, dir) {
                 Work::Ready(ready) => {
-                    let disc = cue.fields.get("DISCNUMBER").and_then(|d| d.split('/').next()?.trim().parse::<u32>().ok()).or(if multi { Some(gi as u32 + 1) } else { None });
-                    match self.image_tracks(dir, cue, &ready, disc, multi, groups.len(), sidecar.as_ref(), &[mtime(&dir.join(cue_name)), mtime(&img_path), sidecar_mtime]) {
+                    let disc = cue
+                        .fields
+                        .get("DISCNUMBER")
+                        .and_then(|d| d.split('/').next()?.trim().parse::<u32>().ok())
+                        .or(if multi { Some(gi as u32 + 1) } else { None });
+                    match self.image_tracks(
+                        dir,
+                        cue,
+                        &ready,
+                        disc,
+                        multi,
+                        groups.len(),
+                        sidecar.as_ref(),
+                        &[mtime(&dir.join(cue_name)), mtime(&img_path), sidecar_mtime],
+                    ) {
                         Ok(v) => {
                             hidden.insert(cue_name.clone());
                             hidden.insert(img_name.clone());
@@ -544,7 +651,10 @@ impl Library {
         }
 
         // --- SACD ISOs
-        let isos: Vec<&(OsString, std::fs::Metadata)> = names.iter().filter(|(n, md)| md.is_file() && ext_lower(Path::new(n)).as_deref() == Some("iso")).collect();
+        let isos: Vec<&(OsString, std::fs::Metadata)> = names
+            .iter()
+            .filter(|(n, md)| md.is_file() && ext_lower(Path::new(n)).as_deref() == Some("iso"))
+            .collect();
         let multi_iso = isos.len() > 1;
         for (ii, (n, _)) in isos.iter().enumerate() {
             let p = dir.join(n);
@@ -554,12 +664,28 @@ impl Library {
             let disc_no = if multi_iso { Some(ii as u32 + 1) } else { None };
             match self.sacd_state(&p, dir, false) {
                 Work::Ready(disc) => {
-                    virtuals.extend(self.sacd_tracks(dir, &disc, disc_no, isos.len(), sidecar.as_ref(), &[mtime(&p), sidecar_mtime], false));
+                    virtuals.extend(self.sacd_tracks(
+                        dir,
+                        &disc,
+                        disc_no,
+                        isos.len(),
+                        sidecar.as_ref(),
+                        &[mtime(&p), sidecar_mtime],
+                        false,
+                    ));
                     hidden.insert(n.clone());
                     if self.cfg.sacd_multichannel
                         && let Work::Ready(mc) = self.sacd_state(&p, dir, true)
                     {
-                        virtuals.extend(self.sacd_tracks(dir, &mc, disc_no, isos.len(), sidecar.as_ref(), &[mtime(&p), sidecar_mtime], true));
+                        virtuals.extend(self.sacd_tracks(
+                            dir,
+                            &mc,
+                            disc_no,
+                            isos.len(),
+                            sidecar.as_ref(),
+                            &[mtime(&p), sidecar_mtime],
+                            true,
+                        ));
                     }
                 }
                 Work::Pending | Work::Settling(_) => {
@@ -584,7 +710,11 @@ impl Library {
             let p = dir.join(n);
             let mt = md.modified().unwrap_or(SystemTime::UNIX_EPOCH);
             if md.is_dir() {
-                entries.push(Entry { name: n.clone(), kind: EntryKind::Dir(p), mtime: mt });
+                entries.push(Entry {
+                    name: n.clone(),
+                    kind: EntryKind::Dir(p),
+                    mtime: mt,
+                });
                 continue;
             }
             if is_cover_name(&s) {
@@ -600,14 +730,48 @@ impl Library {
                         Ok(r) => Arc::new(r),
                         Err(e) => {
                             warn!("retag {}: {e:#}", p.display());
-                            Arc::new(Passthrough { path: p.clone(), size: md.len() })
+                            Arc::new(Passthrough {
+                                path: p.clone(),
+                                size: md.len(),
+                            })
                         }
                     }
                 }
-                _ => Arc::new(Passthrough { path: p.clone(), size: md.len() }),
+                (Some(sc), Some(ext @ ("mp3" | "m4a")))
+                    if !sc.album.is_empty() || sc.file(&s).is_some() =>
+                {
+                    let mut ov = sc.album.clone();
+                    if let Some(f) = sc.file(&s) {
+                        ov.overlay(f);
+                    }
+                    match retag_other(&p, ext, md.len(), &ov) {
+                        Ok(r) => Arc::new(r),
+                        Err(e) => {
+                            warn!("retag {}: {e:#}", p.display());
+                            Arc::new(Passthrough {
+                                path: p.clone(),
+                                size: md.len(),
+                            })
+                        }
+                    }
+                }
+                _ => Arc::new(Passthrough {
+                    path: p.clone(),
+                    size: md.len(),
+                }),
             };
-            let mt = mt.max(if matches!(ext_lower(&p).as_deref(), Some("flac")) { sidecar_mtime.unwrap_or(mt) } else { mt });
-            entries.push(Entry { name: n.clone(), kind: EntryKind::File(vf), mtime: mt });
+            let mt = mt.max(
+                if matches!(ext_lower(&p).as_deref(), Some("flac" | "mp3" | "m4a")) {
+                    sidecar_mtime.unwrap_or(mt)
+                } else {
+                    mt
+                },
+            );
+            entries.push(Entry {
+                name: n.clone(),
+                kind: EntryKind::File(vf),
+                mtime: mt,
+            });
         }
 
         // cover art exported into the sidecar tree
@@ -618,7 +782,14 @@ impl Library {
             for c in ["cover.jpg", "cover.png"] {
                 let p = ov.join(c);
                 if let Ok(md) = std::fs::metadata(&p) {
-                    entries.push(Entry { name: c.into(), kind: EntryKind::File(Arc::new(Passthrough { path: p, size: md.len() })), mtime: md.modified().unwrap_or(SystemTime::UNIX_EPOCH) });
+                    entries.push(Entry {
+                        name: c.into(),
+                        kind: EntryKind::File(Arc::new(Passthrough {
+                            path: p,
+                            size: md.len(),
+                        })),
+                        mtime: md.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                    });
                     break;
                 }
             }
@@ -641,12 +812,27 @@ impl Library {
         entries.sort_by(|a, b| a.name.cmp(&b.name));
 
         let gen_time = self.generations.lock().get(dir).map(|g| g.1);
-        let dir_mt = [sig.dir_mtime, sig.sidecar_mtime, sig.overlay_mtime, gen_time].into_iter().flatten().max().unwrap_or(SystemTime::UNIX_EPOCH);
+        let dir_mt = [
+            sig.dir_mtime,
+            sig.sidecar_mtime,
+            sig.overlay_mtime,
+            gen_time,
+        ]
+        .into_iter()
+        .flatten()
+        .max()
+        .unwrap_or(SystemTime::UNIX_EPOCH);
         if pending {
             // make sure someone re-checks soon even if nothing else changes
             let _ = pending;
         }
-        Ok(Listing { entries, mtime: dir_mt, sig, checked: Mutex::new(Instant::now()), retry_at })
+        Ok(Listing {
+            entries,
+            mtime: dir_mt,
+            sig,
+            checked: Mutex::new(Instant::now()),
+            retry_at,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -664,7 +850,10 @@ impl Library {
         let img = &ready.flac;
         let si = img.si();
         if si.sample_rate % 75 != 0 {
-            bail!("sample rate {} is not a multiple of 75 (cue frames)", si.sample_rate);
+            bail!(
+                "sample rate {} is not a multiple of 75 (cue frames)",
+                si.sample_rate
+            );
         }
         let spf = si.sample_rate as u64 / 75;
         let total = si.total_samples;
@@ -673,17 +862,37 @@ impl Library {
             t.overlay(&tags::from_cue_disc(&cue.fields));
             t
         };
-        let mt = mtimes.iter().flatten().max().copied().unwrap_or(SystemTime::UNIX_EPOCH);
+        let mt = mtimes
+            .iter()
+            .flatten()
+            .max()
+            .copied()
+            .unwrap_or(SystemTime::UNIX_EPOCH);
         let ntracks = cue.tracks.len();
         let ranges: Vec<(u64, u64)> = cue
             .tracks
             .iter()
             .enumerate()
-            .map(|(i, t)| (t.index01 * spf, cue.tracks.get(i + 1).map(|n| n.index01 * spf).unwrap_or(total).min(total)))
+            .map(|(i, t)| {
+                (
+                    t.index01 * spf,
+                    cue.tracks
+                        .get(i + 1)
+                        .map(|n| n.index01 * spf)
+                        .unwrap_or(total)
+                        .min(total),
+                )
+            })
             .collect();
         let md5s = self.cache.load_md5s(&img.path);
-        if ranges.iter().any(|r| !md5s.contains_key(r)) && self.md5_queued.lock().insert(img.path.clone()) {
-            let queued = self.enqueue(Job::Md5 { image: Arc::clone(img), ranges: ranges.clone(), dir: _dir.to_path_buf() });
+        if ranges.iter().any(|r| !md5s.contains_key(r))
+            && self.md5_queued.lock().insert(img.path.clone())
+        {
+            let queued = self.enqueue(Job::Md5 {
+                image: Arc::clone(img),
+                ranges: ranges.clone(),
+                dir: _dir.to_path_buf(),
+            });
             if !queued {
                 self.md5_queued.lock().remove(&img.path);
             }
@@ -715,7 +924,10 @@ impl Library {
                     tg.overlay(tt);
                 }
             }
-            let title = tg.get("TITLE").map(tags::sanitize_name).unwrap_or_else(|| format!("Track {:02}", t.number));
+            let title = tg
+                .get("TITLE")
+                .map(tags::sanitize_name)
+                .unwrap_or_else(|| format!("Track {:02}", t.number));
             let name = match (multi, disc) {
                 (true, Some(d)) => format!("{d}-{:02} - {title}.flac", t.number),
                 _ => format!("{:02} - {title}.flac", t.number),
@@ -725,15 +937,40 @@ impl Library {
             {
                 tg.overlay(ft);
             }
-            let tr = FlacTrack::new(Arc::clone(img), s, e, &tg, &ready.pictures, md5s.get(&(s, e)).copied())?;
-            out.push(Entry { name: name.into(), kind: EntryKind::File(Arc::new(tr)), mtime: mt });
+            let tr = FlacTrack::new(
+                Arc::clone(img),
+                s,
+                e,
+                &tg,
+                &ready.pictures,
+                md5s.get(&(s, e)).copied(),
+            )?;
+            out.push(Entry {
+                name: name.into(),
+                kind: EntryKind::File(Arc::new(tr)),
+                mtime: mt,
+            });
         }
         Ok(out)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn sacd_tracks(&self, _dir: &Path, disc: &Arc<SacdDisc>, disc_no: Option<u32>, ndiscs: usize, sidecar: Option<&Sidecar>, mtimes: &[Option<SystemTime>], mc: bool) -> Vec<Entry> {
-        let mt = mtimes.iter().flatten().max().copied().unwrap_or(SystemTime::UNIX_EPOCH);
+    fn sacd_tracks(
+        &self,
+        _dir: &Path,
+        disc: &Arc<SacdDisc>,
+        disc_no: Option<u32>,
+        ndiscs: usize,
+        sidecar: Option<&Sidecar>,
+        mtimes: &[Option<SystemTime>],
+        mc: bool,
+    ) -> Vec<Entry> {
+        let mt = mtimes
+            .iter()
+            .flatten()
+            .max()
+            .copied()
+            .unwrap_or(SystemTime::UNIX_EPOCH);
         let n = disc.tracks.len();
         let mut out = Vec::new();
         for (i, _) in disc.tracks.iter().enumerate() {
@@ -756,7 +993,10 @@ impl Library {
                 let album = tg.get("ALBUM").unwrap_or("SACD").to_string();
                 tg.set("ALBUM", format!("{album} (Multichannel)"));
             }
-            let title = tg.get("TITLE").map(tags::sanitize_name).unwrap_or_else(|| format!("Track {num:02}"));
+            let title = tg
+                .get("TITLE")
+                .map(tags::sanitize_name)
+                .unwrap_or_else(|| format!("Track {num:02}"));
             let prefix = if mc { "MC " } else { "" };
             let name = match disc_no {
                 Some(d) => format!("{prefix}{d}-{num:02} - {title}.dsf"),
@@ -768,7 +1008,11 @@ impl Library {
                 tg.overlay(ft);
             }
             let vf = sacd::DsfTrack::new(Arc::clone(disc), i, &tg);
-            out.push(Entry { name: name.into(), kind: EntryKind::File(Arc::new(vf)), mtime: mt });
+            out.push(Entry {
+                name: name.into(),
+                kind: EntryKind::File(Arc::new(vf)),
+                mtime: mt,
+            });
         }
         out
     }
@@ -783,18 +1027,41 @@ impl Listing {
 /// Find the audio file a single-FILE cue refers to. Rips are often converted
 /// after the cue was written (cue says .wav, file is .flac), so fall back to
 /// matching by stem, then by the cue's own stem.
-fn resolve_image(cue: &CueSheet, cue_name: &OsStr, names: &[(OsString, std::fs::Metadata)]) -> Option<OsString> {
-    let referenced = Path::new(&cue.files[0].replace('\\', "/")).file_name()?.to_string_lossy().to_string();
-    let is_audio = |n: &str| AUDIO_IMAGE_EXT.contains(&ext_lower(Path::new(n)).unwrap_or_default().as_str());
-    let files: Vec<&OsString> = names.iter().filter(|(_, md)| md.is_file()).map(|(n, _)| n).collect();
-    if let Some(n) = files.iter().find(|n| n.to_string_lossy() == referenced && is_audio(&referenced)) {
+fn resolve_image(
+    cue: &CueSheet,
+    cue_name: &OsStr,
+    names: &[(OsString, std::fs::Metadata)],
+) -> Option<OsString> {
+    let referenced = Path::new(&cue.files[0].replace('\\', "/"))
+        .file_name()?
+        .to_string_lossy()
+        .to_string();
+    let is_audio =
+        |n: &str| AUDIO_IMAGE_EXT.contains(&ext_lower(Path::new(n)).unwrap_or_default().as_str());
+    let files: Vec<&OsString> = names
+        .iter()
+        .filter(|(_, md)| md.is_file())
+        .map(|(n, _)| n)
+        .collect();
+    if let Some(n) = files
+        .iter()
+        .find(|n| n.to_string_lossy() == referenced && is_audio(&referenced))
+    {
         return Some((*n).clone());
     }
     // case-insensitive exact
-    if let Some(n) = files.iter().find(|n| n.to_string_lossy().eq_ignore_ascii_case(&referenced) && is_audio(&referenced)) {
+    if let Some(n) = files
+        .iter()
+        .find(|n| n.to_string_lossy().eq_ignore_ascii_case(&referenced) && is_audio(&referenced))
+    {
         return Some((*n).clone());
     }
-    let stem_of = |s: &str| Path::new(s).file_stem().map(|x| x.to_string_lossy().to_string()).unwrap_or_default();
+    let stem_of = |s: &str| {
+        Path::new(s)
+            .file_stem()
+            .map(|x| x.to_string_lossy().to_string())
+            .unwrap_or_default()
+    };
     let ref_stem = stem_of(&referenced);
     let cue_stem = stem_of(&cue_name.to_string_lossy());
     for want in [&ref_stem, &cue_stem] {
@@ -808,23 +1075,55 @@ fn resolve_image(cue: &CueSheet, cue_name: &OsStr, names: &[(OsString, std::fs::
     None
 }
 
+/// A retagged MP3 (new ID3v2 tag + the source after its tag) or M4A (new moov).
+fn retag_other(p: &Path, ext: &str, len: u64, overlay: &crate::tags::Tags) -> Result<Spliced> {
+    if ext == "mp3" {
+        let (tag, start) = crate::id3::retag_mp3(p, overlay)?;
+        Ok(Spliced::new(
+            p.to_path_buf(),
+            "retagged-mp3",
+            vec![Seg::Mem(tag), Seg::Src(start, len - start)],
+        ))
+    } else {
+        let (mpos, mlen, moov) = crate::mp4::retag_m4a(p, overlay)?;
+        Ok(Spliced::new(
+            p.to_path_buf(),
+            "retagged-m4a",
+            vec![
+                Seg::Src(0, mpos),
+                Seg::Mem(moov),
+                Seg::Src(mpos + mlen, len - mpos - mlen),
+            ],
+        ))
+    }
+}
+
 fn picture_type(data: &[u8]) -> Option<u32> {
-    data.get(0..4).map(|b| u32::from_be_bytes(b.try_into().unwrap()))
+    data.get(0..4)
+        .map(|b| u32::from_be_bytes(b.try_into().unwrap()))
 }
 
 fn ext_lower(p: &Path) -> Option<String> {
-    p.extension().map(|e| e.to_string_lossy().to_ascii_lowercase())
+    p.extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
 }
 
 fn is_ignored(name: &str) -> bool {
     let l = name.to_ascii_lowercase();
-    name.starts_with('.') || l.ends_with(".!qb") || l.ends_with(".parts") || l == crate::sidecar::FILE_NAME
+    name.starts_with('.')
+        || l.ends_with(".!qb")
+        || l.ends_with(".parts")
+        || l == crate::sidecar::FILE_NAME
 }
 
 fn is_cover_name(name: &str) -> bool {
     let l = name.to_ascii_lowercase();
     let stem = l.rsplit_once('.').map(|(s, _)| s).unwrap_or(&l);
-    matches!(stem, "cover" | "folder" | "front" | "albumart" | "album") && (l.ends_with(".jpg") || l.ends_with(".jpeg") || l.ends_with(".png") || l.ends_with(".webp"))
+    matches!(stem, "cover" | "folder" | "front" | "albumart" | "album")
+        && (l.ends_with(".jpg")
+            || l.ends_with(".jpeg")
+            || l.ends_with(".png")
+            || l.ends_with(".webp"))
 }
 
 fn mtime(p: &Path) -> Option<SystemTime> {
@@ -845,7 +1144,9 @@ fn newest_mtime(dir: &Path) -> Option<SystemTime> {
 }
 
 fn recently_modified(p: &Path) -> bool {
-    mtime(p).and_then(|m| m.elapsed().ok()).is_some_and(|age| age < SETTLE)
+    mtime(p)
+        .and_then(|m| m.elapsed().ok())
+        .is_some_and(|age| age < SETTLE)
 }
 
 #[allow(dead_code)]

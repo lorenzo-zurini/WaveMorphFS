@@ -4,8 +4,9 @@
 use crate::scan::{EntryKind, Library};
 use crate::vfile::VFile;
 use fuser::{
-    Errno, FileAttr, FileHandle, FileType, FopenFlags, Filesystem, Generation, INodeNo, LockOwner, OpenFlags, PollEvents, PollFlags,
-    PollNotifier, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyPoll, ReplyStatfs, ReplyXattr, Request,
+    Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, LockOwner,
+    OpenFlags, PollEvents, PollFlags, PollNotifier, ReplyAttr, ReplyData, ReplyDirectory,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyPoll, ReplyStatfs, ReplyXattr, Request,
 };
 use log::{debug, warn};
 use parking_lot::RwLock;
@@ -48,7 +49,11 @@ pub struct WaveFs {
 impl WaveFs {
     pub fn new(lib: Arc<Library>) -> WaveFs {
         let mut nodes = Nodes::default();
-        nodes.list.push(Node { parent: 1, name: OsString::new(), kind: Kind::Root });
+        nodes.list.push(Node {
+            parent: 1,
+            name: OsString::new(),
+            kind: Kind::Root,
+        });
         WaveFs {
             lib,
             nodes: RwLock::new(nodes),
@@ -60,7 +65,9 @@ impl WaveFs {
 
     fn node_kind(&self, ino: u64) -> Option<(u64, OsString, Kind)> {
         let n = self.nodes.read();
-        n.list.get(ino as usize - 1).map(|x| (x.parent, x.name.clone(), x.kind.clone()))
+        n.list
+            .get(ino as usize - 1)
+            .map(|x| (x.parent, x.name.clone(), x.kind.clone()))
     }
 
     fn ino_for(&self, parent: u64, name: &OsStr, kind: Kind) -> u64 {
@@ -78,7 +85,11 @@ impl WaveFs {
         if let Some(&i) = n.by_name.get(&key) {
             return i;
         }
-        n.list.push(Node { parent, name: name.to_os_string(), kind });
+        n.list.push(Node {
+            parent,
+            name: name.to_os_string(),
+            kind,
+        });
         let ino = n.list.len() as u64;
         n.by_name.insert(key, ino);
         ino
@@ -140,8 +151,14 @@ impl WaveFs {
         }
     }
 
-    fn resolve_file(&self, parent: u64, name: &OsStr) -> Result<(Arc<dyn VFile>, SystemTime), Errno> {
-        let Some((_, _, Kind::Dir(p))) = self.node_kind(parent) else { return Err(Errno::ENOENT) };
+    fn resolve_file(
+        &self,
+        parent: u64,
+        name: &OsStr,
+    ) -> Result<(Arc<dyn VFile>, SystemTime), Errno> {
+        let Some((_, _, Kind::Dir(p))) = self.node_kind(parent) else {
+            return Err(Errno::ENOENT);
+        };
         let l = self.lib.list_dir(&p).map_err(|_| Errno::ENOENT)?;
         match l.find(name).map(|e| (&e.kind, e.mtime)) {
             Some((EntryKind::File(vf), mt)) => Ok((Arc::clone(vf), mt)),
@@ -152,7 +169,13 @@ impl WaveFs {
     /// Children of a directory node: (name, kind, is_dir)
     fn children(&self, ino: u64) -> Result<Vec<(OsString, Kind, bool)>, Errno> {
         match self.node_kind(ino).ok_or(Errno::ENOENT)?.2 {
-            Kind::Root => Ok(self.lib.cfg.roots.iter().map(|r| (OsString::from(&r.name), Kind::Dir(r.path.clone()), true)).collect()),
+            Kind::Root => Ok(self
+                .lib
+                .cfg
+                .roots
+                .iter()
+                .map(|r| (OsString::from(&r.name), Kind::Dir(r.path.clone()), true))
+                .collect()),
             Kind::Dir(p) => {
                 let l = self.lib.list_dir(&p).map_err(|e| {
                     warn!("list {}: {e:#}", p.display());
@@ -175,7 +198,10 @@ impl Filesystem for WaveFs {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let res = (|| {
             let kids = self.children(parent.0)?;
-            let (n, kind, _) = kids.into_iter().find(|(n, _, _)| n == name).ok_or(Errno::ENOENT)?;
+            let (n, kind, _) = kids
+                .into_iter()
+                .find(|(n, _, _)| n == name)
+                .ok_or(Errno::ENOENT)?;
             let ino = self.ino_for(parent.0, &n, kind);
             self.attr(ino)
         })();
@@ -214,7 +240,9 @@ impl Filesystem for WaveFs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        let Some((parent, name, Kind::File)) = self.node_kind(ino.0) else { return reply.error(Errno::ENOENT) };
+        let Some((parent, name, Kind::File)) = self.node_kind(ino.0) else {
+            return reply.error(Errno::ENOENT);
+        };
         let vf = match self.resolve_file(parent, &name) {
             Ok((vf, _)) => vf,
             Err(e) => return reply.error(e),
@@ -229,24 +257,58 @@ impl Filesystem for WaveFs {
     }
 
     // Read-only, static content: nothing to flush, always readable.
-    fn flush(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle, _lock_owner: LockOwner, reply: ReplyEmpty) {
+    fn flush(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _lock_owner: LockOwner,
+        reply: ReplyEmpty,
+    ) {
         reply.ok();
     }
 
-    fn poll(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle, _ph: PollNotifier, events: PollEvents, _flags: PollFlags, reply: ReplyPoll) {
+    fn poll(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _ph: PollNotifier,
+        events: PollEvents,
+        _flags: PollFlags,
+        reply: ReplyPoll,
+    ) {
         reply.poll(events);
     }
 
-    fn readdir(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, mut reply: ReplyDirectory) {
+    fn readdir(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
+        mut reply: ReplyDirectory,
+    ) {
         let kids = match self.children(ino.0) {
             Ok(k) => k,
             Err(e) => return reply.error(e),
         };
         let parent = self.node_kind(ino.0).map_or(1, |n| n.0);
-        let mut all: Vec<(u64, FileType, OsString)> = vec![(ino.0, FileType::Directory, ".".into()), (parent, FileType::Directory, "..".into())];
+        let mut all: Vec<(u64, FileType, OsString)> = vec![
+            (ino.0, FileType::Directory, ".".into()),
+            (parent, FileType::Directory, "..".into()),
+        ];
         for (n, kind, is_dir) in kids {
             let child = self.ino_for(ino.0, &n, kind);
-            all.push((child, if is_dir { FileType::Directory } else { FileType::RegularFile }, n));
+            all.push((
+                child,
+                if is_dir {
+                    FileType::Directory
+                } else {
+                    FileType::RegularFile
+                },
+                n,
+            ));
         }
         for (i, (child, ft, name)) in all.into_iter().enumerate().skip(offset as usize) {
             if reply.add(INodeNo(child), (i + 1) as u64, ft, &name) {
@@ -257,11 +319,23 @@ impl Filesystem for WaveFs {
     }
 
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
-        let Some(root) = self.lib.cfg.roots.first() else { return reply.statfs(0, 0, 0, 0, 0, 4096, 255, 4096) };
-        let c = std::ffi::CString::new(root.path.as_os_str().as_encoded_bytes()).unwrap_or_default();
+        let Some(root) = self.lib.cfg.roots.first() else {
+            return reply.statfs(0, 0, 0, 0, 0, 4096, 255, 4096);
+        };
+        let c =
+            std::ffi::CString::new(root.path.as_os_str().as_encoded_bytes()).unwrap_or_default();
         let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
         if unsafe { libc::statvfs(c.as_ptr(), &mut s) } == 0 {
-            reply.statfs(s.f_blocks, 0, 0, s.f_files, 0, s.f_bsize as u32, 255, s.f_frsize as u32);
+            reply.statfs(
+                s.f_blocks,
+                0,
+                0,
+                s.f_files,
+                0,
+                s.f_bsize as u32,
+                255,
+                s.f_frsize as u32,
+            );
         } else {
             reply.statfs(0, 0, 0, 0, 0, 4096, 255, 4096);
         }

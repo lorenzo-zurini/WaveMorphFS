@@ -68,3 +68,80 @@ pub fn copy_overlap(out: &mut Vec<u8>, seg: &[u8], seg_start: u64, off: u64, len
         out.extend_from_slice(&seg[(a - seg_start) as usize..(b - seg_start) as usize]);
     }
 }
+
+/// A piece of a `Spliced` file.
+pub enum Seg {
+    Mem(Vec<u8>),
+    /// (offset, length) in the source file
+    Src(u64, u64),
+}
+
+/// A source file with some byte ranges replaced (retagged MP3 / M4A).
+pub struct Spliced {
+    pub path: PathBuf,
+    /// segments with their virtual start offsets
+    segs: Vec<(u64, Seg)>,
+    size: u64,
+    what: &'static str,
+}
+
+impl Spliced {
+    pub fn new(path: PathBuf, what: &'static str, segs: Vec<Seg>) -> Spliced {
+        let mut at = 0;
+        let segs: Vec<(u64, Seg)> = segs
+            .into_iter()
+            .map(|s| {
+                let start = at;
+                at += match &s {
+                    Seg::Mem(b) => b.len() as u64,
+                    Seg::Src(_, l) => *l,
+                };
+                (start, s)
+            })
+            .collect();
+        Spliced {
+            path,
+            segs,
+            size: at,
+            what,
+        }
+    }
+}
+
+impl VFile for Spliced {
+    fn size(&self) -> u64 {
+        self.size
+    }
+
+    fn read_at(&self, off: u64, len: usize) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(len);
+        if off >= self.size {
+            return Ok(out);
+        }
+        let end = off + len.min((self.size - off) as usize) as u64;
+        let mut file = None;
+        for (start, seg) in &self.segs {
+            match seg {
+                Seg::Mem(b) => copy_overlap(&mut out, b, *start, off, (end - off) as usize),
+                Seg::Src(so, sl) => {
+                    let a = off.max(*start);
+                    let b = end.min(start + sl);
+                    if a < b {
+                        if file.is_none() {
+                            file = Some(File::open(&self.path)?);
+                        }
+                        let mut buf = vec![0u8; (b - a) as usize];
+                        let n = read_full_at(file.as_ref().unwrap(), &mut buf, so + (a - start))?;
+                        buf.truncate(n);
+                        out.extend_from_slice(&buf);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn describe(&self) -> String {
+        format!("{}:{}", self.what, self.path.display())
+    }
+}
