@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "cache.hpp"
 
-#include <nlohmann/json.hpp>
-
 #include <cstring>
 
 #include "md5.hpp"
@@ -12,7 +10,7 @@ namespace wm {
 static const char IDX_MAGIC[8] = {'W', 'M', 'I', 'D', 'X', '0', '0', '1'};
 
 Cache::Cache(fs::path dir) : dir_(std::move(dir)) {
-    for (auto sub : {"flacidx", "images", "md5"}) fs::create_directories(dir_ / sub);
+    for (auto sub : {"flacidx", "md5"}) fs::create_directories(dir_ / sub);
 }
 
 std::string Cache::name_for(const fs::path& src, const SrcKey& key, std::string_view extra) {
@@ -52,9 +50,8 @@ void Cache::store_index(const fs::path& src, const SrcKey& key, const flac::Fram
 bool Cache::image_is_cached(const fs::path& src) const {
     auto key = SrcKey::try_of(src);
     if (!key) return false;
-    fs::path f = ext_lower(src) == "flac" ? src : converted_path(src, *key);
-    auto fkey = SrcKey::try_of(f);
-    return fkey && fs::exists(idx_path(f, *fkey));
+    if (ext_lower(src) != "flac") return fs::exists(dir_ / "flacidx" / (name_for(src, *key, "av") + ".avidx"));
+    return fs::exists(idx_path(src, *key));
 }
 
 flac::FrameIndex Cache::index_for(const fs::path& src, const flac::FlacMeta& meta) const {
@@ -107,80 +104,8 @@ void Cache::store_md5s(const fs::path& flac, const Md5Map& entries) const {
     atomic_write(md5_path(flac, key), text);
 }
 
-fs::path Cache::converted_path(const fs::path& src, const SrcKey& key) const { return dir_ / "images" / (name_for(src, key) + ".flac"); }
-
 fs::path Cache::sacd_frames_path(const fs::path& src, const SrcKey& key, bool multichannel) const {
     return dir_ / "flacidx" / (name_for(src, key, multichannel ? "sacd-mc" : "sacd") + ".sacdidx");
-}
-
-fs::path Cache::convert_image(const fs::path& src) const {
-    auto key = SrcKey::of(src);
-    auto out = converted_path(src, key);
-    if (fs::exists(out)) return out;
-    auto probe = run({"ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
-                      "stream=sample_fmt,bits_per_raw_sample,bits_per_sample,channels,sample_rate", "-of", "default=nw=1", src.string()});
-    WM_ENSURE(probe.ok(), "ffprobe failed: {}", probe.err);
-    auto field = [&](std::string_view k) -> std::string {
-        for (auto& l : split(probe.out, '\n'))
-            if (starts_with(l, std::string(k) + "=")) return l.substr(k.size() + 1);
-        return "";
-    };
-    uint64_t bits = parse_u64(field("bits_per_raw_sample")).value_or(0);
-    if (bits == 0) bits = parse_u64(field("bits_per_sample")).value_or(0);
-    if (bits == 0) {
-        auto f = field("sample_fmt");
-        bits = (f == "u8" || f == "u8p") ? 8 : (f == "s16" || f == "s16p") ? 16 : 24;
-    }
-    const char* codec = bits <= 8 ? "pcm_u8" : bits <= 16 ? "pcm_s16le" : "pcm_s24le";
-    // unique per process+thread, and ending in .flac because the flac CLI wants that
-    fs::path tmp = unique_tmp(out).string() + ".flac";
-    // decode with ffmpeg, encode with the reference encoder
-    int st = run_inherit({"sh", "-c",
-                          "ffmpeg -v error -i \"$1\" -map 0:a:0 -c:a $2 -f wav - | flac -s -f --ignore-chunk-sizes --compression-level-5 --blocksize=4096 -o \"$3\" -",
-                          "sh", src.string(), codec, tmp.string()});
-    std::error_code ec;
-    if (st != 0) {
-        fs::remove(tmp, ec);
-        fail("conversion of {} failed", src.string());
-    }
-    // verify: MD5 of the source PCM (ffmpeg) == STREAMINFO MD5 written by flac
-    auto md5 = run({"ffmpeg", "-v", "error", "-i", src.string(), "-map", "0:a:0", "-c:a", codec, "-f", "md5", "-"});
-    std::string src_md5 = trim(md5.out);
-    if (starts_with(src_md5, "MD5=")) src_md5 = src_md5.substr(4);
-    std::string got = hex(flac::FlacMeta::read(tmp).streaminfo.md5);
-    if (src_md5 != got) {
-        fs::remove(tmp, ec);
-        fail("PCM MD5 mismatch after converting {} ({} vs {})", src.string(), src_md5, got);
-    }
-    WM_ENSURE(SrcKey::of(src) == key, "{} changed during conversion", src.string());
-    if (fs::exists(out)) {
-        // another process finished the same conversion first; keep theirs
-        fs::remove(tmp, ec);
-        return out;
-    }
-    fs::rename(tmp, out);
-    // source tags (APEv2 etc.) for later use as album-level tags
-    auto tags = run({"ffprobe", "-v", "error", "-show_entries", "format_tags", "-of", "json", src.string()});
-    atomic_write(fs::path(out).replace_extension(".json"), tags.out);
-    return out;
-}
-
-std::vector<std::pair<std::string, std::string>> Cache::converted_tags(const fs::path& converted) const {
-    auto t = try_read_text(fs::path(converted).replace_extension(".json"));
-    return t ? parse_ffprobe_tags(*t) : std::vector<std::pair<std::string, std::string>>{};
-}
-
-std::vector<std::pair<std::string, std::string>> parse_ffprobe_tags(std::string_view json) {
-    std::vector<std::pair<std::string, std::string>> out;
-    auto j = nlohmann::ordered_json::parse(json, nullptr, false);
-    if (j.is_discarded()) return out;
-    auto f = j.find("format");
-    if (f == j.end() || !f->is_object()) return out;
-    auto t = f->find("tags");
-    if (t == f->end() || !t->is_object()) return out;
-    for (auto& [k, v] : t->items())
-        if (v.is_string()) out.emplace_back(k, v.get<std::string>());
-    return out;
 }
 
 }  // namespace wm

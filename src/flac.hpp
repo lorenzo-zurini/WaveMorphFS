@@ -112,6 +112,13 @@ uint64_t verbatim_size(uint32_t samples, uint32_t channels, uint32_t bps, uint64
 Bytes encode_verbatim(const std::vector<std::span<const int32_t>>& chans, uint32_t bps, uint64_t sample_number, uint8_t sr_code,
                       std::span<const uint8_t> sr_extra);
 
+/// Encode one block of per-channel samples as a compressed FLAC frame (libFLAC,
+/// compression level 5) numbered `frame_number` in a fixed-blocksize stream of
+/// `block_size`-sample frames. Frames are encoded independently, so the result
+/// depends only on the samples and the number: the same frame can be produced
+/// again at any time, byte for byte.
+Bytes encode_frame(const std::vector<std::span<const int32_t>>& chans, uint32_t bps, uint32_t sample_rate, uint32_t block_size, uint64_t frame_number);
+
 /// Decode one complete frame (first header byte to CRC-16) to per-channel samples.
 /// bps and sample rate come from STREAMINFO when the header defers to it.
 std::vector<std::vector<int32_t>> decode_frame(std::span<const uint8_t> frame, uint32_t bps, uint32_t sample_rate);

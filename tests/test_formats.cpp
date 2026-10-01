@@ -2,7 +2,6 @@
 // CUE / charset detection, ID3, MP4 and ffprobe-tag parsing.
 #include <unistd.h>
 
-#include "cache.hpp"
 #include "charset.hpp"
 #include "cue.hpp"
 #include "id3.hpp"
@@ -198,11 +197,4 @@ TEST(mp4_rewrites_ilst_and_shifts_offsets) {
     CHECK(s.find("com.apple.iTunes") != std::string::npos && s.find("MusicBrainz Album Id") != std::string::npos);
     Bytes trkn = {0, 0, 0, 3, 0, 12, 0, 0};
     CHECK_MSG(std::search(r.moov.begin(), r.moov.end(), trkn.begin(), trkn.end()) != r.moov.end(), "trkn 3/12");
-}
-
-TEST(ffprobe_tags_keep_names) {
-    auto t = parse_ffprobe_tags(R"({"format": {"tags": {"Artist": "Neutral Milk Hotel", "Album": "In the \"Aeroplane\"", "Year": "1998"}}})");
-    CHECK(t.size() == 3);
-    CHECK((t[0] == std::pair<std::string, std::string>("Artist", "Neutral Milk Hotel")));
-    CHECK(t[1].second == "In the \"Aeroplane\"");
 }

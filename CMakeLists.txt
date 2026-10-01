@@ -11,6 +11,7 @@ endif()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(FUSE3 REQUIRED IMPORTED_TARGET fuse3)
 pkg_check_modules(FLAC REQUIRED IMPORTED_TARGET flac)
+pkg_check_modules(LIBAV REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil)
 find_package(nlohmann_json 3.10 REQUIRED)
 find_package(Threads REQUIRED)
 
@@ -25,6 +26,8 @@ add_library(wmcore STATIC
   src/cue.cpp
   src/flac.cpp
   src/track.cpp
+  src/avimage.cpp
+  src/encoded.cpp
   src/vfile.cpp
   src/retag.cpp
   src/id3.cpp
@@ -38,7 +41,7 @@ add_library(wmcore STATIC
 )
 target_include_directories(wmcore PUBLIC src)
 target_compile_definitions(wmcore PUBLIC FUSE_USE_VERSION=312)
-target_link_libraries(wmcore PUBLIC PkgConfig::FUSE3 PkgConfig::FLAC nlohmann_json::nlohmann_json Threads::Threads)
+target_link_libraries(wmcore PUBLIC PkgConfig::FUSE3 PkgConfig::FLAC PkgConfig::LIBAV nlohmann_json::nlohmann_json Threads::Threads)
 
 add_executable(wavemorphfs src/main.cpp)
 target_link_libraries(wavemorphfs PRIVATE wmcore)

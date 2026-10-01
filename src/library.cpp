@@ -210,6 +210,19 @@ void Library::run_job(Job job) {
             md5_queued_.erase(j->image->path);
         }
         bump(j->dir);
+    } else if (auto* j = std::get_if<EncodeJob>(&job)) {
+        try {
+            auto t = Clock::now();
+            build_layout(*j->image, j->ranges, &cache);
+            info("tracks measured: {} ({:.0f}s)", j->image->path.string(), std::chrono::duration<double>(Clock::now() - t).count());
+        } catch (const std::exception& e) {
+            warn("measuring tracks of {}: {}", j->image->path.string(), e.what());
+        }
+        {
+            std::lock_guard g(mu_);
+            encode_queued_.erase(j->image->path);
+        }
+        bump(j->dir);
     } else if (auto* j = std::get_if<SacdJob>(&job)) {
         auto key = SrcKey::try_of(j->src);
         const char* area = j->mc ? "multichannel" : "stereo";
@@ -234,17 +247,17 @@ void Library::run_job(Job job) {
 }
 
 ReadyImage Library::process_image(const fs::path& src) const {
-    bool is_flac = ext_lower(src) == "flac";
-    fs::path flac_path = src;
-    std::optional<Tags> source_tags;
-    if (!is_flac) {
-        flac_path = cache.convert_image(src);
-        source_tags = Tags::from_pairs(cache.converted_tags(flac_path));
+    ReadyImage r;
+    if (ext_lower(src) != "flac") {
+        auto av = AvImage::open(src, &cache);
+        r.source_tags = av->tags;
+        r.av = av;
+        return r;
     }
+    fs::path flac_path = src;
     auto meta = flac::FlacMeta::read(flac_path);
     auto idx = cache.index_for(flac_path, meta);
-    ReadyImage r;
-    r.source_tags = source_tags ? *source_tags : Tags::from_pairs(meta.vorbis_comments());
+    r.source_tags = Tags::from_pairs(meta.vorbis_comments());
     for (auto* b : meta.pictures())
         if (b->data.size() <= (2 << 20) && picture_type(b->data) == 3) {
             r.pictures.push_back(*b);
@@ -328,7 +341,7 @@ Work<ReadyImage> Library::image_state(const fs::path& src, const fs::path& dir) 
         }
     }
     if (recently_modified(src)) {
-        Work<ReadyImage> st{Work<ReadyImage>::Settling, Clock::now() + SETTLE};
+        Work<ReadyImage> st{Work<ReadyImage>::Settling, Clock::now() + SETTLE, nullptr, ""};
         std::lock_guard g(mu_);
         images_[src] = {*key, st};
         return st;
@@ -366,7 +379,7 @@ Work<SacdDisc> Library::sacd_state(const fs::path& src, const fs::path& dir, boo
         }
     }
     if (recently_modified(src)) {
-        Work<SacdDisc> st{Work<SacdDisc>::Settling, Clock::now() + SETTLE};
+        Work<SacdDisc> st{Work<SacdDisc>::Settling, Clock::now() + SETTLE, nullptr, ""};
         std::lock_guard g(mu_);
         sacds_[mkey] = {*key, st};
         return st;
@@ -523,7 +536,8 @@ std::shared_ptr<Listing> Library::build_listing(const fs::path& dir, const Sig& 
                                       max_mtime({mtime_ns(dir / cue_name), mtime_ns(img_path), sidecar_mtime}));
                 hidden.insert(cue_name);
                 hidden.insert(img_name);
-                for (auto& e : v) virtuals.push_back(std::move(e));
+                if (v)
+                    for (auto& e : *v) virtuals.push_back(std::move(e));
             } catch (const std::exception& e) {
                 warn("splitting {}: {}", img_path.string(), e.what());
             }
@@ -633,12 +647,13 @@ std::shared_ptr<Listing> Library::build_listing(const fs::path& dir, const Sig& 
     return l;
 }
 
-std::vector<Entry> Library::image_tracks(const fs::path& dir, const CueSheet& cue, const ReadyImage& ready, std::optional<uint32_t> disc, bool multi,
-                                         size_t ndiscs, const Sidecar* sidecar, int64_t mt) {
+std::optional<std::vector<Entry>> Library::image_tracks(const fs::path& dir, const CueSheet& cue, const ReadyImage& ready,
+                                                        std::optional<uint32_t> disc, bool multi, size_t ndiscs, const Sidecar* sidecar, int64_t mt) {
     auto& img = ready.flac;
-    const auto& si = img->si();
-    WM_ENSURE(si.sample_rate % 75 == 0, "sample rate {} is not a multiple of 75 (cue frames)", si.sample_rate);
-    uint64_t spf = si.sample_rate / 75, total = si.total_samples;
+    uint32_t rate = img ? img->si().sample_rate : ready.av->sample_rate;
+    uint64_t total = img ? img->si().total_samples : ready.av->total;
+    WM_ENSURE(rate % 75 == 0, "sample rate {} is not a multiple of 75 (cue frames)", rate);
+    uint64_t spf = rate / 75;
     Tags base = ready.source_tags.without_track_specific();
     base.overlay(from_cue_disc(cue.fields));
     size_t ntracks = cue.tracks.size();
@@ -647,8 +662,30 @@ std::vector<Entry> Library::image_tracks(const fs::path& dir, const CueSheet& cu
         uint64_t e = i + 1 < ntracks ? cue.tracks[i + 1].index01 * spf : total;
         ranges.emplace_back(cue.tracks[i].index01 * spf, std::min(e, total));
     }
-    auto md5s = cache.load_md5s(img->path);
-    bool missing = std::any_of(ranges.begin(), ranges.end(), [&](auto& r) { return !md5s.contains(r); });
+    std::optional<std::vector<TrackLayout>> layout;
+    if (ready.av) {
+        layout = load_layout(*ready.av, ranges, cache);
+        if (!layout) {
+            bool fresh;
+            {
+                std::lock_guard g(mu_);
+                fresh = encode_queued_.insert(ready.av->path).second;
+            }
+            if (!fresh) return std::nullopt;
+            if (enqueue(EncodeJob{ready.av, ranges, dir})) return std::nullopt;
+            try {
+                layout = build_layout(*ready.av, ranges, &cache);
+            } catch (...) {
+                std::lock_guard g(mu_);
+                encode_queued_.erase(ready.av->path);
+                throw;
+            }
+            std::lock_guard g(mu_);
+            encode_queued_.erase(ready.av->path);
+        }
+    }
+    Md5Map md5s = img ? cache.load_md5s(img->path) : Md5Map{};
+    bool missing = img && std::any_of(ranges.begin(), ranges.end(), [&](auto& r) { return !md5s.contains(r); });
     if (missing) {
         bool fresh;
         {
@@ -684,6 +721,10 @@ std::vector<Entry> Library::image_tracks(const fs::path& dir, const CueSheet& cu
         std::string name = multi && disc ? std::format("{}-{:02} - {}.flac", *disc, t.number, title) : std::format("{:02} - {}.flac", t.number, title);
         if (sidecar)
             if (auto ft = sidecar->file(name)) tg.overlay(*ft);
+        if (ready.av) {
+            out.push_back({name, false, {}, std::make_shared<EncodedTrack>(ready.av, s, e, tg, (*layout)[i]), mt});
+            continue;
+        }
         std::optional<std::array<uint8_t, 16>> md5;
         if (auto it = md5s.find({s, e}); it != md5s.end()) md5 = it->second;
         out.push_back({name, false, {}, std::make_shared<FlacTrack>(img, s, e, tg, ready.pictures, md5), mt});

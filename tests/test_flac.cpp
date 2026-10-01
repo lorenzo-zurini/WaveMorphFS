@@ -166,3 +166,56 @@ TEST(split_multichannel_8bit) {
     size_t total = 576 * 40 + 9;
     run_case(22050, 6, 8, 576, total, edge_ranges(576, total));
 }
+
+// ---- decoded (non-FLAC) images, tracks encoded on the fly
+
+#include "avimage.hpp"
+#include "encoded.hpp"
+
+namespace {
+
+void run_decoded_case(const char* codec, const char* ext, uint32_t rate, size_t ch, uint32_t bps, size_t total) {
+    fs::path dir = fs::temp_directory_path() / std::format("wm-test-av-{}-{}", ::getpid(), codec);
+    fs::create_directories(dir);
+    fs::path raw = dir / "in.raw", img = dir / (std::string("img.") + ext);
+    auto sig = signal(total, ch, bps);
+    Bytes all = raw_pcm(sig, bps);
+    atomic_write(raw, all);
+    auto st = run({"ffmpeg", "-v", "error", "-y", "-f", bps == 16 ? "s16le" : "s24le", "-ar", std::to_string(rate), "-ac", std::to_string(ch), "-i",
+                   raw.string(), "-c:a", codec, img.string()});
+    CHECK_MSG(st.ok(), "ffmpeg encode: {}", st.err);
+    auto image = AvImage::open(img, nullptr);
+    CHECK(image->total == total && image->channels == ch && image->bps == bps && image->sample_rate == rate);
+    size_t frame_bytes = bps / 8 * ch;
+    uint64_t bs = 4096;
+    Ranges ranges = {{0, total}, {1, bs + 1}, {bs - 3, bs + 3}, {12345, total - 777}, {total - 5, total}};
+    auto layout = build_layout(*image, ranges, nullptr);
+    for (size_t i = 0; i < ranges.size(); i++) {
+        auto [s, e] = ranges[i];
+        Tags tags;
+        tags.set("TITLE", std::format("{}-{}", s, e));
+        EncodedTrack tr(image, s, e, tags, layout[i]);
+        Bytes bytes = tr.read_at(0, size_t(tr.size()));
+        CHECK(bytes.size() == tr.size());
+        fs::path out = dir / "t.flac";
+        atomic_write(out, bytes);
+        auto t = run({"flac", "-t", "-s", out.string()});
+        CHECK_MSG(t.ok(), "flac -t failed for {} range {}..{}: {}", codec, s, e, t.err);
+        auto d = run({"flac", "-d", "-c", "-s", "--force-raw-format", "--endian=little", "--sign=signed", out.string()});
+        std::string_view want = str_of(std::span(all).subspan(size_t(s) * frame_bytes, size_t(e - s) * frame_bytes));
+        CHECK_MSG(d.out == want, "PCM mismatch for {} range {}..{}", codec, s, e);
+        // compressed, and random access reproduces the same bytes
+        if (e - s > 100000) CHECK(tr.size() < (e - s) * frame_bytes * 9 / 10);
+        for (uint64_t off : {uint64_t(7), tr.size() / 2, tr.size() - 3000}) {
+            EncodedTrack fresh(image, s, e, tags, layout[i]);
+            Bytes part = fresh.read_at(off, 9000);
+            CHECK(std::equal(part.begin(), part.end(), bytes.begin() + ptrdiff_t(off)));
+        }
+    }
+    fs::remove_all(dir);
+}
+
+}  // namespace
+
+TEST(decoded_wavpack_16bit) { run_decoded_case("wavpack", "wv", 44100, 2, 16, 44100 * 7 + 1234); }
+TEST(decoded_tta_24bit) { run_decoded_case("tta", "tta", 96000, 2, 24, 96000 * 5 + 99); }
