@@ -50,7 +50,7 @@ void Cache::store_index(const fs::path& src, const SrcKey& key, const flac::Fram
 bool Cache::image_is_cached(const fs::path& src) const {
     auto key = SrcKey::try_of(src);
     if (!key) return false;
-    if (ext_lower(src) != "flac") return fs::exists(dir_ / "flacidx" / (name_for(src, *key, "av") + ".avidx"));
+    if (ext_lower(src) != "flac") return fs::exists(av_index_path(src, *key));
     return fs::exists(idx_path(src, *key));
 }
 
@@ -103,6 +103,8 @@ void Cache::store_md5s(const fs::path& flac, const Md5Map& entries) const {
     for (auto& l : lines) text += l + "\n";
     atomic_write(md5_path(flac, key), text);
 }
+
+fs::path Cache::av_index_path(const fs::path& src, const SrcKey& key) const { return dir_ / "flacidx" / (name_for(src, key, "av") + ".avidx"); }
 
 fs::path Cache::sacd_frames_path(const fs::path& src, const SrcKey& key, bool multichannel) const {
     return dir_ / "flacidx" / (name_for(src, key, multichannel ? "sacd-mc" : "sacd") + ".sacdidx");

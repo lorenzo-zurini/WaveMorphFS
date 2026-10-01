@@ -9,18 +9,18 @@
 
 namespace wm {
 
+fs::path layout_path(const AvImage& img, const Ranges& ranges, const Cache& cache) {
+    std::string extra = "flac-encoded";
+    for (auto& [s, e] : ranges) extra += std::format(" {}-{}", s, e);
+    return cache.dir() / "flacidx" / (Cache::name_for(img.path, SrcKey::of(img.path), extra) + ".encidx");
+}
+
 namespace {
 
 const char LAYOUT_MAGIC[8] = {'W', 'M', 'E', 'N', 'C', '0', '0', '1'};
 constexpr size_t RECENT = 8;
 /// frames decoded per batch while measuring
 constexpr uint64_t BATCH = 64;
-
-fs::path layout_path(const AvImage& img, const Ranges& ranges, const Cache& cache) {
-    std::string extra = "flac-encoded";
-    for (auto& [s, e] : ranges) extra += std::format(" {}-{}", s, e);
-    return cache.dir() / "flacidx" / (Cache::name_for(img.path, SrcKey::of(img.path), extra) + ".encidx");
-}
 
 uint64_t frames_of(uint64_t samples) { return (samples + ENCODED_BLOCK - 1) / ENCODED_BLOCK; }
 
