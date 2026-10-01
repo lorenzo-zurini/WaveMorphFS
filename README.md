@@ -75,16 +75,155 @@ cmake --build build
 build/wavemorphfs-tests      # unit tests (need the flac tool)
 ```
 
-The `Dockerfile` builds and tests it on Debian and runs the mount in a container
-(needs `/dev/fuse`, `CAP_SYS_ADMIN`, and the mountpoint's parent bound with
-`rshared` propagation; see `docker/entrypoint.sh`).
+The `Dockerfile` builds and tests it on Debian and runs the mount in a container;
+see [Running with Docker](#running-with-docker).
+
+## Running with Docker
+
+A complete setup as it runs in production: WaveMorphFS mounts the downloads,
+[Navidrome](https://www.navidrome.org/) serves the mount, and
+[beets](https://beets.io/) tags it from MusicBrainz — every tag beets writes lands
+in a sidecar, so the downloads are never touched.
+
+```
+music-stack/
+├── docker-compose.yml
+├── wavemorph/
+│   ├── mnt/        the mount (created by the container)
+│   ├── tags/       sidecars — the only precious data, back it up
+│   └── cache/      frame/packet indexes, safe to delete
+├── navidrome/      Navidrome's database
+└── beets/
+    └── config.yaml
+```
+
+```yaml
+# docker-compose.yml
+services:
+  wavemorphfs:
+    build: ./WaveMorphFS          # a checkout of this repository
+    image: wavemorphfs:latest
+    container_name: wavemorphfs
+    user: 1000:1000               # owner of wavemorph/ (see note below)
+    devices:
+      - /dev/fuse
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined       # AppArmor blocks FUSE mounts in containers
+    environment:
+      - WAVEMORPH_LOG=info
+      - WAVEMORPH_MOUNT=/wavemorph/mnt
+      # also expose SACD multichannel areas as "(Multichannel)" albums
+      - WAVEMORPH_SACD_MULTICHANNEL=false
+    command:
+      - --root=Music=/music
+      - --root=Classical Music=/classical
+      - --tags-dir=/wavemorph/tags
+      - --cache-dir=/wavemorph/cache
+    volumes:
+      # the downloads: read-only, WaveMorphFS never writes to them
+      - /path/to/downloads/music:/music:ro
+      - /path/to/downloads/classical:/classical:ro
+      # rshared: the FUSE mount made in here propagates back to the host
+      - type: bind
+        source: ./wavemorph
+        target: /wavemorph
+        bind:
+          propagation: rshared
+    healthcheck:
+      test: ["CMD", "mountpoint", "-q", "/wavemorph/mnt"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  navidrome:
+    image: deluan/navidrome:latest
+    user: 1000:1000
+    environment:
+      # the image sets ND_MUSICFOLDER=/music, which overrides navidrome.toml
+      - ND_MUSICFOLDER=/wm/mnt/Music
+      # FUSE gives no change notifications: rescan on a timer
+      - ND_SCANNER_SCHEDULE=@every 1h
+    ports:
+      - 4533:4533
+    depends_on:
+      wavemorphfs:
+        condition: service_healthy
+    volumes:
+      - ./navidrome:/data
+      # bind the PARENT of the mountpoint with rslave, not the mountpoint itself:
+      # that way the mount reappears after wavemorphfs restarts
+      - type: bind
+        source: ./wavemorph
+        target: /wm
+        read_only: true
+        bind:
+          propagation: rslave
+    restart: unless-stopped
+
+  beets:
+    image: lscr.io/linuxserver/beets:latest
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Etc/UTC
+    depends_on:
+      wavemorphfs:
+        condition: service_healthy
+    volumes:
+      - ./beets:/config
+      # writable: tag writes on the mount are stored as sidecars
+      - type: bind
+        source: ./wavemorph
+        target: /wm
+        bind:
+          propagation: rslave
+    restart: unless-stopped
+```
+
+```yaml
+# beets/config.yaml — tag files in place on the mount; never move or copy them
+# (their names are fixed by the mount)
+directory: /wm/mnt
+library: /config/library.db
+plugins: musicbrainz
+import:
+  copy: no
+  move: no
+  write: yes
+  incremental: yes
+  log: /config/import.log
+```
+
+Then `docker compose up -d`, import with
+`docker compose exec beets beet import /wm/mnt/Music`, and add further libraries
+(e.g. `/wm/mnt/Classical Music`) in Navidrome's web UI under *Libraries*.
+
+Notes:
+
+* The host directory holding `wavemorph/` must be on a shared mount for `rshared`
+  to work (the default on systemd hosts; otherwise `mount --make-rshared /`).
+* The image's built-in user is uid 1000 (`fusermount3` needs a passwd entry for
+  the user it runs as), so run it as `1000:1000`; the downloads must be readable
+  and `wavemorph/` writable by that user.
+* Only the folder of the mountpoint is bound into the other containers, never the
+  mountpoint itself — a bind of the mountpoint goes stale
+  ("Transport endpoint is not connected") when wavemorphfs restarts.
+* After upgrading to a version that changes generated files, their mtimes change,
+  so Navidrome's regular scan picks the new contents up by itself.
+* Don't run `navidrome scan` in a second container or next to the running server;
+  let the server's own scan do it.
 
 ## Usage
 
 ```sh
-# mount (roots default to ~/Storage/Music and ~/Storage/Classical Music)
-wavemorphfs --root "Music=~/Storage/Music" --root "Classical Music=~/Storage/Classical Music" \
-    mount ~/Storage/Stacks/lgzcloud-navidrome/wavemorph/mnt --allow-other
+# mount: one --root per library, shown as a top-level folder of the mount
+wavemorphfs --root "Music=/srv/music" --root "Classical Music=/srv/classical" \
+    --tags-dir /srv/wavemorph/tags --cache-dir /srv/wavemorph/cache \
+    mount /srv/wavemorph/mnt --allow-other
 
 wavemorphfs ls <source dir>                  # what a folder looks like through the fs
 wavemorphfs verify <source dir>              # validate its virtual tracks with flac/ffmpeg
