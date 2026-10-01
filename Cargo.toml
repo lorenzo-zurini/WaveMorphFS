@@ -9,7 +9,7 @@ license = "MIT"
 anyhow = "1"
 chardetng = "1"
 claxon = "0.4"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 encoding_rs = "0.8"
 env_logger = "0.11"
 fuser = "0.18"
