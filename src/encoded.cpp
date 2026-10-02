@@ -197,15 +197,19 @@ Bytes EncodedTrack::read_at(uint64_t off, size_t len) const {
     std::vector<std::shared_future<Frame>> need;
     {
         std::lock_guard g(mu_);
-        for (uint64_t s = j0; s < j1; s += JOB_FRAMES)
-            if (auto ps = claim(s, std::min(j1, s + JOB_FRAMES)); !ps.empty()) jobs.push_back(std::move(ps));
+        // take each needed frame's future right after claiming it: later claims
+        // (read-ahead) may evict finished frames from the cache
+        for (uint64_t s = j0; s < j1; s += JOB_FRAMES) {
+            uint64_t e = std::min(j1, s + JOB_FRAMES);
+            if (auto ps = claim(s, e); !ps.empty()) jobs.push_back(std::move(ps));
+            for (uint64_t j = s; j < e; j++) need.push_back(frames_.at(j).frame);
+        }
         // read-ahead only for a reader moving forward
         bool sequential = last_end_ != UINT64_MAX && j0 + 1 >= last_end_ && j0 <= last_end_;
         last_end_ = j1;
         if (self && sequential)
             for (uint64_t s = j1; s < std::min(nframes, j1 + AHEAD_FRAMES); s += JOB_FRAMES)
                 if (auto ps = claim(s, std::min(nframes, s + JOB_FRAMES)); !ps.empty()) ahead.push_back(std::move(ps));
-        for (uint64_t j = j0; j < j1; j++) need.push_back(frames_.at(j).frame);
     }
     for (size_t i = 1; i < jobs.size(); i++) {
         if (self) submit([self, ps = std::move(jobs[i])] { self->produce(ps); }, Lane::Encode);
