@@ -22,7 +22,7 @@ namespace {
 /// servers re-read them once. 2026-10-01 13:00 UTC: C++ rewrite (tag synonyms,
 /// SACD genres, kept tag spelling, APE served as encoded FLAC).
 /// 2026-10-01 16:00 UTC: padding in generated tag areas (editable mount).
-constexpr int64_t OUTPUT_EPOCH_NS = 1790870400LL * 1'000'000'000;
+constexpr int64_t OUTPUT_EPOCH_NS = 1790945990LL * 1'000'000'000;
 
 const std::vector<std::string_view> AUDIO_IMAGE_EXT = {"flac", "ape", "wv", "tta", "tak", "wav", "m4a", "aiff", "aif"};
 /// A file modified more recently than this is assumed to still be written.
@@ -660,7 +660,7 @@ std::shared_ptr<Listing> Library::build_listing(const fs::path& dir, const Sig& 
         VFilePtr vf;
         if (sc && taggable && (!sc->album.empty() || sc->file(n.name))) {
             Tags ov = sc->album;
-            if (auto f = sc->file(n.name)) ov.overlay(*f);
+            if (auto f = sc->file(n.name)) ov.merge(*f);  // keeps removals for retag_file
             try {
                 vf = retag_file(p, ext, ov);
             } catch (const std::exception& e) {

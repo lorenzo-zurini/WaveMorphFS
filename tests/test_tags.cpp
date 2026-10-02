@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Tag model and JSON sidecars.
+#include <unistd.h>
+
+#include "library.hpp"
 #include "sidecar.hpp"
 #include "tags.hpp"
 #include "test.hpp"
+#include "writeback.hpp"
 
 using namespace wm;
 
@@ -73,6 +77,66 @@ TEST(sidecar_parse_and_lookup) {
     auto base = Tags::from_pairs({{"COMMENT", "rip info"}});
     base.overlay(sc.album);
     CHECK_MSG(base.get("COMMENT") == nullptr, "removal applied");
+}
+
+TEST(sidecar_removals_survive_layering) {
+    // in-source sidecar sets fields; the tags-dir sidecar removes some of them per track
+    fs::path dir = fs::temp_directory_path() / std::format("wm-layer-{}", ::getpid());
+    fs::create_directories(dir / "src");
+    fs::create_directories(dir / "tags");
+    atomic_write(dir / "src" / SIDECAR_NAME, R"({"album": {"MUSICBRAINZ_ALBUMID": "a", "DISCTOTAL": "2", "COMMENT": "x"},
+        "track": {"1": {"ALBUMARTISTSORT": "s"}}})");
+    atomic_write(dir / "tags" / SIDECAR_NAME, R"({"album": {"COMMENT": ""},
+        "track": {"1": {"MUSICBRAINZ_ALBUMID": "", "ALBUMARTISTSORT": "", "DISCTOTAL": ""}},
+        "file": {"f.flac": {"MusicBrainz Album Id": ""}}})");
+    auto sc = Sidecar::load(dir / "src", dir / "tags");
+    CHECK(sc);
+    auto removed = [](const Tags* t, const char* k) { return t && t->get_all(k) && t->get_all(k)->empty(); };
+    CHECK_MSG(removed(&sc->album, "COMMENT"), "album removal kept");
+    CHECK_MSG(removed(sc->track(std::nullopt, 1), "MUSICBRAINZ_ALBUMID"), "track removal kept");
+    CHECK_MSG(removed(sc->track(std::nullopt, 1), "ALBUMARTISTSORT"), "removal overrides the in-source track value");
+    CHECK_MSG(removed(sc->file("f.flac"), "MusicBrainz Album Id"), "file removal kept, spelling kept");
+    // applied like a split track: source tags, then album, then track
+    auto tg = Tags::from_pairs({{"MUSICBRAINZ_ALBUMID", "from-image"}, {"COMMENT", "rip"}, {"TITLE", "t"}});
+    tg.overlay(sc->album);
+    tg.overlay(*sc->track(std::nullopt, 1));
+    CHECK(tg.get("MUSICBRAINZ_ALBUMID") == nullptr && tg.get("ALBUMARTISTSORT") == nullptr);
+    CHECK(tg.get("DISCTOTAL") == nullptr && tg.get("COMMENT") == nullptr);
+    CHECK(*tg.get("TITLE") == "t");
+    for (auto& [k, v] : tg.m) CHECK_MSG(!v.empty(), "empty field {} would be emitted", k);
+    fs::remove_all(dir);
+}
+
+TEST(sidecar_removes_tags_of_regular_files) {
+    // a FLAC file's own tags are removed by album and file entries of the tags-dir sidecar
+    fs::path dir = fs::temp_directory_path() / std::format("wm-rm-{}", ::getpid());
+    fs::path src = dir / "lib" / "Album";
+    fs::create_directories(src);
+    fs::create_directories(dir / "tags" / "Lib" / "Album");
+    fs::path f = src / "01 - a.flac";
+    auto st = run({"ffmpeg", "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t", "0.5", "-c:a", "flac", f.string()});
+    CHECK_MSG(st.ok(), "ffmpeg: {}", st.err);
+    st = run({"metaflac", "--set-tag=TITLE=keep", "--set-tag=MUSICBRAINZ_ALBUMID=src-id", "--set-tag=ALBUMARTISTSORT=src-sort",
+              "--set-tag=ORIGINALDATE=1970", f.string()});
+    CHECK_MSG(st.ok(), "metaflac: {}", st.err);
+    atomic_write(dir / "tags" / "Lib" / "Album" / SIDECAR_NAME, R"({"album": {"ORIGINALDATE": ""},
+        "file": {"01 - a.flac": {"MUSICBRAINZ_ALBUMID": "", "albumartistsort": ""}}})");
+    Config cfg;
+    cfg.roots = {{"Lib", dir / "lib"}};
+    cfg.tags_dir = dir / "tags";
+    cfg.cache_dir = dir / "cache";
+    cfg.workers = 0;
+    auto lib = Library::create(std::move(cfg));
+    auto listing = lib->list_dir(src);
+    auto e = listing->find("01 - a.flac");
+    CHECK(e && e->file);
+    auto vf = e->file;
+    auto tags = read_file_tags("flac", [&](uint64_t off, size_t len) { return vf->read_at(off, len); }, vf->size());
+    CHECK(*tags.get("TITLE") == "keep");
+    CHECK_MSG(tags.get("MUSICBRAINZ_ALBUMID") == nullptr, "file removal applied to the source's tag");
+    CHECK_MSG(tags.get("ALBUMARTISTSORT") == nullptr, "removal under another spelling applied");
+    CHECK_MSG(tags.get("ORIGINALDATE") == nullptr, "album removal applied");
+    fs::remove_all(dir);
 }
 
 TEST(sidecar_pinned_track_names) {

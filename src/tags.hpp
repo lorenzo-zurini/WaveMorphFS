@@ -36,6 +36,9 @@ public:
     /// synonym of it (album_artist replaces ALBUMARTIST); the spelling from `other`
     /// is kept. An empty value list deletes the field.
     void overlay(const Tags& other);
+    /// Like overlay(), but an empty value list is kept as an explicit removal, so
+    /// that layered sidecar tables can still delete fields of the layers below.
+    void merge(const Tags& other);
     Tags without_track_specific() const;
     std::vector<std::pair<std::string, std::string>> to_pairs() const;
     bool empty() const { return m.empty(); }

@@ -132,6 +132,13 @@ void Tags::overlay(const Tags& other) {
         if (!v.empty()) m.emplace(k, v);
 }
 
+void Tags::merge(const Tags& other) {
+    std::set<std::string> fields;
+    for (auto& kv : other.m) fields.insert(canonical_field(kv.first));
+    std::erase_if(m, [&](auto& kv) { return fields.contains(canonical_field(kv.first)); });
+    for (auto& [k, v] : other.m) m.emplace(k, v);
+}
+
 Tags Tags::without_track_specific() const {
     Tags t = *this;
     std::erase_if(t.m, [](auto& kv) { return is_track_specific(kv.first); });
