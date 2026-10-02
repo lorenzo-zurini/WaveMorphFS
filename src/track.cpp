@@ -21,6 +21,8 @@ std::shared_ptr<FlacImage> FlacImage::open(fs::path p, flac::FlacMeta meta, flac
     auto img = std::make_shared<FlacImage>();
     img->path = std::move(p);
     img->meta = std::move(meta);
+    // tags and pictures were taken by the caller; tracks reference pictures in the file
+    img->meta.blocks = {};
     img->index = std::move(index);
     img->sr_code = hdr->sr_code;
     img->sr_extra.assign(h + ex + bs_extra, h + ex + hdr->extra_len);
@@ -73,7 +75,7 @@ std::vector<std::array<uint8_t, 16>> track_md5s(const FlacImage& img, const std:
 }
 
 FlacTrack::FlacTrack(std::shared_ptr<const FlacImage> img, uint64_t start, uint64_t end, const Tags& tags,
-                     const std::vector<flac::MetaBlock>& pictures, std::optional<std::array<uint8_t, 16>> md5)
+                     const std::vector<flac::HeaderBlock>& pictures, std::optional<std::array<uint8_t, 16>> md5)
     : img_(std::move(img)), start_(start), end_(end) {
     uint64_t total = img_->total(), bs = img_->bs(), nf = img_->index.nframes();
     WM_ENSURE(start < end && end <= total, "bad track range {}..{} (total {})", start, end, total);
@@ -129,10 +131,10 @@ FlacTrack::FlacTrack(std::shared_ptr<const FlacImage> img, uint64_t start, uint6
     tsi.bps = si.bps;
     tsi.total_samples = end - start;
     if (md5) tsi.md5 = *md5;  // all-zero = unknown until the background job has computed it
-    std::vector<flac::MetaBlock> meta = {{flac::BLOCK_VORBIS, flac::build_vorbis("WaveMorphFS", tags.to_pairs())}};
+    std::vector<flac::HeaderBlock> meta = {{flac::BLOCK_VORBIS, flac::build_vorbis("WaveMorphFS", tags.to_pairs())}};
     meta.insert(meta.end(), pictures.begin(), pictures.end());
-    meta.push_back({flac::BLOCK_PADDING, Bytes(flac::EDIT_PADDING, 0)});
-    header_ = flac::build_header(tsi.encode(0, 0), meta);
+    meta.push_back({flac::BLOCK_PADDING, Zeros{flac::EDIT_PADDING}});
+    header_ = Segments(flac::header_segments(tsi.encode(0, 0), meta));
     size_ = header_.size() + (head_ ? head_->size : 0) + copy_size_ + (tail_ ? tail_->size : 0);
 }
 
@@ -144,18 +146,25 @@ Bytes FlacTrack::verbatim(const VSeg& seg) const {
     return fr;
 }
 
-const Bytes& FlacTrack::seg_bytes(std::optional<Bytes>& cell, const VSeg& seg) const {
+FlacTrack::Shared FlacTrack::seg_bytes(Shared& cell, const VSeg& seg) const {
     {
         std::lock_guard g(mu_);
-        if (cell) return *cell;
+        if (cell) return cell;
     }
-    Bytes v = verbatim(seg);
+    auto v = std::make_shared<const Bytes>(verbatim(seg));
     std::lock_guard g(mu_);
     if (!cell) cell = std::move(v);
-    return *cell;
+    return cell;
 }
 
-const std::vector<uint64_t>& FlacTrack::vstarts() const {
+void FlacTrack::drop_cached() const {
+    std::lock_guard g(mu_);
+    head_bytes_.reset();
+    tail_bytes_.reset();
+    vstarts_.reset();
+}
+
+std::shared_ptr<const std::vector<uint64_t>> FlacTrack::vstarts() const {
     std::lock_guard g(mu_);
     if (!vstarts_) {
         auto& offs = img_->index.offsets;
@@ -168,13 +177,14 @@ const std::vector<uint64_t>& FlacTrack::vstarts() const {
             pos += int64_t(offs[k + 1] - offs[k]) + int64_t(flac::coded_len(k * bs - start_)) - int64_t(flac::coded_len(k));
         }
         v.push_back(uint64_t(pos));
-        vstarts_ = std::move(v);
+        vstarts_ = std::make_shared<const std::vector<uint64_t>>(std::move(v));
     }
-    return *vstarts_;
+    return vstarts_;
 }
 
 void FlacTrack::read_copy(uint64_t off, size_t len, Bytes& out) const {
-    const auto& vs = vstarts();
+    auto keep = vstarts();
+    const auto& vs = *keep;
     uint64_t end = off + len;
     // first frame i0 with vs[i0] <= off < vs[i0+1]
     size_t i0 = size_t(std::upper_bound(vs.begin(), vs.end(), off) - vs.begin()) - 1;
@@ -204,11 +214,12 @@ Bytes FlacTrack::read_at(uint64_t off, size_t len) const {
     if (off >= size_) return out;
     len = size_t(std::min<uint64_t>(len, size_ - off));
     out.reserve(len);
+    touch(weak_from_this().lock());
     uint64_t end = off + len, pos = 0;
-    copy_overlap(out, header_, pos, off, len);
+    header_.read(img_->path, off, len, out);
     pos += header_.size();
     if (head_) {
-        if (off < pos + head_->size && end > pos) copy_overlap(out, seg_bytes(head_bytes_, *head_), pos, off, len);
+        if (off < pos + head_->size && end > pos) copy_overlap(out, *seg_bytes(head_bytes_, *head_), pos, off, len);
         pos += head_->size;
     }
     if (copy_size_ > 0) {
@@ -218,7 +229,7 @@ Bytes FlacTrack::read_at(uint64_t off, size_t len) const {
         }
         pos += copy_size_;
     }
-    if (tail_ && off < pos + tail_->size && end > pos) copy_overlap(out, seg_bytes(tail_bytes_, *tail_), pos, off, len);
+    if (tail_ && off < pos + tail_->size && end > pos) copy_overlap(out, *seg_bytes(tail_bytes_, *tail_), pos, off, len);
     WM_ENSURE(out.size() == len, "internal: produced {} of {} bytes at {}", out.size(), len, off);
     return out;
 }

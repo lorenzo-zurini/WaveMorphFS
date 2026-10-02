@@ -213,7 +213,7 @@ FlacMeta FlacMeta::read(const fs::path& p) {
                 m.streaminfo = StreamInfo::parse(data);
                 have_si = true;
             } else if (kind != BLOCK_PADDING) {
-                m.blocks.push_back({kind, std::move(data)});
+                m.blocks.push_back({kind, std::move(data), pos - len});
             }
             if (last) break;
         }
@@ -286,6 +286,26 @@ Bytes build_header(const std::array<uint8_t, 34>& si, const std::vector<MetaBloc
     };
     push(BLOCK_STREAMINFO, si, blocks.empty());
     for (size_t i = 0; i < blocks.size(); i++) push(blocks[i].kind, blocks[i].data, i + 1 == blocks.size());
+    return out;
+}
+
+std::vector<Seg> header_segments(const std::array<uint8_t, 34>& si, const std::vector<HeaderBlock>& blocks) {
+    std::vector<Seg> out;
+    Bytes head = {'f', 'L', 'a', 'C'};
+    auto block_header = [](Bytes& b, uint8_t kind, uint64_t len, bool last) {
+        WM_ENSURE(len < (1u << 24), "metadata block too large");
+        b.push_back(kind | (last ? 0x80 : 0));
+        put_be24(b, uint32_t(len));
+    };
+    block_header(head, BLOCK_STREAMINFO, si.size(), blocks.empty());
+    append(head, si);
+    out.emplace_back(std::move(head));
+    for (size_t i = 0; i < blocks.size(); i++) {
+        Bytes h;
+        block_header(h, blocks[i].kind, seg_size(blocks[i].body), i + 1 == blocks.size());
+        out.emplace_back(std::move(h));
+        out.push_back(blocks[i].body);
+    }
     return out;
 }
 
@@ -364,8 +384,9 @@ FrameIndex FrameIndex::build(const fs::path& path, const FlacMeta& meta) {
     FrameIndex idx;
     idx.block_size = bs;
     idx.bps_in_header = h0.bps_code != 0;
-    idx.offsets.reserve(nframes + 1);
-    idx.offsets.push_back(meta.audio_start);
+    auto offs = std::make_shared<std::vector<uint64_t>>();
+    offs->reserve(nframes + 1);
+    offs->push_back(meta.audio_start);
 
     Window w{f, flen, {}, meta.audio_start};
     w.fill();
@@ -417,9 +438,11 @@ FrameIndex FrameIndex::build(const fs::path& path, const FlacMeta& meta) {
         } else {
             WM_ENSURE(end.has_value(), "frame {}: no valid end found (incomplete file?)", k);
         }
-        idx.offsets.push_back(*end);
+        offs->push_back(*end);
         cur = size_t(*end - w.off);
     }
+    idx.offsets = *offs;
+    idx.storage = std::move(offs);
     return idx;
 }
 

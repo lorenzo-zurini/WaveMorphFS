@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "cache.hpp"
 
+#include <bit>
 #include <cstring>
 
 #include "md5.hpp"
@@ -25,15 +26,25 @@ std::string Cache::name_for(const fs::path& src, const SrcKey& key, std::string_
 fs::path Cache::idx_path(const fs::path& src, const SrcKey& key) const { return dir_ / "flacidx" / (name_for(src, key) + ".idx"); }
 
 std::optional<flac::FrameIndex> Cache::load_index(const fs::path& src, const SrcKey& key) const {
-    auto b = try_read_file(idx_path(src, key));
-    if (!b || b->size() < 24 || std::memcmp(b->data(), IDX_MAGIC, 8) != 0) return std::nullopt;
+    // mapped, not read: offsets are little-endian uint64s at an 8-aligned position,
+    // used in place, so an index costs memory only while its image is being read
+    auto m = map_file(idx_path(src, key));
+    if (!m || m->bytes.size() < 24) return std::nullopt;
+    const uint8_t* b = m->bytes.data();
+    uint64_t n = le64(b + 16);
+    if (std::memcmp(b, IDX_MAGIC, 8) != 0 || m->bytes.size() != 24 + n * 8) return std::nullopt;
     flac::FrameIndex idx;
-    idx.block_size = le32(&(*b)[8]);
-    idx.bps_in_header = (*b)[12] != 0;
-    uint64_t n = le64(&(*b)[16]);
-    if (b->size() != 24 + n * 8) return std::nullopt;
-    idx.offsets.resize(size_t(n));
-    for (size_t i = 0; i < n; i++) idx.offsets[i] = le64(&(*b)[24 + 8 * i]);
+    idx.block_size = le32(b + 8);
+    idx.bps_in_header = b[12] != 0;
+    if constexpr (std::endian::native == std::endian::little) {
+        idx.offsets = {reinterpret_cast<const uint64_t*>(b + 24), size_t(n)};
+        idx.storage = std::move(m->owner);
+    } else {
+        auto v = std::make_shared<std::vector<uint64_t>>(size_t(n));
+        for (size_t i = 0; i < n; i++) (*v)[i] = le64(b + 24 + 8 * i);
+        idx.offsets = *v;
+        idx.storage = std::move(v);
+    }
     return idx;
 }
 

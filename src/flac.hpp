@@ -18,7 +18,7 @@
 #include <utility>
 #include <vector>
 
-#include "util.hpp"
+#include "vfile.hpp"
 
 namespace wm::flac {
 
@@ -71,6 +71,7 @@ constexpr uint8_t BLOCK_PICTURE = 6;
 struct MetaBlock {
     uint8_t kind = 0;
     Bytes data;
+    uint64_t offset = 0;  // where `data` starts in the file it was read from
 };
 
 struct FlacMeta {
@@ -91,6 +92,14 @@ Bytes build_vorbis(const std::string& vendor, const std::vector<std::pair<std::s
 constexpr size_t EDIT_PADDING = 8192;
 /// "fLaC" + STREAMINFO + blocks.
 Bytes build_header(const std::array<uint8_t, 34>& si, const std::vector<MetaBlock>& blocks);
+/// A block of a generated header whose body is bytes, a range of the source file
+/// (e.g. a picture, by MetaBlock::offset) or zeros (padding).
+struct HeaderBlock {
+    uint8_t kind = 0;
+    Seg body;
+};
+/// The same bytes as build_header, as segments.
+std::vector<Seg> header_segments(const std::array<uint8_t, 34>& si, const std::vector<HeaderBlock>& blocks);
 
 /// Byte offsets of every frame of a fixed-blocksize FLAC image, built by a single
 /// sequential pass that verifies each frame's header CRC-8, frame number and
@@ -99,8 +108,11 @@ Bytes build_header(const std::array<uint8_t, 34>& si, const std::vector<MetaBloc
 struct FrameIndex {
     uint32_t block_size = 0;
     /// offsets[k] = start of frame k; offsets[nframes] = end of the last frame
-    std::vector<uint64_t> offsets;
+    std::span<const uint64_t> offsets;
     bool bps_in_header = false;
+    /// owner of `offsets`: a vector, or the cache file mapped into memory (pages
+    /// the kernel loads when a track is read and may drop again)
+    std::shared_ptr<const void> storage;
 
     static FrameIndex build(const fs::path& p, const FlacMeta& meta);
     uint64_t nframes() const { return offsets.size() - 1; }

@@ -169,6 +169,7 @@ void Library::start_prescan(std::chrono::seconds every) {
             size_t n = 0;
             for (auto& r : self->cfg.roots) self->walk(r.path, n);
             info("prescan: {} directories in {:.1f}s", n, std::chrono::duration<double>(Clock::now() - t).count());
+            trim_heap();  // building listings reads (and frees) every image's metadata and pictures
             self->write_status();
             std::this_thread::sleep_for(every);
         }
@@ -281,7 +282,7 @@ ReadyImage Library::process_image(const fs::path& src) const {
     r.source_tags = Tags::from_pairs(meta.vorbis_comments());
     for (auto* b : meta.pictures())
         if (b->data.size() <= (2 << 20) && picture_type(b->data) == 3) {
-            r.pictures.push_back(*b);
+            r.pictures.push_back({b->kind, SrcRange{b->offset, b->data.size()}});
             break;
         }
     r.flac = FlacImage::open(flac_path, std::move(meta), std::move(idx));

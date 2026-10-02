@@ -84,7 +84,7 @@ struct ReadyImage {
     std::shared_ptr<const FlacImage> flac;
     std::shared_ptr<const AvImage> av;
     Tags source_tags;
-    std::vector<flac::MetaBlock> pictures;
+    std::vector<flac::HeaderBlock> pictures;  // referenced in the image file, not held
 };
 
 template <class T>

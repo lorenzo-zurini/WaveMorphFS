@@ -42,25 +42,44 @@ private:
 /// the request [off, off+len) into `out`.
 void copy_overlap(Bytes& out, std::span<const uint8_t> seg, uint64_t seg_start, uint64_t off, size_t len);
 
-/// A piece of a Spliced file: bytes in memory, or (offset, length) of the source.
+/// A piece of generated output: bytes in memory, (offset, length) of a source
+/// file, or zeros. Large parts that already exist in the source (cover art,
+/// audio) are referenced rather than held, so generated files cost little memory.
 struct SrcRange {
     uint64_t off, len;
 };
-using Seg = std::variant<Bytes, SrcRange>;
+struct Zeros {
+    uint64_t len;
+};
+using Seg = std::variant<Bytes, SrcRange, Zeros>;
+uint64_t seg_size(const Seg& s);
+
+/// Segments laid end to end from offset 0 (adjacent in-memory bytes are merged).
+class Segments {
+public:
+    Segments() = default;
+    explicit Segments(std::vector<Seg> segs);
+    uint64_t size() const { return size_; }
+    /// Append the part of [off, off+len) these segments cover; source ranges are read from `src`.
+    void read(const fs::path& src, uint64_t off, size_t len, Bytes& out) const;
+
+private:
+    std::vector<std::pair<uint64_t, Seg>> segs_;  // with start offsets
+    uint64_t size_ = 0;
+};
 
 /// A source file with some byte ranges replaced (retagged FLAC / MP3 / M4A).
 class Spliced : public VFile {
 public:
-    Spliced(fs::path p, std::string what, std::vector<Seg> segs);
-    uint64_t size() const override { return size_; }
+    Spliced(fs::path p, std::string what, std::vector<Seg> segs) : path_(std::move(p)), what_(std::move(what)), segs_(std::move(segs)) {}
+    uint64_t size() const override { return segs_.size(); }
     Bytes read_at(uint64_t off, size_t len) const override;
     std::string describe() const override { return what_ + ":" + path_.string(); }
 
 private:
     fs::path path_;
     std::string what_;
-    std::vector<std::pair<uint64_t, Seg>> segs_;  // with virtual start offsets
-    uint64_t size_ = 0;
+    Segments segs_;
 };
 
 }  // namespace wm
