@@ -57,7 +57,7 @@ flac::FrameIndex Cache::index_for(const fs::path& src, const flac::FlacMeta& met
     auto key = SrcKey::of(src);
     if (auto i = load_index(src, key)) return *i;
     auto idx = flac::FrameIndex::build(src, meta);
-    // the file must not have changed while we read it (e.g. still downloading)
+    // the file must not have changed while we read it (e.g. still being written)
     WM_ENSURE(SrcKey::of(src) == key, "{} changed while indexing", src.string());
     store_index(src, key, idx);
     return idx;

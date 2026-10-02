@@ -3,7 +3,7 @@
 // fly with FFmpeg's libraries; nothing is converted or copied.
 //
 // The first open decodes the whole file once with checksum verification (so an
-// incomplete or corrupt download never appears) and records a packet index:
+// incomplete or corrupt file never appears) and records a packet index:
 // where each packet's samples start. Reads then decode only the packets that
 // cover the requested samples. The index (a few KB) is cached on disk.
 #pragma once

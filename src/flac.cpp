@@ -338,7 +338,7 @@ bool trailing_is_tag(const File& f, uint64_t end, uint64_t flen) {
     } catch (...) {
         return false;
     }
-    // No allowance for zero padding on purpose: an unfinished download also ends in zeros.
+    // No allowance for zero padding on purpose: an unfinished file also ends in zeros.
     return (tail == 128 && std::memcmp(head, "TAG", 3) == 0) || (n >= 8 && std::memcmp(head, "APETAGEX", 8) == 0) ||
            (n >= 3 && std::memcmp(head, "ID3", 3) == 0);
 }

@@ -232,7 +232,7 @@ std::shared_ptr<SacdDisc> SacdDisc::open(const fs::path& path, const Cache* cach
     size_t ntracks = at[0x45];
     uint64_t audio_start = be32(&at[0x48]), audio_end = be32(&at[0x4C]);
     WM_ENSURE(ntracks >= 1 && audio_end > audio_start, "bad track info");
-    WM_ENSURE(flen >= (audio_end + 1) * SECTOR, "ISO is truncated (still downloading?)");
+    WM_ENSURE(flen >= (audio_end + 1) * SECTOR, "ISO is truncated (still being copied?)");
     uint8_t area_charset = at[0x5A];
 
     // locate SACDTRL2 and SACDTTxt inside the area TOC
