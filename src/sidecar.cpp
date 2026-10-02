@@ -61,9 +61,10 @@ std::optional<Sidecar> Sidecar::load(const fs::path& src_dir, const std::optiona
         WM_ENSURE(text.has_value(), "read {}", p.string());
         Sidecar sc = with_context("parse " + p.string(), [&] { return parse(*text); });
         if (!out) out.emplace();
-        out->album.overlay(sc.album);
-        for (auto& [k, v] : sc.tracks) out->tracks[k].overlay(v);
-        for (auto& [k, v] : sc.files) out->files[k].overlay(v);
+        // merge, not overlay: removals ("KEY": "") must survive to be applied
+        out->album.merge(sc.album);
+        for (auto& [k, v] : sc.tracks) out->tracks[k].merge(v);
+        for (auto& [k, v] : sc.files) out->files[k].merge(v);
         for (auto& [k, v] : sc.track_names) out->track_names[k] = v;
         out->mtime = std::max(out->mtime.value_or(*m), *m);
         out->sources.push_back(p);
