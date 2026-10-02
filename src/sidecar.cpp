@@ -37,6 +37,21 @@ Sidecar Sidecar::parse(const std::string& text) {
     WM_ENSURE(doc.is_object(), "sidecar is not a JSON object");
     Sidecar sc;
     if (auto a = doc.find("album"); a != doc.end()) sc.album = table_to_tags(*a);
+    auto truthy = [](const json& v) {
+        if (v.is_boolean()) return v.get<bool>();
+        if (v.is_number()) return v.get<double>() != 0;
+        if (v.is_string()) {
+            std::string s = lower(trim(v.get<std::string>()));
+            return s == "true" || s == "yes" || s == "1";
+        }
+        return false;
+    };
+    if (auto h = doc.find("_hide"); h != doc.end()) {
+        if (h->is_string()) sc.hidden.insert(h->get<std::string>());
+        else if (h->is_array())
+            for (auto& x : *h)
+                if (x.is_string()) sc.hidden.insert(x.get<std::string>());
+    }
     for (auto [section, target] : {std::pair{"track", &sc.tracks}, std::pair{"file", &sc.files}}) {
         auto s = doc.find(section);
         if (s == doc.end() || !s->is_object()) continue;
@@ -45,6 +60,7 @@ Sidecar Sidecar::parse(const std::string& text) {
             (*target)[k] = table_to_tags(v);
             if (target == &sc.tracks)
                 if (auto n = v.find("_name"); n != v.end() && n->is_string() && !n->get<std::string>().empty()) sc.track_names[k] = n->get<std::string>();
+            if (auto h = v.find("_hide"); h != v.end() && truthy(*h)) (target == &sc.tracks ? sc.hidden_tracks : sc.hidden).insert(k);
         }
     }
     return sc;
@@ -66,6 +82,8 @@ std::optional<Sidecar> Sidecar::load(const fs::path& src_dir, const std::optiona
         for (auto& [k, v] : sc.tracks) out->tracks[k].merge(v);
         for (auto& [k, v] : sc.files) out->files[k].merge(v);
         for (auto& [k, v] : sc.track_names) out->track_names[k] = v;
+        out->hidden.insert(sc.hidden.begin(), sc.hidden.end());
+        out->hidden_tracks.insert(sc.hidden_tracks.begin(), sc.hidden_tracks.end());
         out->mtime = std::max(out->mtime.value_or(*m), *m);
         out->sources.push_back(p);
     }
@@ -91,6 +109,15 @@ const std::string* Sidecar::track_name(std::optional<uint32_t> disc, uint32_t n)
     for (auto& k : keys)
         if (auto it = track_names.find(k); it != track_names.end()) return &it->second;
     return nullptr;
+}
+
+bool Sidecar::hides_track(std::optional<uint32_t> disc, uint32_t n) const {
+    std::vector<std::string> keys;
+    if (disc) keys = {std::format("{}-{}", *disc, n), std::format("{}-{:02}", *disc, n), std::format("{}.{}", *disc, n)};
+    else keys = {std::to_string(n), std::format("{:02}", n)};
+    for (auto& k : keys)
+        if (hidden_tracks.contains(k)) return true;
+    return false;
 }
 
 const Tags* Sidecar::file(const std::string& name) const {

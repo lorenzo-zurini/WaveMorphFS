@@ -22,7 +22,7 @@ namespace {
 /// servers re-read them once. 2026-10-01 13:00 UTC: C++ rewrite (tag synonyms,
 /// SACD genres, kept tag spelling, APE served as encoded FLAC).
 /// 2026-10-01 16:00 UTC: padding in generated tag areas (editable mount).
-constexpr int64_t OUTPUT_EPOCH_NS = 1790952899LL * 1'000'000'000;
+constexpr int64_t OUTPUT_EPOCH_NS = 1790954138LL * 1'000'000'000;
 
 const std::vector<std::string_view> AUDIO_IMAGE_EXT = {"flac", "ape", "wv", "tta", "tak", "wav", "m4a", "aiff", "aif"};
 /// A file modified more recently than this is assumed to still be written.
@@ -585,6 +585,40 @@ std::shared_ptr<Listing> Library::build_listing(const fs::path& dir, const Sig& 
             if (incomplete(fs::path(ref).filename().string())) hidden.insert(n.name);  // image still being written as <name>.!qB
         }
     }
+    // sheets hidden by the sidecar, and duplicates: several sheets describing the
+    // same image with the same tracks (e.g. "X.ape.cue" and "X.wav.cue") list it
+    // once, from the sheet whose FILE names the image itself, else the first by
+    // name. Both happen before discs are numbered.
+    std::erase_if(groups, [&](const Group& g) {
+        if (!sc || !(sc->hides(g.cue_name) || sc->hides(g.img_name))) return false;
+        hidden.insert(g.cue_name);
+        hidden.insert(g.img_name);
+        return true;
+    });
+    auto same_tracks = [](const CueSheet& a, const CueSheet& b) {
+        if (a.tracks.size() != b.tracks.size()) return false;
+        for (size_t i = 0; i < a.tracks.size(); i++)
+            if (a.tracks[i].number != b.tracks[i].number || a.tracks[i].index01 != b.tracks[i].index01) return false;
+        return true;
+    };
+    auto names_image = [](const Group& g) {
+        std::string ref = g.cue.files[0];
+        std::replace(ref.begin(), ref.end(), '\\', '/');
+        return fs::path(ref).filename().string() == g.img_name;
+    };
+    std::set<size_t> dropped;
+    for (size_t i = 0; i < groups.size(); i++)
+        for (size_t j = i + 1; j < groups.size(); j++) {
+            if (dropped.contains(i) || dropped.contains(j)) continue;
+            if (groups[i].img_name != groups[j].img_name || !same_tracks(groups[i].cue, groups[j].cue)) continue;
+            bool ni = names_image(groups[i]), nj = names_image(groups[j]);
+            bool keep_j = (nj && !ni) || (nj == ni && groups[j].cue_name < groups[i].cue_name);
+            dropped.insert(keep_j ? i : j);
+        }
+    for (auto it = dropped.rbegin(); it != dropped.rend(); ++it) {
+        hidden.insert(groups[*it].cue_name);
+        groups.erase(groups.begin() + ptrdiff_t(*it));
+    }
     bool multi = groups.size() > 1;
     for (size_t gi = 0; gi < groups.size(); gi++) {
         auto& [cue_name, cue, img_name] = groups[gi];
@@ -621,7 +655,7 @@ std::shared_ptr<Listing> Library::build_listing(const fs::path& dir, const Sig& 
     // --- SACD ISOs
     std::vector<const DirItem*> isos;
     for (auto& n : names)
-        if (n.is_file && ext_lower(n.name) == "iso") isos.push_back(&n);
+        if (n.is_file && ext_lower(n.name) == "iso" && !(sc && sc->hides(n.name))) isos.push_back(&n);
     bool multi_iso = isos.size() > 1;
     for (size_t ii = 0; ii < isos.size(); ii++) {
         const std::string& n = isos[ii]->name;
@@ -704,6 +738,7 @@ std::shared_ptr<Listing> Library::build_listing(const fs::path& dir, const Sig& 
         v.name = name;
         entries.push_back(std::move(v));
     }
+    if (sc) std::erase_if(entries, [&](const Entry& e) { return sc->hides(e.name); });
     std::sort(entries.begin(), entries.end(), [](auto& a, auto& b) { return a.name < b.name; });
 
     std::optional<int64_t> gen_time;
@@ -785,6 +820,7 @@ std::optional<std::vector<Entry>> Library::image_tracks(const fs::path& dir, con
     std::vector<Entry> out;
     for (size_t i = 0; i < ntracks; i++) {
         const auto& t = cue.tracks[i];
+        if (sidecar && sidecar->hides_track(multi ? disc : std::nullopt, t.number)) continue;
         auto [s, e] = ranges[i];
         WM_ENSURE(s < e, "track {} starts beyond the end of the image", t.number);
         Tags tg = base;
@@ -827,6 +863,7 @@ std::vector<Entry> Library::sacd_tracks(const std::shared_ptr<const SacdDisc>& d
     std::vector<Entry> out;
     for (size_t i = 0; i < n; i++) {
         uint32_t num = uint32_t(i + 1);
+        if (sidecar && sidecar->hides_track(disc_no, num)) continue;
         Tags tg = disc->track_tags(i);
         tg.set("TRACKNUMBER", std::to_string(num));
         tg.set("TRACKTOTAL", std::to_string(n));

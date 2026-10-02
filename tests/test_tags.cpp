@@ -2,6 +2,8 @@
 // Tag model and JSON sidecars.
 #include <unistd.h>
 
+#include <thread>
+
 #include "id3.hpp"
 #include "library.hpp"
 #include "sidecar.hpp"
@@ -181,6 +183,54 @@ TEST(sidecar_retags_regular_dsf) {
     auto tags = read_file_tags("dsf", [&](uint64_t off, size_t len) { return vf->read_at(off, len); }, vf->size());
     CHECK(*tags.get("TITLE") == "new" && *tags.get("ARTIST") == "a");
     CHECK_MSG(tags.get("MUSICBRAINZ_ALBUMID") == nullptr, "removal applied");
+    fs::remove_all(dir);
+}
+
+TEST(duplicate_cues_and_hidden_files) {
+    fs::path dir = fs::temp_directory_path() / std::format("wm-dup-{}", ::getpid());
+    fs::path src = dir / "lib" / "Album";
+    fs::create_directories(src);
+    fs::create_directories(dir / "tags" / "Lib" / "Album");
+    auto st = run({"ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=f=440:d=6", "-ac", "2", "-ar", "44100", "-sample_fmt", "s16", "-c:a", "flac",
+                   (src / "Album.flac").string()});
+    CHECK_MSG(st.ok(), "ffmpeg: {}", st.err);
+    auto cue = [](const char* file) {
+        return std::format("FILE \"{}\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"One\"\n    INDEX 01 00:00:00\n"
+                           "  TRACK 02 AUDIO\n    TITLE \"Two\"\n    INDEX 01 00:02:00\n  TRACK 03 AUDIO\n    TITLE \"Three\"\n    INDEX 01 00:04:00\n",
+                           file);
+    };
+    // two sheets for the same image: the one naming the real file wins
+    atomic_write(src / "Album.flac.cue", cue("Album.flac"));
+    atomic_write(src / "Album.wav.cue", cue("Album.wav"));
+    auto old = fs::file_time_type::clock::now() - std::chrono::hours(1);  // not "still being written"
+    for (auto& e : fs::directory_iterator(src)) fs::last_write_time(e.path(), old);
+    Config cfg;
+    cfg.roots = {{"Lib", dir / "lib"}};
+    cfg.tags_dir = dir / "tags";
+    cfg.cache_dir = dir / "cache";
+    cfg.workers = 0;
+    auto lib = Library::create(std::move(cfg));
+    auto names = [&] {
+        std::vector<std::string> v;
+        for (auto& e : lib->list_dir(src)->entries) v.push_back(e.name);
+        return v;
+    };
+    CHECK_MSG((names() == std::vector<std::string>{"01 - One.flac", "02 - Two.flac", "03 - Three.flac"}), "listed once, as a single disc");
+    auto e = lib->list_dir(src)->find("02 - Two.flac");
+    CHECK(e && e->tag_key == "2");
+    auto set_sidecar = [&](const char* text) {
+        atomic_write(dir / "tags" / "Lib" / "Album" / SIDECAR_NAME, text);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1600));  // listings are re-checked after 1.5 s
+    };
+    // a hidden track, and a hidden mount entry
+    set_sidecar(R"({"track": {"1": {"_hide": true}}, "_hide": ["03 - Three.flac"]})");
+    CHECK((names() == std::vector<std::string>{"02 - Two.flac"}));
+    // hiding the winning sheet falls back to the other one
+    set_sidecar(R"({"_hide": "Album.flac.cue"})");
+    CHECK((names() == std::vector<std::string>{"01 - One.flac", "02 - Two.flac", "03 - Three.flac"}));
+    // hiding the image hides everything made from it
+    set_sidecar(R"({"_hide": ["Album.flac"]})");
+    CHECK(names().empty());
     fs::remove_all(dir);
 }
 
