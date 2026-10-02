@@ -24,13 +24,17 @@
 // text); an empty string or empty array removes the tag. Tag names are used
 // exactly as written. Names starting with "_" are not tags: "_name" in a track
 // table pins that track's file name (set when it is first edited on the mount,
-// so renaming by title does not move files under tag editors like beets). Other
-// top-level keys (e.g. "_comment") are ignored, and // or /* */ comments are
-// allowed.
+// so renaming by title does not move files under tag editors like beets), and
+// "_hide": true in a track or file table hides that track or file. A top-level
+// "_hide": ["name", ...] hides files of the folder by name: a source CUE sheet,
+// image or SACD ISO (with all its tracks; the remaining discs are numbered as if
+// it were not there), or any entry of the mount. Other top-level keys (e.g.
+// "_comment") are ignored, and // or /* */ comments are allowed.
 #pragma once
 
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -46,6 +50,8 @@ struct Sidecar {
     std::map<std::string, Tags> tracks;
     std::map<std::string, Tags> files;
     std::map<std::string, std::string> track_names;  // pinned file names ("_name")
+    std::set<std::string> hidden;                     // "_hide": names, and file tables with "_hide": true
+    std::set<std::string> hidden_tracks;              // track tables with "_hide": true
     /// newest mtime among the sidecar files that contributed
     std::optional<int64_t> mtime;
     std::vector<fs::path> sources;
@@ -58,6 +64,8 @@ struct Sidecar {
     const Tags* file(const std::string& name) const;
     /// Pinned file name of track `n` of disc `disc`, if any.
     const std::string* track_name(std::optional<uint32_t> disc, uint32_t n) const;
+    bool hides(const std::string& name) const { return hidden.contains(name); }
+    bool hides_track(std::optional<uint32_t> disc, uint32_t n) const;
     /// Serialize tags to sidecar JSON (used by `tags-init`).
     static std::string render(const Tags& album, const std::vector<std::pair<std::string, Tags>>& tracks,
                               const std::vector<std::pair<std::string, Tags>>& files);

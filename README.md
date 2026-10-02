@@ -25,6 +25,10 @@ you control — never written into the source files.
   The partial frames at the two track boundaries are decoded and re-emitted as
   VERBATIM frames. Output sizes are computable up front, so `stat` is exact and
   random access is cheap.
+* **Several images in one folder** become discs (`1-01 - Title.flac`, …). Several
+  CUE sheets describing the same image with the same tracks (e.g. `X.flac.cue` and
+  `X.wav.cue`) count once: the sheet whose FILE line names the image is used, else
+  the first by name.
 * **Images are fully verified before they appear.** The first time an image is
   seen, one sequential pass checks every frame's CRC and numbering and records its
   offset (cached on disk). This also keeps files that are still being copied or
@@ -269,6 +273,11 @@ Both are merged, the separate tree winning.
   (`album_artist` replaces the image's `ALBUMARTIST`), keeping the sidecar's
   spelling. In ID3/MP4 output, names without a standard frame or atom become
   `TXXX` / freeform items under their exact name.
+* `"_hide"` hides files: at the top level a name or list of names of the folder —
+  a CUE sheet, image or SACD ISO (with all its tracks), or any file of the mount —
+  and `"_hide": true` inside a `track` or `file` entry hides that one track or file.
+  Hidden sheets and ISOs do not count as discs, so the rest is numbered as if they
+  were not there.
 * Other top-level keys (e.g. `"_comment"`) are ignored; `//` comments are allowed.
 
 Edits are picked up within seconds. A `cover.jpg`/`cover.png` in the sidecar folder
