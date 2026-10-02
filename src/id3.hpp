@@ -21,6 +21,9 @@ Bytes build(const Tags& tags);
 /// Retag an MP3: the new tag and the offset where the source's audio (everything
 /// after its ID3v2 tag) starts.
 std::pair<Bytes, uint64_t> retag_mp3(const fs::path& p, const Tags& overlay);
+/// The ID3v2 tag of `f` at `pos` (none if no tag starts there) with `overlay`
+/// applied, and the length of the source tag.
+std::pair<Bytes, uint64_t> retag_at(const File& f, uint64_t pos, const Tags& overlay);
 
 /// Tags of an ID3v2 tag (as written by this program or a tag editor), with
 /// frames mapped back to Vorbis-style names (TIT2 -> TITLE, TRCK -> TRACKNUMBER

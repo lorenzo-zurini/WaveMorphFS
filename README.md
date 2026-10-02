@@ -10,7 +10,7 @@ is duplicated.
 | `Album.cue` + `Album.flac` (image rip)     | `01 - Title.flac`, `02 - Title.flac`, …                |
 | `Album.cue` + `Album.ape` / `.wv` / `.wav` | same, encoded to FLAC on the fly from the decoded image |
 | `Disc.iso` (SACD, plain DSD **or DST**)    | `01 - Title.dsf`, `02 - Title.dsf`, …                  |
-| `*.flac`, `*.mp3`, `*.m4a`                 | the same file with sidecar tags applied                |
+| `*.flac`, `*.mp3`, `*.m4a`, `*.dsf`        | the same file with sidecar tags applied                |
 | any other file                             | passed through untouched                               |
 | incomplete files (`*.parts`), dotfiles     | hidden                                                 |
 
@@ -42,9 +42,10 @@ you control — never written into the source files.
   as `MC NN - Title.dsf` tagged `<album> (Multichannel)`. Plain DSD is only
   re-ordered (byte de-interleave + bit reversal); DST-compressed areas are decoded
   by a port of FFmpeg's DST decoder.
-* **Regular FLAC, MP3 and M4A files** get sidecar tags without touching the audio:
-  only the tag area is rebuilt (VORBIS_COMMENT; ID3v2.4; the MP4 `ilst`, with chunk
-  offsets adjusted). Tags and pictures the sidecar does not name are kept as is.
+* **Regular FLAC, MP3, M4A and DSF files** get sidecar tags without touching the
+  audio: only the tag area is rebuilt (VORBIS_COMMENT; ID3v2.4; the MP4 `ilst`, with
+  chunk offsets adjusted; DSF's trailing ID3v2.4 tag). Tags and pictures the sidecar
+  does not name are kept as is.
 * Each split track's STREAMINFO carries the real audio MD5, computed in the
   background after the image is indexed (one decode pass per image, cached), so
   `flac -t` and players can verify every track end to end.
