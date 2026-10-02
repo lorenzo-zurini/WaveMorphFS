@@ -402,22 +402,23 @@ Bytes build(const Tags& tags) {
     return serialize(0, frames);
 }
 
-std::pair<Bytes, uint64_t> retag_mp3(const fs::path& p, const Tags& overlay) {
-    File f(p);
+std::pair<Bytes, uint64_t> retag_at(const File& f, uint64_t pos, const Tags& overlay) {
     uint8_t head[10] = {};
-    size_t n = f.read_at(head, 10, 0);
+    size_t n = f.read_at(head, 10, pos);
     SourceTag src;
-    uint64_t start = 0;
+    uint64_t len = 0;
     if (n == 10 && std::memcmp(head, "ID3", 3) == 0) {
         size_t total = 10 + unsynchsafe(&head[6]);
         Bytes b(total);
-        f.read_exact_at(b.data(), total, 0);
-        auto [tag, len] = parse_tag(b);
+        f.read_exact_at(b.data(), total, pos);
+        auto [tag, l] = parse_tag(b);
         src = std::move(tag);
-        start = len;
+        len = l;
     }
     apply(src.frames, overlay);
-    return {serialize(src.flags, src.frames), start};
+    return {serialize(src.flags, src.frames), len};
 }
+
+std::pair<Bytes, uint64_t> retag_mp3(const fs::path& p, const Tags& overlay) { return retag_at(File(p), 0, overlay); }
 
 }  // namespace wm::id3

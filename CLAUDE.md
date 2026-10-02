@@ -38,7 +38,7 @@ src/
   sacd.cpp       SACD ISO parsing, DSF tracks, chunked parallel DST decode
   dst.cpp        DST decoder (port of FFmpeg dstdec.c, LGPL-2.1+ used under GPL)
   id3.cpp mp4.cpp  ID3v2.4 writer/reader (DSF + MP3 retag), MP4 ilst rewrite/reader (stco/co64 shift)
-  retag.cpp      regular FLAC/MP3/M4A with sidecar tags (Spliced VFile)
+  retag.cpp      regular FLAC/MP3/M4A/DSF with sidecar tags (Spliced VFile)
   writeback.cpp  tag edits on the mount: WriteSession overlay, read_file_tags(), tag_changes() diff
   sidecar.cpp    wavemorph.json (nlohmann ordered_json, // comments allowed, "_name" pins track file names)
   tags.cpp       Tags model (case-insensitive keys keeping spelling), synonyms, cue mapping, sanitize_name

@@ -12,7 +12,8 @@ namespace wm {
 
 /// FLAC: the VORBIS_COMMENT block is replaced (source tags overlaid with `overlay`);
 /// all other metadata blocks are kept. MP3: new ID3v2.4 tag. M4A: new ilst.
-/// `ext` is the lower-case extension ("flac", "mp3", "m4a").
+/// DSF: new ID3v2.4 tag at the end, DSD chunk sizes patched.
+/// `ext` is the lower-case extension ("flac", "mp3", "m4a", "dsf").
 std::shared_ptr<Spliced> retag_file(const fs::path& p, const std::string& ext, const Tags& overlay);
 
 }  // namespace wm

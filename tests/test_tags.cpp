@@ -2,6 +2,7 @@
 // Tag model and JSON sidecars.
 #include <unistd.h>
 
+#include "id3.hpp"
 #include "library.hpp"
 #include "sidecar.hpp"
 #include "tags.hpp"
@@ -136,6 +137,50 @@ TEST(sidecar_removes_tags_of_regular_files) {
     CHECK_MSG(tags.get("MUSICBRAINZ_ALBUMID") == nullptr, "file removal applied to the source's tag");
     CHECK_MSG(tags.get("ALBUMARTISTSORT") == nullptr, "removal under another spelling applied");
     CHECK_MSG(tags.get("ORIGINALDATE") == nullptr, "album removal applied");
+    fs::remove_all(dir);
+}
+
+TEST(sidecar_retags_regular_dsf) {
+    // a DSF file's own ID3 tag is rebuilt with the sidecar applied; audio bytes stay
+    fs::path dir = fs::temp_directory_path() / std::format("wm-dsf-{}", ::getpid());
+    fs::path src = dir / "lib" / "Album";
+    fs::create_directories(src);
+    fs::create_directories(dir / "tags" / "Lib" / "Album");
+    Bytes audio(4096 * 2 * 3);
+    for (size_t i = 0; i < audio.size(); i++) audio[i] = uint8_t(i * 13 + 1);
+    Bytes id3 = id3::build(Tags::from_pairs({{"TITLE", "old"}, {"ARTIST", "a"}, {"MUSICBRAINZ_ALBUMID", "x"}}));
+    uint64_t audio_end = 28 + 52 + 12 + audio.size();
+    Bytes f;
+    append(f, std::string_view("DSD "));
+    put_le64(f, 28);
+    put_le64(f, audio_end + id3.size());
+    put_le64(f, audio_end);
+    append(f, std::string_view("fmt "));
+    put_le64(f, 52);
+    f.resize(f.size() + 40, 0);  // fmt fields (not interpreted when retagging)
+    append(f, std::string_view("data"));
+    put_le64(f, 12 + audio.size());
+    append(f, audio);
+    append(f, id3);
+    atomic_write(src / "t.dsf", f);
+    atomic_write(dir / "tags" / "Lib" / "Album" / SIDECAR_NAME, R"({"file": {"t.dsf": {"TITLE": "new", "MUSICBRAINZ_ALBUMID": ""}}})");
+    Config cfg;
+    cfg.roots = {{"Lib", dir / "lib"}};
+    cfg.tags_dir = dir / "tags";
+    cfg.cache_dir = dir / "cache";
+    cfg.workers = 0;
+    auto lib = Library::create(std::move(cfg));
+    auto e = lib->list_dir(src)->find("t.dsf");
+    CHECK(e && e->file && e->tag_section == "file" && e->tag_ext == "dsf");
+    auto vf = e->file;
+    Bytes out = vf->read_at(0, size_t(vf->size()));
+    CHECK(out.size() == vf->size());
+    CHECK_MSG(le64(&out[12]) == out.size(), "DSD chunk carries the new file size");
+    CHECK_MSG(le64(&out[20]) == audio_end, "metadata pointer after the data chunk");
+    CHECK_MSG(std::equal(out.begin() + 28, out.begin() + ptrdiff_t(audio_end), f.begin() + 28), "audio bytes unchanged");
+    auto tags = read_file_tags("dsf", [&](uint64_t off, size_t len) { return vf->read_at(off, len); }, vf->size());
+    CHECK(*tags.get("TITLE") == "new" && *tags.get("ARTIST") == "a");
+    CHECK_MSG(tags.get("MUSICBRAINZ_ALBUMID") == nullptr, "removal applied");
     fs::remove_all(dir);
 }
 
