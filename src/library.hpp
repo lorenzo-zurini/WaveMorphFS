@@ -6,10 +6,10 @@
 //
 // Rules per source directory:
 //  * X.cue + existing single-file image   -> virtual per-track FLAC files; cue and image hidden
-//    (the image stays hidden while it is still downloading or being processed)
+//    (the image stays hidden while it is incomplete or being processed)
 //  * *.iso with an SACD master TOC         -> virtual per-track DSF files; ISO hidden
 //  * other files                           -> passthrough (FLAC/MP3/M4A retagged if a sidecar applies)
-//  * *.!qB, *.parts, dotfiles, sidecars    -> hidden
+//  * partial files, dotfiles, sidecars     -> hidden
 //  * cover image from the sidecar tree     -> exposed as cover.jpg/png if the folder has none
 #pragma once
 

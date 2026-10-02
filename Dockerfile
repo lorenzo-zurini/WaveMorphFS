@@ -11,7 +11,7 @@ RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
 
 FROM debian:trixie-slim
 LABEL org.opencontainers.image.title="WaveMorphFS" \
-      org.opencontainers.image.description="FUSE filesystem presenting pristine music downloads (CUE images, APE, SACD ISOs) as split, tagged tracks" \
+      org.opencontainers.image.description="FUSE filesystem presenting pristine music files (CUE images, APE, SACD ISOs) as split, tagged tracks" \
       org.opencontainers.image.licenses="GPL-3.0-or-later" \
       org.opencontainers.image.source="https://github.com/lorenzo-zurini/WaveMorphFS"
 RUN apt-get update \

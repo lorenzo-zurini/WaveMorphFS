@@ -2,7 +2,8 @@
 
 A read-only FUSE filesystem that shows a music library the way a music server
 wants to see it — **one properly tagged file per track** — while the files on disk
-stay **exactly as downloaded**, so torrents keep seeding.
+stay **byte-for-byte untouched**: rips keep their checksums and logs, and nothing
+is duplicated.
 
 | On disk (pristine)                         | What the mount shows                                   |
 |--------------------------------------------|--------------------------------------------------------|
@@ -11,10 +12,10 @@ stay **exactly as downloaded**, so torrents keep seeding.
 | `Disc.iso` (SACD, plain DSD **or DST**)    | `01 - Title.dsf`, `02 - Title.dsf`, …                  |
 | `*.flac`, `*.mp3`, `*.m4a`                 | the same file with sidecar tags applied                |
 | any other file                             | passed through untouched                               |
-| `*.!qB`, `*.parts`, dotfiles               | hidden                                                 |
+| incomplete files (`*.parts`), dotfiles     | hidden                                                 |
 
 Tags come from the image itself, the CUE sheet / SACD text, and **sidecar files**
-you control — never written into the downloads.
+you control — never written into the source files.
 
 ## How it works
 
@@ -26,8 +27,8 @@ you control — never written into the downloads.
   random access is cheap.
 * **Images are fully verified before they appear.** The first time an image is
   seen, one sequential pass checks every frame's CRC and numbering and records its
-  offset (cached on disk). BitTorrent downloads pieces in random order, so this is
-  also what keeps half-finished downloads out of the library.
+  offset (cached on disk). This also keeps files that are still being copied or
+  are damaged out of the library.
 * **Non-FLAC images** (APE, WavPack, TTA, TAK, WAV, ALAC) cannot be cut without
   re-encoding (APE frames are seconds long and must all be full length), so their
   tracks are served as compressed FLAC encoded on the fly. Nothing is stored but
@@ -83,10 +84,10 @@ the compose file with `build: <path to this repository>`.
 
 ## Running with Docker
 
-A complete setup as it runs in production: WaveMorphFS mounts the downloads,
+A complete setup as it runs in production: WaveMorphFS mounts the music folders,
 [Navidrome](https://www.navidrome.org/) serves the mount, and
 [beets](https://beets.io/) tags it from MusicBrainz — every tag beets writes lands
-in a sidecar, so the downloads are never touched.
+in a sidecar, so the source files are never touched.
 
 ```
 music-stack/
@@ -113,7 +114,7 @@ services:
     security_opt:
       - apparmor:unconfined       # AppArmor blocks FUSE mounts in containers
     environment:
-      # the user the filesystem runs as: owner of wavemorph/, able to read the downloads
+      # the user the filesystem runs as: owner of wavemorph/, able to read the music
       - PUID=1000
       - PGID=1000
       # also expose SACD multichannel areas as "(Multichannel)" albums
@@ -123,9 +124,9 @@ services:
       - --root=Music=/music
       - --root=Classical Music=/classical
     volumes:
-      # the downloads: read-only, WaveMorphFS never writes to them
-      - /path/to/downloads/music:/music:ro
-      - /path/to/downloads/classical:/classical:ro
+      # the music: read-only, WaveMorphFS never writes to it
+      - /path/to/music:/music:ro
+      - /path/to/classical:/classical:ro
       # mount (mnt/), sidecars (tags/) and indexes (cache/); rshared: the FUSE
       # mount made in here propagates back to the host
       - type: bind
@@ -237,7 +238,7 @@ so they survive filesystem restarts. `WAVEMORPH_LOG=debug` for more logging.
 
 ## Sidecar tags
 
-`wavemorph.json`, either next to the files or (to keep downloads untouched) in a
+`wavemorph.json`, either next to the files or (to keep the source folders untouched) in a
 separate tree: `<tags-dir>/<root name>/<path relative to the root>/wavemorph.json`.
 Both are merged, the separate tree winning.
 
@@ -275,7 +276,7 @@ is shown in the album folder if it has no cover of its own.
 ### Editing tags on the mount
 
 FLAC, DSF, MP3 and M4A files on the mount can be edited in place with any tag
-editor (Picard, Kid3, Mp3tag, mutagen...). The edit never reaches the download:
+editor (Picard, Kid3, Mp3tag, mutagen...). The edit never reaches the source file:
 writes go to a scratch overlay, and when the editor closes the file the tags are
 read back from it, compared field by field with what the mount generated, and
 only the differences are stored in the folder's sidecar — `track."N"` for split

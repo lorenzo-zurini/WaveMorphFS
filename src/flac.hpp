@@ -95,7 +95,7 @@ Bytes build_header(const std::array<uint8_t, 34>& si, const std::vector<MetaBloc
 /// Byte offsets of every frame of a fixed-blocksize FLAC image, built by a single
 /// sequential pass that verifies each frame's header CRC-8, frame number and
 /// CRC-16. A successful build therefore also proves the file is complete (no
-/// zero-filled holes from an unfinished download).
+/// zero-filled holes from an unfinished file).
 struct FrameIndex {
     uint32_t block_size = 0;
     /// offsets[k] = start of frame k; offsets[nframes] = end of the last frame

@@ -3,8 +3,8 @@
 //
 // A sidecar is a JSON file named `wavemorph.json`, looked up (and merged, later
 // wins) at:
-//   1. <source dir>/wavemorph.json                          (optional, inside the download)
-//   2. <tags dir>/<root name>/<relative dir>/wavemorph.json  (keeps downloads pristine)
+//   1. <source dir>/wavemorph.json                          (optional, inside the source dir)
+//   2. <tags dir>/<root name>/<relative dir>/wavemorph.json  (keeps source dirs pristine)
 //
 //   {
 //     "album": {                          // applies to every track in the directory

@@ -1,13 +1,14 @@
 # WaveMorphFS — notes for Claude sessions
 
 Read-only-source FUSE filesystem (C++20, GPL-3.0-or-later) that presents pristine
-music downloads (torrents that must keep seeding) as one tagged file per track for
-music servers. See README.md for the user-facing picture; this file is the
+music files (CUE images, APE, SACD ISOs, which must stay byte-identical) as one
+tagged file per track for music servers. See README.md for the user-facing picture; this file is the
 developer briefing.
 
 ## Non-negotiable invariants
 
-1. **Never write to source files.** Downloads stay byte-identical (they seed).
+1. **Never write to source files.** Source files stay byte-identical (the owner
+   verifies them by checksum).
    Everything the user changes goes into sidecars (`wavemorph.json`).
 2. **Never cache audio.** Only positions/sizes/MD5s are cached. Audio is always
    read (or decoded/encoded) from the source on the fly. A previous version kept
@@ -55,7 +56,7 @@ file, mtime, tag_section/tag_key/tag_ext for edit routing).
 ## How things work (short)
 
 - **FLAC images** (fixed blocksize): one CRC-verified pass builds a frame index
-  (also proves the download is complete). Tracks copy inner frames with headers
+  (also proves the file is complete). Tracks copy inner frames with headers
   rewritten to variable-blocksize sample numbers; partial boundary frames are
   decoded and re-emitted as VERBATIM. Per-track STREAMINFO MD5 computed by a
   background job (md5/ cache).

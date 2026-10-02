@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// WaveMorphFS - present pristine audio downloads as split, tagged tracks via FUSE.
+// WaveMorphFS - present pristine audio files as split, tagged tracks via FUSE.
 //
 // Copyright (C) 2026 Lorenzo Zurini
 //
@@ -25,7 +25,7 @@ using namespace wm;
 
 namespace {
 
-const char* USAGE = R"USAGE(wavemorphfs - present pristine audio downloads as split, tagged tracks via FUSE
+const char* USAGE = R"USAGE(wavemorphfs - present pristine audio files as split, tagged tracks via FUSE
 
 usage: wavemorphfs [global options] <command> [arguments]
 

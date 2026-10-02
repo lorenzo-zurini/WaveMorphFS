@@ -55,6 +55,7 @@ std::vector<DirItem> read_dir(const fs::path& dir) {
 
 bool is_ignored(const std::string& name) {
     std::string l = lower(name);
+    // .!qB/.parts: suffixes of files that are still being written
     return starts_with(name, ".") || ends_with(l, ".!qb") || ends_with(l, ".parts") || l == SIDECAR_NAME;
 }
 
@@ -531,7 +532,7 @@ std::shared_ptr<Listing> Library::build_listing(const fs::path& dir, const Sig& 
     auto names = with_context("read_dir " + dir.string(), [&] { return read_dir(dir); });
     std::set<std::string> name_set;
     for (auto& n : names) name_set.insert(n.name);
-    auto downloading = [&](const std::string& n) { return name_set.contains(n + ".!qB") || name_set.contains(n + ".!qb"); };
+    auto incomplete = [&](const std::string& n) { return name_set.contains(n + ".!qB") || name_set.contains(n + ".!qb"); };
     auto item = [&](const std::string& n) -> const DirItem* {
         for (auto& x : names)
             if (x.name == n) return &x;
@@ -580,14 +581,14 @@ std::shared_ptr<Listing> Library::build_listing(const fs::path& dir, const Sig& 
         } else {
             std::string ref = cue.files[0];
             std::replace(ref.begin(), ref.end(), '\\', '/');
-            if (downloading(fs::path(ref).filename().string())) hidden.insert(n.name);  // image still downloading as <name>.!qB
+            if (incomplete(fs::path(ref).filename().string())) hidden.insert(n.name);  // image still being written as <name>.!qB
         }
     }
     bool multi = groups.size() > 1;
     for (size_t gi = 0; gi < groups.size(); gi++) {
         auto& [cue_name, cue, img_name] = groups[gi];
         fs::path img_path = dir / img_name;
-        if (downloading(img_name)) {
+        if (incomplete(img_name)) {
             hidden.insert(cue_name);
             hidden.insert(img_name);
             continue;
@@ -624,7 +625,7 @@ std::shared_ptr<Listing> Library::build_listing(const fs::path& dir, const Sig& 
     for (size_t ii = 0; ii < isos.size(); ii++) {
         const std::string& n = isos[ii]->name;
         fs::path p = dir / n;
-        if (downloading(n) || !is_sacd(p)) continue;
+        if (incomplete(n) || !is_sacd(p)) continue;
         std::optional<uint32_t> disc_no = multi_iso ? std::optional<uint32_t>(uint32_t(ii + 1)) : std::nullopt;
         auto st = sacd_state(p, dir, false);
         int64_t mt = max_mtime({mtime_ns(p), sidecar_mtime});

@@ -55,7 +55,7 @@ struct AvImage::Decoder {
         codec = avcodec_alloc_context3(dec);
         avcodec_parameters_to_context(codec, fmt->streams[stream]->codecpar);
         codec->thread_count = 1;
-        // checksums on, and any damage is an error: incomplete downloads must not pass
+        // checksums on, and any damage is an error: incomplete files must not pass
         codec->err_recognition = AV_EF_CRCCHECK | AV_EF_BITSTREAM | AV_EF_EXPLODE;
         if ((r = avcodec_open2(codec, dec, nullptr)) < 0) fail("{}: {}", p.string(), av_err(r));
         auto* par = fmt->streams[stream]->codecpar;
