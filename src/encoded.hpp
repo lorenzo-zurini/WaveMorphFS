@@ -37,12 +37,14 @@ std::optional<std::vector<TrackLayout>> load_layout(const AvImage& img, const Ra
 /// Encode every track once to measure it; stores the result in the cache.
 std::vector<TrackLayout> build_layout(const AvImage& img, const Ranges& ranges, const Cache* cache);
 
-class EncodedTrack : public VFile, public std::enable_shared_from_this<EncodedTrack> {
+class EncodedTrack : public VFile, public Trimmable, public std::enable_shared_from_this<EncodedTrack> {
 public:
     EncodedTrack(std::shared_ptr<const AvImage> img, uint64_t start, uint64_t end, const Tags& tags, const TrackLayout& layout);
     uint64_t size() const override { return size_; }
     Bytes read_at(uint64_t off, size_t len) const override;
     std::string describe() const override;
+    /// Drop encoded frames (the track is not being read).
+    void drop_cached() const override;
 
 private:
     using Frame = std::shared_ptr<const Bytes>;

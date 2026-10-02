@@ -2,10 +2,13 @@
 // Shared helpers: errors, byte order, strings, files, logging, child processes.
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <format>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -131,6 +134,30 @@ enum class Lane { Decode, Encode };
 /// Run `task` on a worker pool (each lane has as many threads as the CPU).
 void submit(std::function<void()> task, Lane lane = Lane::Decode);
 size_t pool_size();
+
+/// Something that keeps decoded or encoded audio around for the readers of the
+/// moment (read-ahead, frames shared by neighbouring reads). Once registered, by
+/// its first read, a sweeper calls drop_cached() after it has been idle for a while and
+/// hands the freed memory back to the system, so an idle mount holds no audio.
+class Trimmable {
+public:
+    virtual ~Trimmable() = default;
+    /// Drop cached data that is complete (never wait on in-flight work).
+    virtual void drop_cached() const = 0;
+
+protected:
+    /// Note a read of `self` (registers it with the sweeper the first time).
+    void touch(const std::shared_ptr<const Trimmable>& self) const;
+
+private:
+    friend struct Sweeper;
+    mutable std::atomic<int64_t> last_use_{0};
+    mutable std::atomic<int64_t> trimmed_at_{0};  // last_use_ when last trimmed
+    mutable std::atomic<bool> registered_{false};
+};
+/// Trim what has been idle for `idle` now (the sweeper does this on its own);
+/// returns how many objects were trimmed.
+size_t sweep_idle(std::chrono::nanoseconds idle);
 
 // ---- logging (level from WAVEMORPH_LOG: debug, info, warn, error)
 enum class Level { Debug, Info, Warn, Error };
