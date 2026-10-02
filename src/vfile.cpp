@@ -19,37 +19,55 @@ void copy_overlap(Bytes& out, std::span<const uint8_t> seg, uint64_t seg_start, 
     if (a < b) out.insert(out.end(), seg.begin() + ptrdiff_t(a - seg_start), seg.begin() + ptrdiff_t(b - seg_start));
 }
 
-Spliced::Spliced(fs::path p, std::string what, std::vector<Seg> segs) : path_(std::move(p)), what_(std::move(what)) {
+uint64_t seg_size(const Seg& s) {
+    if (auto* b = std::get_if<Bytes>(&s)) return b->size();
+    if (auto* r = std::get_if<SrcRange>(&s)) return r->len;
+    return std::get<Zeros>(s).len;
+}
+
+Segments::Segments(std::vector<Seg> segs) {
     for (auto& s : segs) {
-        uint64_t start = size_;
-        size_ += std::visit([](auto& x) -> uint64_t {
-            if constexpr (std::is_same_v<std::decay_t<decltype(x)>, Bytes>) return x.size();
-            else return x.len;
-        }, s);
-        segs_.emplace_back(start, std::move(s));
+        uint64_t n = seg_size(s);
+        if (n == 0) continue;
+        if (!segs_.empty())
+            if (auto* prev = std::get_if<Bytes>(&segs_.back().second))
+                if (auto* b = std::get_if<Bytes>(&s)) {
+                    append(*prev, *b);
+                    size_ += n;
+                    continue;
+                }
+        segs_.emplace_back(size_, std::move(s));
+        size_ += n;
+    }
+}
+
+void Segments::read(const fs::path& src, uint64_t off, size_t len, Bytes& out) const {
+    if (off >= size_) return;
+    uint64_t end = off + std::min<uint64_t>(len, size_ - off);
+    std::unique_ptr<File> f;
+    for (auto& [start, seg] : segs_) {
+        uint64_t n = seg_size(seg);
+        uint64_t a = std::max(off, start), e = std::min(end, start + n);
+        if (a >= e) continue;
+        if (auto* b = std::get_if<Bytes>(&seg)) {
+            out.insert(out.end(), b->begin() + ptrdiff_t(a - start), b->begin() + ptrdiff_t(e - start));
+        } else if (auto* r = std::get_if<SrcRange>(&seg)) {
+            if (!f) f = std::make_unique<File>(src);
+            size_t old = out.size();
+            out.resize(old + size_t(e - a));
+            size_t got = f->read_at(out.data() + old, size_t(e - a), r->off + (a - start));
+            WM_ENSURE(got == e - a, "short read in {}", src.string());
+        } else {
+            out.insert(out.end(), size_t(e - a), uint8_t(0));
+        }
     }
 }
 
 Bytes Spliced::read_at(uint64_t off, size_t len) const {
     Bytes out;
-    if (off >= size_) return out;
-    uint64_t end = off + std::min<uint64_t>(len, size_ - off);
-    out.reserve(size_t(end - off));
-    std::unique_ptr<File> f;
-    for (auto& [start, seg] : segs_) {
-        if (auto* b = std::get_if<Bytes>(&seg)) {
-            copy_overlap(out, *b, start, off, size_t(end - off));
-            continue;
-        }
-        auto& r = std::get<SrcRange>(seg);
-        uint64_t a = std::max(off, start), e = std::min(end, start + r.len);
-        if (a >= e) continue;
-        if (!f) f = std::make_unique<File>(path_);
-        size_t n = size_t(e - a);
-        size_t old = out.size();
-        out.resize(old + n);
-        out.resize(old + f->read_at(out.data() + old, n, r.off + (a - start)));
-    }
+    if (off >= size()) return out;
+    out.reserve(size_t(std::min<uint64_t>(len, size() - off)));
+    segs_.read(path_, off, len, out);
     return out;
 }
 

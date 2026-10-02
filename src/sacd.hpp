@@ -34,6 +34,29 @@ struct SacdTrack {
     std::optional<std::string> title, performer, songwriter, composer, arranger;
 };
 
+/// Where each audio frame of an area starts: (sector, byte offset of its first
+/// audio packet), ending with an end marker. Read in place from the mapped cache
+/// file (6-byte records) when possible, so the table costs memory only while used.
+class SacdFrames {
+public:
+    using Frame = std::pair<uint32_t, uint16_t>;
+    SacdFrames() = default;
+    explicit SacdFrames(std::vector<Frame> v) : vec_(std::make_shared<const std::vector<Frame>>(std::move(v))), n_(vec_->size()) {}
+    SacdFrames(MappedFile m, size_t first, size_t n) : map_(std::move(m)), recs_(map_.bytes.data() + first), n_(n) {}
+    size_t size() const { return n_; }
+    Frame operator[](size_t i) const {
+        if (vec_) return (*vec_)[i];
+        const uint8_t* c = recs_ + 6 * i;
+        return {le32(c), uint16_t(c[4] | c[5] << 8)};
+    }
+
+private:
+    std::shared_ptr<const std::vector<Frame>> vec_;
+    MappedFile map_;
+    const uint8_t* recs_ = nullptr;
+    size_t n_ = 0;
+};
+
 class SacdDisc : public Trimmable, public std::enable_shared_from_this<SacdDisc> {
 public:
     /// Open the stereo area, or with `multichannel` the multichannel area.
@@ -62,8 +85,7 @@ private:
     std::shared_future<Chunk> start(uint64_t c, std::shared_ptr<std::promise<Chunk>>* claimed) const;  // mu_ held
     void fulfil(uint64_t c, std::promise<Chunk>& p) const;
     uint64_t nchunks() const { return (frames_.size() - 1 + CHUNK_FRAMES - 1) / CHUNK_FRAMES; }
-    /// per frame: (sector, byte offset of the frame's first audio packet); ends with an end marker
-    std::vector<std::pair<uint32_t, uint16_t>> frames_;
+    SacdFrames frames_;
     mutable std::mutex mu_;
     struct Cached {
         std::shared_future<Chunk> data;

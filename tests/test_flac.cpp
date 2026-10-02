@@ -147,6 +147,37 @@ std::vector<std::pair<uint64_t, uint64_t>> edge_ranges(uint64_t bs, uint64_t tot
 
 }  // namespace
 
+TEST(header_segments_match_build_header) {
+    // a picture referenced in a file and zero padding give the same bytes as the
+    // header built in memory
+    fs::path f = fs::temp_directory_path() / std::format("wm-hdr-{}", ::getpid());
+    Bytes picture(70000);
+    for (size_t i = 0; i < picture.size(); i++) picture[i] = uint8_t(i * 7);
+    Bytes file(123, 0xAA);
+    append(file, picture);
+    atomic_write(f, file);
+    flac::StreamInfo si;
+    si.min_block = si.max_block = 4096;
+    si.sample_rate = 44100;
+    si.channels = 2;
+    si.bps = 16;
+    si.total_samples = 1000;
+    Bytes vorbis = flac::build_vorbis("v", {{"TITLE", "t"}});
+    Bytes want = flac::build_header(si.encode(0, 0), {{flac::BLOCK_VORBIS, vorbis}, {flac::BLOCK_PICTURE, picture}, {flac::BLOCK_PADDING, Bytes(8192, 0)}});
+    Segments segs(flac::header_segments(si.encode(0, 0), {{flac::BLOCK_VORBIS, vorbis}, {flac::BLOCK_PICTURE, SrcRange{123, picture.size()}},
+                                                          {flac::BLOCK_PADDING, Zeros{8192}}}));
+    CHECK(segs.size() == want.size());
+    for (auto [off, len] : {std::pair<uint64_t, size_t>{0, want.size()}, {0, 10}, {40, 5000}, {want.size() - 9000, 9000}, {77, 70100}}) {
+        Bytes got;
+        segs.read(f, off, len, got);
+        CHECK_MSG(got.size() == len && std::equal(got.begin(), got.end(), want.begin() + ptrdiff_t(off)), "range {}+{}", off, len);
+    }
+    Bytes none;
+    segs.read(f, want.size(), 10, none);
+    CHECK(none.empty());
+    fs::remove(f);
+}
+
 TEST(split_cd_audio_4096) {
     size_t total = 4096 * 20 + 3;  // tiny last frame
     run_case(44100, 2, 16, 4096, total, edge_ranges(4096, total));

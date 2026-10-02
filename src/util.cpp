@@ -3,6 +3,7 @@
 
 #include <fcntl.h>
 #include <malloc.h>
+#include <sys/mman.h>
 #include <poll.h>
 #include <spawn.h>
 #include <sys/stat.h>
@@ -381,7 +382,7 @@ struct Sweeper {
         }
         live.clear();  // the last owner of a removed object frees it here, before trimming the heap
         if (trimmed) {
-            malloc_trim(0);
+            trim_heap();
             debug("released the cached audio of {} idle files", trimmed);
         }
         return trimmed;
@@ -389,6 +390,29 @@ struct Sweeper {
 };
 
 size_t sweep_idle(std::chrono::nanoseconds idle) { return Sweeper::get().sweep(idle); }
+
+void trim_heap() {
+    malloc_trim(0);
+    if (log_enabled(Level::Debug)) {
+        auto mi = mallinfo2();
+        debug("heap: {} MB in use, {} MB free, {} MB mapped", (mi.uordblks + mi.hblkhd) >> 20, mi.fordblks >> 20, mi.hblkhd >> 20);
+    }
+}
+
+std::optional<MappedFile> map_file(const fs::path& p) {
+    int fd = ::open(p.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return std::nullopt;
+    struct stat st{};
+    void* map = MAP_FAILED;
+    if (::fstat(fd, &st) == 0 && st.st_size > 0) map = ::mmap(nullptr, size_t(st.st_size), PROT_READ, MAP_SHARED, fd, 0);
+    ::close(fd);  // the mapping keeps the file
+    if (map == MAP_FAILED) return std::nullopt;
+    size_t len = size_t(st.st_size);
+    MappedFile m;
+    m.owner = std::shared_ptr<const void>(map, [len](const void* q) { ::munmap(const_cast<void*>(q), len); });
+    m.bytes = {static_cast<const uint8_t*>(map), len};
+    return m;
+}
 
 void Trimmable::touch(const std::shared_ptr<const Trimmable>& self) const {
     last_use_ = now_ns();

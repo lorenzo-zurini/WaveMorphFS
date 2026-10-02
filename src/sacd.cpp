@@ -151,22 +151,33 @@ Frames scan_frames(const File& f, uint64_t start, uint64_t end, uint32_t channel
     return frames;
 }
 
-std::optional<Frames> load_frames(const fs::path& p, uint64_t area_end) {
-    auto b = try_read_file(p);
-    if (!b || b->size() < 16) return std::nullopt;
-    bool v1 = std::memcmp(b->data(), IDX_MAGIC_V1, 8) == 0;
-    if (!v1 && std::memcmp(b->data(), IDX_MAGIC, 8) != 0) return std::nullopt;
-    uint64_t n = le64(&(*b)[8]);
-    if (b->size() != 16 + n * 6) return std::nullopt;
+void store_frames(const fs::path& p, const Frames& fr);
+
+std::optional<SacdFrames> load_frames(const fs::path& p, uint64_t area_end) {
+    auto m = map_file(p);
+    if (!m || m->bytes.size() < 16) return std::nullopt;
+    const uint8_t* b = m->bytes.data();
+    bool v1 = std::memcmp(b, IDX_MAGIC_V1, 8) == 0;
+    if (!v1 && std::memcmp(b, IDX_MAGIC, 8) != 0) return std::nullopt;
+    uint64_t n = le64(b + 8);
+    if (m->bytes.size() != 16 + n * 6) return std::nullopt;
+    if (!v1) return SacdFrames(std::move(*m), 16, size_t(n));
+    // v1 caches were only written for discs whose area ends cleanly; they lack the end marker
     Frames fr;
     fr.reserve(size_t(n) + 1);
     for (size_t i = 0; i < n; i++) {
-        const uint8_t* c = &(*b)[16 + 6 * i];
+        const uint8_t* c = b + 16 + 6 * i;
         fr.emplace_back(le32(c), uint16_t(c[4] | c[5] << 8));
     }
-    // v1 caches were only written for discs whose area ends cleanly
-    if (v1) fr.emplace_back(uint32_t(area_end + 1), 0);
-    return fr;
+    fr.emplace_back(uint32_t(area_end + 1), 0);
+    // upgrade the cache file to the current format, which can be used in place
+    try {
+        store_frames(p, fr);
+        if (auto mapped = load_frames(p, area_end)) return mapped;
+    } catch (const std::exception& e) {
+        warn("upgrading {}: {}", p.string(), e.what());
+    }
+    return SacdFrames(std::move(fr));
 }
 
 void store_frames(const fs::path& p, const Frames& fr) {
@@ -309,15 +320,16 @@ std::shared_ptr<SacdDisc> SacdDisc::open(const fs::path& path, const Cache* cach
 
     uint64_t needed = disc->tracks.back().end;
     auto key = SrcKey::of(path);
-    std::optional<Frames> frames;
+    std::optional<SacdFrames> frames;
     fs::path cp;
     if (cache) {
         cp = cache->sacd_frames_path(path, key, multichannel);
         frames = load_frames(cp, audio_end);
     }
     if (!frames) {
-        frames = scan_frames(f, audio_start, audio_end, channels, dst, needed);
-        if (cache) store_frames(cp, *frames);
+        Frames scanned = scan_frames(f, audio_start, audio_end, channels, dst, needed);
+        if (cache) store_frames(cp, scanned);
+        frames = SacdFrames(std::move(scanned));
     }
     // frames ends with one extra entry: where the last needed frame ends
     WM_ENSURE(needed < frames->size(), "track list ends at frame {} but only {} frames were found", needed, frames->size() ? frames->size() - 1 : 0);

@@ -116,8 +116,8 @@ EncodedTrack::EncodedTrack(std::shared_ptr<const AvImage> img, uint64_t start, u
     si.total_samples = len;
     si.md5 = layout.md5;
     auto [mn, mx] = std::minmax_element(layout.frame_sizes.begin(), layout.frame_sizes.end());
-    header_ = flac::build_header(si.encode(*mn, *mx), {{flac::BLOCK_VORBIS, flac::build_vorbis("WaveMorphFS", tags.to_pairs())},
-                                                       {flac::BLOCK_PADDING, Bytes(flac::EDIT_PADDING, 0)}});
+    header_ = Segments(flac::header_segments(si.encode(*mn, *mx), {{flac::BLOCK_VORBIS, flac::build_vorbis("WaveMorphFS", tags.to_pairs())},
+                                                                   {flac::BLOCK_PADDING, Zeros{flac::EDIT_PADDING}}}));
     size_ = header_.size() + pos;
 }
 
@@ -182,7 +182,7 @@ Bytes EncodedTrack::read_at(uint64_t off, size_t len) const {
     if (off >= size_) return out;
     len = size_t(std::min<uint64_t>(len, size_ - off));
     out.reserve(len);
-    copy_overlap(out, header_, 0, off, len);
+    header_.read(img_->path, off, len, out);
     uint64_t h = header_.size(), end = off + len;
     if (end <= h) return out;
     uint64_t a = std::max(off, h) - h, b = end - h;  // audio-relative

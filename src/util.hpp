@@ -155,6 +155,17 @@ private:
     mutable std::atomic<int64_t> trimmed_at_{0};  // last_use_ when last trimmed
     mutable std::atomic<bool> registered_{false};
 };
+/// A file mapped read-only into memory: its bytes, kept valid by `owner` (even if
+/// the file is replaced or deleted later). Pages are loaded when touched and can
+/// be dropped by the kernel again, so mapped data costs memory only while in use.
+struct MappedFile {
+    std::shared_ptr<const void> owner;
+    std::span<const uint8_t> bytes;
+};
+std::optional<MappedFile> map_file(const fs::path& p);
+
+/// Return freed heap memory to the system (after work that allocated and freed a lot).
+void trim_heap();
 /// Trim what has been idle for `idle` now (the sweeper does this on its own);
 /// returns how many objects were trimmed.
 size_t sweep_idle(std::chrono::nanoseconds idle);

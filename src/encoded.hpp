@@ -56,7 +56,7 @@ private:
 
     std::shared_ptr<const AvImage> img_;
     uint64_t start_, end_;
-    Bytes header_;
+    Segments header_;  // padding is not held
     std::vector<uint32_t> offsets_;  // frame start offsets relative to the audio, + end
     uint64_t size_;
     mutable std::mutex mu_;

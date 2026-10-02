@@ -44,14 +44,16 @@ struct FlacImage {
 /// decoding pass over the image.
 std::vector<std::array<uint8_t, 16>> track_md5s(const FlacImage& img, const std::vector<std::pair<uint64_t, uint64_t>>& ranges);
 
-class FlacTrack : public VFile {
+class FlacTrack : public VFile, public Trimmable, public std::enable_shared_from_this<FlacTrack> {
 public:
-    /// Track covering samples [start, end) of `img`.
-    FlacTrack(std::shared_ptr<const FlacImage> img, uint64_t start, uint64_t end, const Tags& tags, const std::vector<flac::MetaBlock>& pictures,
+    /// Track covering samples [start, end) of `img`; `pictures` are blocks of the image file.
+    FlacTrack(std::shared_ptr<const FlacImage> img, uint64_t start, uint64_t end, const Tags& tags, const std::vector<flac::HeaderBlock>& pictures,
               std::optional<std::array<uint8_t, 16>> md5);
     uint64_t size() const override { return size_; }
     Bytes read_at(uint64_t off, size_t len) const override;
     std::string describe() const override;
+    /// Drop the boundary frames and frame positions computed for reads.
+    void drop_cached() const override;
 
 private:
     struct VSeg {  // a partial frame re-emitted as VERBATIM
@@ -59,22 +61,23 @@ private:
         uint64_t out_sample;  // first sample number in the output stream
         uint64_t size;
     };
+    using Shared = std::shared_ptr<const Bytes>;
     Bytes verbatim(const VSeg& seg) const;
-    const Bytes& seg_bytes(std::optional<Bytes>& cell, const VSeg& seg) const;
-    const std::vector<uint64_t>& vstarts() const;
+    Shared seg_bytes(Shared& cell, const VSeg& seg) const;
+    std::shared_ptr<const std::vector<uint64_t>> vstarts() const;
     void read_copy(uint64_t off, size_t len, Bytes& out) const;
 
     std::shared_ptr<const FlacImage> img_;
     uint64_t start_, end_;
-    Bytes header_;
+    Segments header_;  // pictures and padding are not held
     std::optional<VSeg> head_, tail_;
     uint64_t k1_ = 0, k2_ = 0;  // copied source frames [k1, k2)
     uint64_t copy_size_ = 0;
     uint64_t size_ = 0;
     mutable std::mutex mu_;
-    mutable std::optional<Bytes> head_bytes_, tail_bytes_;
+    mutable Shared head_bytes_, tail_bytes_;
     /// virtual start offset (relative to the copy region) of each copied frame, + end
-    mutable std::optional<std::vector<uint64_t>> vstarts_;
+    mutable std::shared_ptr<const std::vector<uint64_t>> vstarts_;
 };
 
 }  // namespace wm
