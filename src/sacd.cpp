@@ -453,7 +453,13 @@ void SacdDisc::fulfil(uint64_t c, std::promise<Chunk>& p) const {
     }
 }
 
+void SacdDisc::drop_cached() const {
+    std::lock_guard g(mu_);
+    std::erase_if(chunks_, [](auto& kv) { return kv.second.data.wait_for(std::chrono::seconds(0)) == std::future_status::ready; });
+}
+
 SacdDisc::Chunk SacdDisc::chunk(uint64_t c) const {
+    touch(weak_from_this().lock());
   for (int attempt = 0;; attempt++) {
     std::shared_future<Chunk> f;
     std::shared_ptr<std::promise<Chunk>> mine;

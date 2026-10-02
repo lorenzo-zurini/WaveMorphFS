@@ -20,10 +20,11 @@ namespace wm {
 namespace {
 
 const char INDEX_MAGIC[8] = {'W', 'M', 'A', 'V', 'I', 'X', '0', '1'};
-/// decoded packets kept per image (APE: up to 294912 samples each)
-constexpr size_t CACHE_PACKETS = 24;
 /// decode this many samples beyond the one being read, in parallel (~30 s at 44.1 kHz)
 constexpr uint64_t READ_AHEAD_SAMPLES = 1'500'000;
+/// decoded samples (per channel) kept per image while it is read: the read-ahead
+/// plus as much again behind it (APE packets are up to 294912 samples each)
+constexpr uint64_t CACHE_SAMPLES = 2 * READ_AHEAD_SAMPLES;
 constexpr size_t MAX_DECODERS = 8;
 
 std::string av_err(int e) {
@@ -264,7 +265,12 @@ std::shared_future<AvImage::Samples> AvImage::start(size_t k, std::shared_ptr<st
     std::shared_future<Samples> f = promise->get_future().share();
     cache_[k] = {f, ++clock_};
     // bounded: drop the least recently used finished entries
-    while (cache_.size() > CACHE_PACKETS) {
+    auto cached_samples = [&] {
+        uint64_t n = 0;
+        for (auto& [j, c] : cache_) n += packets_[j].count;
+        return n;
+    };
+    while (cache_.size() > 1 && cached_samples() > CACHE_SAMPLES) {
         auto victim = cache_.end();
         for (auto it = cache_.begin(); it != cache_.end(); ++it)
             if (it->first != k && it->second.samples.wait_for(std::chrono::seconds(0)) == std::future_status::ready &&
@@ -279,6 +285,14 @@ std::shared_future<AvImage::Samples> AvImage::start(size_t k, std::shared_ptr<st
     }
     submit([this, self = shared_from_this(), k, promise] { fulfil(k, *promise); });
     return f;
+}
+
+void AvImage::drop_cached() const {
+    std::vector<std::unique_ptr<Decoder>> drop;  // closed outside the lock
+    std::lock_guard g(mu_);
+    std::erase_if(cache_, [](auto& kv) { return kv.second.samples.wait_for(std::chrono::seconds(0)) == std::future_status::ready; });
+    drop.swap(idle_);
+    last_packet_ = SIZE_MAX;
 }
 
 void AvImage::fulfil(size_t k, std::promise<Samples>& promise) const {
@@ -307,6 +321,7 @@ AvImage::Samples AvImage::packet_samples(size_t k) const {
     std::shared_future<Samples> f;
     std::shared_ptr<std::promise<Samples>> mine;
     bool sequential;
+    touch(weak_from_this().lock());
     {
         std::lock_guard g(mu_);
         sequential = last_packet_ != SIZE_MAX && (k == last_packet_ || k == last_packet_ + 1);

@@ -22,7 +22,7 @@ namespace wm {
 
 class Cache;
 
-class AvImage : public std::enable_shared_from_this<AvImage> {
+class AvImage : public Trimmable, public std::enable_shared_from_this<AvImage> {
 public:
     /// Open (index from the cache, or verified and indexed now).
     static std::shared_ptr<AvImage> open(const fs::path& p, const Cache* cache);
@@ -38,6 +38,8 @@ public:
     std::vector<std::vector<int32_t>> decode_range(uint64_t s, uint64_t e) const;
     /// Audio MD5 (FLAC convention) of each sample range, in one decoding pass.
     std::vector<std::array<uint8_t, 16>> md5s(const std::vector<std::pair<uint64_t, uint64_t>>& ranges) const;
+    /// Drop decoded packets and idle decoders (the image is not being read).
+    void drop_cached() const override;
 
     struct Packet {
         int64_t pts;     // demuxer timestamp, for seeking

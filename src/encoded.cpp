@@ -20,7 +20,7 @@ namespace {
 const char LAYOUT_MAGIC[8] = {'W', 'M', 'E', 'N', 'C', '0', '0', '1'};
 /// frames encoded per job, frames kept per track, frames encoded ahead of the reader
 constexpr uint64_t JOB_FRAMES = 32;
-constexpr size_t CACHE_FRAMES = 1024;
+constexpr size_t CACHE_FRAMES = 512;
 constexpr uint64_t AHEAD_FRAMES = 256;  // ~24 s at 44.1 kHz
 /// frames decoded per batch while measuring
 constexpr uint64_t BATCH = 64;
@@ -121,6 +121,12 @@ EncodedTrack::EncodedTrack(std::shared_ptr<const AvImage> img, uint64_t start, u
     size_ = header_.size() + pos;
 }
 
+void EncodedTrack::drop_cached() const {
+    std::lock_guard g(mu_);
+    std::erase_if(frames_, [](auto& kv) { return kv.second.frame.wait_for(std::chrono::seconds(0)) == std::future_status::ready; });
+    last_end_ = UINT64_MAX;
+}
+
 EncodedTrack::Promises EncodedTrack::claim(uint64_t a, uint64_t b) const {
     Promises ps;
     for (uint64_t j = a; j < b; j++) {
@@ -186,6 +192,7 @@ Bytes EncodedTrack::read_at(uint64_t off, size_t len) const {
     // claim what is needed (first job done here, the rest in parallel), then read-ahead
     // background work needs a shared owner; without one (tests) everything is done here
     auto self = weak_from_this().lock();
+    touch(self);
     std::vector<Promises> jobs, ahead;
     std::vector<std::shared_future<Frame>> need;
     {

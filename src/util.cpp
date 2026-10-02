@@ -2,6 +2,7 @@
 #include "util.hpp"
 
 #include <fcntl.h>
+#include <malloc.h>
 #include <poll.h>
 #include <spawn.h>
 #include <sys/stat.h>
@@ -334,6 +335,69 @@ void submit(std::function<void()> task, Lane lane) {
 }
 
 size_t pool_size() { return pool().n; }
+
+// idle objects are trimmed after this long; the sweeper looks this often
+constexpr auto TRIM_IDLE = std::chrono::seconds(15);
+constexpr auto TRIM_EVERY = std::chrono::seconds(5);
+
+struct Sweeper {
+    std::mutex mu;
+    std::vector<std::weak_ptr<const Trimmable>> items;
+
+    static Sweeper& get() {
+        // leaked on purpose like the pools: the thread runs until exit
+        static Sweeper* s = [] {
+            auto* sw = new Sweeper;
+            std::thread([sw] {
+                while (true) {
+                    std::this_thread::sleep_for(TRIM_EVERY);
+                    sw->sweep(TRIM_IDLE);
+                }
+            }).detach();
+            return sw;
+        }();
+        return *s;
+    }
+
+    size_t sweep(std::chrono::nanoseconds idle) {
+        std::vector<std::shared_ptr<const Trimmable>> live;
+        {
+            std::lock_guard g(mu);
+            std::erase_if(items, [&](auto& w) {
+                auto p = w.lock();
+                if (!p) return true;
+                live.push_back(std::move(p));
+                return false;
+            });
+        }
+        int64_t idle_before = now_ns() - idle.count();
+        size_t trimmed = 0;
+        for (auto& t : live) {
+            int64_t used = t->last_use_.load();
+            if (used > idle_before || t->trimmed_at_.load() == used) continue;
+            t->drop_cached();
+            t->trimmed_at_ = used;
+            trimmed++;
+        }
+        live.clear();  // the last owner of a removed object frees it here, before trimming the heap
+        if (trimmed) {
+            malloc_trim(0);
+            debug("released the cached audio of {} idle files", trimmed);
+        }
+        return trimmed;
+    }
+};
+
+size_t sweep_idle(std::chrono::nanoseconds idle) { return Sweeper::get().sweep(idle); }
+
+void Trimmable::touch(const std::shared_ptr<const Trimmable>& self) const {
+    last_use_ = now_ns();
+    if (self && !registered_.exchange(true)) {
+        auto& s = Sweeper::get();
+        std::lock_guard g(s.mu);
+        s.items.push_back(self);
+    }
+}
 
 // ---------------------------------------------------------------- logging
 

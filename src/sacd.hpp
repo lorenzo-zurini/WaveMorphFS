@@ -34,7 +34,7 @@ struct SacdTrack {
     std::optional<std::string> title, performer, songwriter, composer, arranger;
 };
 
-class SacdDisc : public std::enable_shared_from_this<SacdDisc> {
+class SacdDisc : public Trimmable, public std::enable_shared_from_this<SacdDisc> {
 public:
     /// Open the stereo area, or with `multichannel` the multichannel area.
     static std::shared_ptr<SacdDisc> open(const fs::path& p, const Cache* cache, bool multichannel);
@@ -53,6 +53,8 @@ public:
     /// Chunk c (frames [c*CHUNK_FRAMES, ...)), decoded here if nobody has started
     /// it; the following chunks are decoded ahead in the background.
     Chunk chunk(uint64_t c) const;
+    /// Drop decoded chunks (the disc is not being read).
+    void drop_cached() const override;
 
 private:
     std::vector<Bytes> coded_frames(uint64_t f0, uint64_t f1) const;

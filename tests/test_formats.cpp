@@ -2,6 +2,8 @@
 // CUE / charset detection, ID3, MP4 and ffprobe-tag parsing.
 #include <unistd.h>
 
+#include <thread>
+
 #include "charset.hpp"
 #include "cue.hpp"
 #include "id3.hpp"
@@ -197,4 +199,30 @@ TEST(mp4_rewrites_ilst_and_shifts_offsets) {
     CHECK(s.find("com.apple.iTunes") != std::string::npos && s.find("MusicBrainz Album Id") != std::string::npos);
     Bytes trkn = {0, 0, 0, 3, 0, 12, 0, 0};
     CHECK_MSG(std::search(r.moov.begin(), r.moov.end(), trkn.begin(), trkn.end()) != r.moov.end(), "trkn 3/12");
+}
+
+namespace {
+struct Holder : Trimmable, std::enable_shared_from_this<Holder> {
+    mutable int dropped = 0;
+    void drop_cached() const override { dropped++; }
+    void use() const { touch(weak_from_this().lock()); }
+};
+}  // namespace
+
+TEST(idle_caches_are_trimmed_once) {
+    auto busy = std::make_shared<Holder>(), idle = std::make_shared<Holder>();
+    busy->use();
+    idle->use();
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    busy->use();
+    sweep_idle(std::chrono::milliseconds(30));
+    CHECK(idle->dropped == 1 && busy->dropped == 0);
+    sweep_idle(std::chrono::milliseconds(30));
+    CHECK_MSG(idle->dropped == 1, "not trimmed again until used again");
+    { auto gone = std::make_shared<Holder>(); gone->use(); }
+    sweep_idle(std::chrono::milliseconds(0));  // a destroyed object is simply forgotten
+    CHECK(busy->dropped == 1);
+    idle->use();
+    sweep_idle(std::chrono::milliseconds(0));
+    CHECK(idle->dropped == 2);
 }
