@@ -32,6 +32,30 @@ static Tags table_to_tags(const json& t) {
     return tags;
 }
 
+std::optional<std::string> normalize_target(std::string_view p) {
+    std::string out;
+    for (auto& c : split(p, '/')) {
+        if (c.empty()) continue;
+        if (c == "." || c == ".." || c[0] == '.') return std::nullopt;
+        if (!out.empty()) out += '/';
+        out += c;
+    }
+    if (out.empty()) return std::nullopt;
+    return out;
+}
+
+std::optional<std::string> canonical_track_key(std::string_view k) {
+    auto sep = k.find_first_of("-.");
+    if (sep == std::string_view::npos) {
+        auto n = parse_u64(std::string(k));
+        if (!n) return std::nullopt;
+        return std::to_string(*n);
+    }
+    auto d = parse_u64(std::string(k.substr(0, sep))), n = parse_u64(std::string(k.substr(sep + 1)));
+    if (!d || !n) return std::nullopt;
+    return std::format("{}-{:02}", *d, *n);
+}
+
 Sidecar Sidecar::parse(const std::string& text) {
     json doc = json::parse(text, nullptr, true, /*ignore_comments=*/true);
     WM_ENSURE(doc.is_object(), "sidecar is not a JSON object");
@@ -46,6 +70,10 @@ Sidecar Sidecar::parse(const std::string& text) {
         }
         return false;
     };
+    if (auto t = doc.find("_target"); t != doc.end() && t->is_string()) {
+        sc.target = normalize_target(t->get<std::string>());
+        if (!sc.target) warn("sidecar: ignoring invalid _target '{}'", t->get<std::string>());
+    }
     if (auto h = doc.find("_hide"); h != doc.end()) {
         if (h->is_string()) sc.hidden.insert(h->get<std::string>());
         else if (h->is_array())
@@ -61,6 +89,12 @@ Sidecar Sidecar::parse(const std::string& text) {
             if (target == &sc.tracks)
                 if (auto n = v.find("_name"); n != v.end() && n->is_string() && !n->get<std::string>().empty()) sc.track_names[k] = n->get<std::string>();
             if (auto h = v.find("_hide"); h != v.end() && truthy(*h)) (target == &sc.tracks ? sc.hidden_tracks : sc.hidden).insert(k);
+            if (auto t = v.find("_target"); t != v.end() && t->is_string()) {
+                auto nt = normalize_target(t->get<std::string>());
+                if (!nt) warn("sidecar: ignoring invalid _target '{}'", t->get<std::string>());
+                else if (target == &sc.files) sc.file_targets[k] = *nt;
+                else if (auto ck = canonical_track_key(k)) sc.track_targets[*ck] = *nt;
+            }
         }
     }
     return sc;
@@ -84,6 +118,9 @@ std::optional<Sidecar> Sidecar::load(const fs::path& src_dir, const std::optiona
         for (auto& [k, v] : sc.track_names) out->track_names[k] = v;
         out->hidden.insert(sc.hidden.begin(), sc.hidden.end());
         out->hidden_tracks.insert(sc.hidden_tracks.begin(), sc.hidden_tracks.end());
+        if (sc.target) out->target = sc.target;
+        for (auto& [k, v] : sc.track_targets) out->track_targets[k] = v;
+        for (auto& [k, v] : sc.file_targets) out->file_targets[k] = v;
         out->mtime = std::max(out->mtime.value_or(*m), *m);
         out->sources.push_back(p);
     }

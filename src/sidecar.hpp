@@ -28,8 +28,13 @@
 // "_hide": true in a track or file table hides that track or file. A top-level
 // "_hide": ["name", ...] hides files of the folder by name: a source CUE sheet,
 // image or SACD ISO (with all its tracks; the remaining discs are numbered as if
-// it were not there), or any entry of the mount. Other top-level keys (e.g.
-// "_comment") are ignored, and // or /* */ comments are allowed.
+// it were not there), or any entry of the mount. "_target" places files elsewhere
+// in the mount: at the top level it moves the whole folder (subfolders follow
+// unless they have their own), in a track or file table it moves that one file;
+// the value is a directory path relative to the mount root ("Classical Music/
+// Mahler/Symphony No. 5 (Bernstein, 1987)"). Targets are read from the sidecars
+// of the tags tree. Other top-level keys (e.g. "_comment") are ignored, and // or
+// /* */ comments are allowed.
 #pragma once
 
 #include <map>
@@ -44,6 +49,10 @@
 namespace wm {
 
 inline constexpr const char* SIDECAR_NAME = "wavemorph.json";
+/// "a//b/ c" -> "a/b/ c"; nullopt for empty paths and "." / ".." / hidden components.
+std::optional<std::string> normalize_target(std::string_view p);
+/// Track key as the listing spells it: "2-05", "2.5", "2-5" -> "2-05"; "05" -> "5".
+std::optional<std::string> canonical_track_key(std::string_view k);
 
 struct Sidecar {
     Tags album;
@@ -52,6 +61,9 @@ struct Sidecar {
     std::map<std::string, std::string> track_names;  // pinned file names ("_name")
     std::set<std::string> hidden;                     // "_hide": names, and file tables with "_hide": true
     std::set<std::string> hidden_tracks;              // track tables with "_hide": true
+    std::optional<std::string> target;                // "_target" of the folder (normalized)
+    std::map<std::string, std::string> track_targets;  // canonical track key -> "_target"
+    std::map<std::string, std::string> file_targets;   // file name -> "_target"
     /// newest mtime among the sidecar files that contributed
     std::optional<int64_t> mtime;
     std::vector<fs::path> sources;

@@ -283,6 +283,36 @@ Both are merged, the separate tree winning.
 Edits are picked up within seconds. A `cover.jpg`/`cover.png` in the sidecar folder
 is shown in the album folder if it has no cover of its own.
 
+### Organizing the mount
+
+By default every folder appears at its own path. `"_target"` places files somewhere
+else in the mount, so the library can be organized without moving a single source
+file:
+
+```json
+{
+  "_target": "Classical Music/Gustav Mahler/Symphony No. 5 (Bernstein, 1987)",
+  "track": {
+    "7": {"_target": "Classical Music/Gustav Mahler/Encores"}
+  },
+  "file": {
+    "booklet.pdf": {"_target": "Classical Music/Gustav Mahler/Booklets"}
+  }
+}
+```
+
+* At the top level it moves the folder's files; its subfolders (`CD1`, `CD2`, ...)
+  move along beneath it unless they have a `"_target"` of their own.
+* In a `track` or `file` entry it moves that one file (its name stays the same).
+* Paths are directories relative to the mount root; their first component is
+  normally a root name. Directories are created as needed, folders emptied by
+  moves disappear, several folders may share a target (equal file names are
+  numbered), and moved folders' new and old parents change mtime so music
+  servers rescan them.
+* Targets are read from the sidecars in the tags tree (`--tags-dir`) and take
+  effect within a few seconds. Tag edits of moved files still go to their own
+  folder's sidecar.
+
 ### Editing tags on the mount
 
 FLAC, DSF, MP3 and M4A files on the mount can be edited in place with any tag

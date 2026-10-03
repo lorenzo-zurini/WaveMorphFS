@@ -26,10 +26,11 @@ int64_t g_started;
 
 struct Node {
     enum Kind { Root, Dir, File } kind;
-    fs::path dir;  // Dir: source path; File: the source folder it is listed in
+    fs::path dir;  // Dir: a source folder behind it (empty if purely virtual); File: the source folder it belongs to
     VFilePtr file;
     int64_t mtime = 0;
     std::string name, tag_section, tag_key, tag_ext;  // File
+    std::string vpath;                                // Dir: its path in the mount
     bool editable() const { return !tag_section.empty(); }
 };
 
@@ -52,32 +53,31 @@ WriteSession* session_for(const std::string& path) {
 
 timespec ts(int64_t ns) { return {time_t(ns / 1'000'000'000), long(ns % 1'000'000'000)}; }
 
-/// Resolve a mount path ("/Music/Artist/Album/01 - x.flac") to a node.
-/// Intermediate components are real directories (never hidden unless dotfiles),
-/// so only the last component needs the parent's listing.
+/// Resolve a mount path ("/Music/Artist/Album/01 - x.flac") to a node through
+/// the parent directory's listing (directories may be placed anywhere by sidecar
+/// "_target"s, so the path says nothing about the source folders behind it).
 std::optional<Node> resolve(const char* path) {
     std::string_view p(path);
     if (p == "/" || p.empty()) return Node{Node::Root, {}, nullptr, g_started};
-    std::vector<std::string> comps;
-    for (auto& c : split(p.substr(1), '/'))
-        if (!c.empty()) comps.push_back(c);
-    const Root* root = nullptr;
-    for (auto& r : g_lib->cfg.roots)
-        if (r.name == comps[0]) root = &r;
-    if (!root) return std::nullopt;
-    fs::path cur = root->path;
-    if (comps.size() == 1) return Node{Node::Dir, cur, nullptr, 0, {}, {}, {}, {}};
-    for (size_t i = 1; i + 1 < comps.size(); i++) {
-        if (starts_with(comps[i], ".")) return std::nullopt;
-        cur /= comps[i];
+    std::string parent, vpath;
+    std::string last;
+    for (auto& c : split(p.substr(1), '/')) {
+        if (c.empty()) continue;
+        if (starts_with(c, ".")) return std::nullopt;
+        if (!last.empty()) parent = vpath;
+        vpath = vpath.empty() ? c : vpath + "/" + c;
+        last = c;
     }
-    std::error_code ec;
-    if (!fs::is_directory(cur, ec)) return std::nullopt;
-    auto l = g_lib->list_dir(cur);
-    auto* e = l->find(comps.back());
-    if (!e) return std::nullopt;
-    if (e->is_dir) return Node{Node::Dir, e->dir, nullptr, e->mtime, {}, {}, {}, {}};
-    return Node{Node::File, cur, e->file, e->mtime, e->name, e->tag_section, e->tag_key, e->tag_ext};
+    if (last.empty()) return Node{Node::Root, {}, nullptr, g_started};
+    auto* ve = g_lib->list_vdir(parent)->find(last);
+    if (!ve) return std::nullopt;
+    auto& e = ve->e;
+    if (e.is_dir) {
+        Node n{Node::Dir, e.dir, nullptr, e.mtime};
+        n.vpath = vpath;
+        return n;
+    }
+    return Node{Node::File, ve->src_dir, e.file, e.mtime, e.name, e.tag_section, e.tag_key, e.tag_ext};
 }
 
 template <class F>
@@ -139,7 +139,7 @@ int op_getattr(const char* path, struct stat* st, struct fuse_file_info* fi) {
         if (!n) return -ENOENT;
         switch (n->kind) {
         case Node::Root: fill_dir(st, g_started); break;
-        case Node::Dir: fill_dir(st, g_lib->list_dir(n->dir)->mtime); break;
+        case Node::Dir: fill_dir(st, g_lib->list_vdir(n->vpath)->mtime); break;
         case Node::File: {
             auto* ws = session_for(path);
             fill_file(st, ws ? ws->size() : n->file->size(), n->mtime, n->editable());
@@ -159,15 +159,11 @@ int op_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_t, struc
         fill_dir(&st, 0);
         filler(buf, ".", &st, 0, fuse_fill_dir_flags(0));
         filler(buf, "..", &st, 0, fuse_fill_dir_flags(0));
-        if (n->kind == Node::Root) {
-            for (auto& r : g_lib->cfg.roots) filler(buf, r.name.c_str(), &st, 0, fuse_fill_dir_flags(0));
-            return 0;
-        }
-        auto l = g_lib->list_dir(n->dir);
-        for (auto& e : l->entries) {
+        auto l = g_lib->list_vdir(n->kind == Node::Root ? std::string() : n->vpath);
+        for (auto& ve : l->entries) {
             std::memset(&st, 0, sizeof st);
-            st.st_mode = e.is_dir ? S_IFDIR : S_IFREG;
-            if (filler(buf, e.name.c_str(), &st, 0, fuse_fill_dir_flags(0))) break;
+            st.st_mode = ve.e.is_dir ? S_IFDIR : S_IFREG;
+            if (filler(buf, ve.e.name.c_str(), &st, 0, fuse_fill_dir_flags(0))) break;
         }
         return 0;
     });
@@ -319,7 +315,8 @@ int op_getxattr(const char* path, const char* name, char* value, size_t size) {
         auto n = resolve(path);
         if (!n) return -ENOENT;
         if (n->kind == Node::Root) return -ENODATA;
-        return reply_bytes(n->kind == Node::File ? n->file->describe() : "dir:" + n->dir.string(), value, size);
+        if (n->kind == Node::File) return reply_bytes(n->file->describe(), value, size);
+        return reply_bytes(n->dir.empty() ? "virtual:" + n->vpath : "dir:" + n->dir.string(), value, size);
     });
 }
 
