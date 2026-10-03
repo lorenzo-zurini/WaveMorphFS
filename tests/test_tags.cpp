@@ -234,6 +234,58 @@ TEST(duplicate_cues_and_hidden_files) {
     fs::remove_all(dir);
 }
 
+TEST(targets_place_folders_and_files) {
+    fs::path dir = fs::temp_directory_path() / std::format("wm-target-{}", ::getpid());
+    fs::path lib_root = dir / "lib", tags = dir / "tags" / "Lib";
+    for (auto d : {"Artist/Album/CD1", "Artist/Other", "Misc"}) fs::create_directories(lib_root / d);
+    for (auto d : {"Artist/Album", "Misc"}) fs::create_directories(tags / d);
+    auto touch = [](const fs::path& p) { atomic_write(p, std::string_view("x")); };
+    touch(lib_root / "Artist/Album/cover.jpg");
+    touch(lib_root / "Artist/Album/CD1/a.txt");
+    touch(lib_root / "Artist/Other/b.txt");
+    touch(lib_root / "Misc/song.txt");
+    touch(lib_root / "Misc/keep.txt");
+    // the album moves (with CD1); one file of Misc joins it, and so does a name clash
+    atomic_write(tags / "Artist/Album" / SIDECAR_NAME, R"({"_target": "Lib//Sorted/Composer/ Work (1990) "})");
+    atomic_write(tags / "Misc" / SIDECAR_NAME, R"({"file": {"song.txt": {"_target": "Lib/Sorted/Composer/ Work (1990) "},
+                                                            "keep.txt": {"_target": "../escape"}}})");
+    Config cfg;
+    cfg.roots = {{"Lib", lib_root}};
+    cfg.tags_dir = dir / "tags";
+    cfg.cache_dir = dir / "cache";
+    cfg.workers = 0;
+    auto lib = Library::create(std::move(cfg));
+    lib->refresh_placements(true);
+    auto names = [&](const std::string& v) {
+        std::vector<std::string> out;
+        for (auto& ve : lib->list_vdir(v)->entries) out.push_back(ve.e.name);
+        return out;
+    };
+    CHECK((names("") == std::vector<std::string>{"Lib"}));
+    CHECK_MSG((names("Lib") == std::vector<std::string>{"Artist", "Misc", "Sorted"}), "virtual directory created");
+    CHECK_MSG((names("Lib/Artist") == std::vector<std::string>{"Other"}), "moved folder gone from its old place");
+    CHECK((names("Lib/Sorted/Composer") == std::vector<std::string>{" Work (1990) "}));
+    CHECK_MSG((names("Lib/Sorted/Composer/ Work (1990) ") == std::vector<std::string>{"CD1", "cover.jpg", "song.txt"}), "folder, subfolder and file");
+    CHECK((names("Lib/Sorted/Composer/ Work (1990) /CD1") == std::vector<std::string>{"a.txt"}));
+    CHECK_MSG((names("Lib/Misc") == std::vector<std::string>{"keep.txt"}), "invalid target ignored");
+    auto* moved = lib->list_vdir("Lib/Sorted/Composer/ Work (1990) ")->find("song.txt");
+    CHECK_MSG(moved && moved->src_dir == lib_root / "Misc", "edits still go to the source folder");
+    // a file placed next to one with the same name
+    atomic_write(lib_root / "Misc/b.txt", std::string_view("y"));
+    atomic_write(tags / "Misc" / SIDECAR_NAME, R"({"file": {"b.txt": {"_target": "Lib/Artist/Other"}}})");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1600));  // source listings are re-checked after 1.5 s
+    lib->refresh_placements(true);
+    CHECK_MSG((names("Lib/Artist/Other") == std::vector<std::string>{"b (2).txt", "b.txt"}), "name clash numbered");
+    // the whole Artist folder emptied by moves is hidden
+    fs::create_directories(tags / "Artist/Other");
+    atomic_write(tags / "Artist/Other" / SIDECAR_NAME, R"({"_target": "Lib/Sorted/Other"})");
+    atomic_write(tags / "Misc" / SIDECAR_NAME, "{}");
+    lib->refresh_placements(true);
+    CHECK_MSG((names("Lib") == std::vector<std::string>{"Misc", "Sorted"}), "emptied folders hidden");
+    CHECK((names("Lib/Sorted") == std::vector<std::string>{"Composer", "Other"}));
+    fs::remove_all(dir);
+}
+
 TEST(sidecar_pinned_track_names) {
     auto sc = Sidecar::parse(R"({"track": {"3": {"_name": "03 - Old.flac", "TITLE": "New"}, "2-05": {"_name": "x.dsf"}}})");
     CHECK(*sc.track_name(std::nullopt, 3) == "03 - Old.flac");

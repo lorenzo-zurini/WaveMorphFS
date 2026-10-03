@@ -40,7 +40,8 @@ src/
   id3.cpp mp4.cpp  ID3v2.4 writer/reader (DSF + MP3 retag), MP4 ilst rewrite/reader (stco/co64 shift)
   retag.cpp      regular FLAC/MP3/M4A/DSF with sidecar tags (Spliced VFile)
   writeback.cpp  tag edits on the mount: WriteSession overlay, read_file_tags(), tag_changes() diff
-  sidecar.cpp    wavemorph.json (nlohmann ordered_json, // comments allowed, "_name" pins track file names)
+  sidecar.cpp    wavemorph.json (nlohmann ordered_json, // comments allowed, "_name" pins track file names, "_hide", "_target")
+  placement.cpp  the mount tree: "_target" placement index (from the tags tree), virtual directory listings
   tags.cpp       Tags model (case-insensitive keys keeping spelling), synonyms, cue mapping, sanitize_name
   cue.cpp charset.cpp  CUE parsing; charset detection via iconv + script/language scoring (no chardetng)
   cache.cpp      on-disk index cache names = md5(path\nsize\nmtime\nextra)[:16]
@@ -84,8 +85,12 @@ file, mtime, tag_section/tag_key/tag_ext for edit routing).
   you get deadlocks. Pools are never destroyed (destroying a condvar with waiters
   blocks exit).
 - **FUSE**: 1 MiB max_write/readahead, `auto_cache`, attr/entry TTL 1 s,
-  direct_io for write sessions. Path resolution: intermediate components are real
-  dirs; only the last needs the parent's listing.
+  direct_io for write sessions. Path resolution goes through mount-directory
+  listings (`Library::list_vdir`, placement.cpp): a mount path need not match a
+  source path because sidecar `"_target"`s (read from the tags tree only, so the
+  whole tree is known without listing sources) move folders and files. File nodes
+  carry their real source folder, so edits go to the right sidecar. With no
+  targets the tree is identical to the source tree (verify that when touching it).
 
 ## Build / test
 

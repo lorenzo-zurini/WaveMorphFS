@@ -328,6 +328,7 @@ int main(int argc, char** argv) {
             if (cli.pos.size() != 1) usage_error("mount needs a mountpoint");
             auto lib = library(cli, cli.workers);
             lib->start_workers();
+            lib->refresh_placements(true);  // the tree is complete from the first request
             lib->start_prescan(std::chrono::seconds(cli.prescan));
             return mount_fs(lib, {cli.pos[0], cli.threads, cli.allow_other});
         }

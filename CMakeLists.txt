@@ -38,6 +38,7 @@ add_library(wmcore STATIC
   src/sidecar.cpp
   src/writeback.cpp
   src/library.cpp
+  src/placement.cpp
   src/fs.cpp
 )
 target_include_directories(wmcore PUBLIC src)

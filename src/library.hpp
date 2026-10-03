@@ -78,6 +78,38 @@ struct Listing {
     const Entry* find(std::string_view name) const;
 };
 
+/// An entry of a mount directory: a source folder's entry, possibly placed here
+/// from elsewhere by a sidecar "_target".
+struct VEntry {
+    Entry e;           // directories: e.dir = the source folder behind it (empty if purely virtual)
+    fs::path src_dir;  // files: the source folder they belong to (tag edits are stored there)
+};
+
+/// A directory of the mount: the source folders placed at its path (by default
+/// the folder at the same path under a root) plus what "_target" moves here.
+struct VListing {
+    std::vector<VEntry> entries;
+    int64_t mtime = 0;
+    Clock::time_point built;
+    uint64_t version = 0;  // placement index it was built from
+    const VEntry* find(std::string_view name) const;
+};
+
+/// Where sidecar "_target"s place things (read from the tags tree).
+struct Placements {
+    uint64_t version = 0;
+    std::map<fs::path, std::string> folder;                  // source folder -> its directory in the mount
+    std::multimap<std::string, fs::path> folder_by_target;   // and back
+    struct EntryTargets {
+        std::map<std::string, std::string> tracks, files;    // canonical track key / file name -> directory
+        bool operator==(const EntryTargets&) const = default;
+    };
+    std::map<fs::path, EntryTargets> entries;                // source folder -> its files placed elsewhere
+    std::map<std::string, std::set<fs::path>> entries_by_target;
+    std::set<std::string> targets;                           // every target directory
+    std::set<std::string> sources;                           // source folders with any placement (as strings)
+};
+
 /// A processed image: a FLAC image (split by copying frames) or a decoded one
 /// (tracks encoded on the fly), plus the source's own tags.
 struct ReadyImage {
@@ -108,6 +140,10 @@ public:
     void start_prescan(std::chrono::seconds every);
     /// Entries for a source directory (cached; rebuilt when anything relevant changes).
     std::shared_ptr<const Listing> list_dir(const fs::path& dir);
+    /// A directory of the mount by its path ("" = the mount root, "Music/Artist").
+    std::shared_ptr<const VListing> list_vdir(const std::string& vpath);
+    /// Re-read "_target"s from the tags tree (rate-limited unless forced).
+    void refresh_placements(bool force = false);
     /// Root this source path belongs to and the path relative to it.
     std::optional<std::pair<const Root*, fs::path>> root_of(const fs::path& p) const;
     std::optional<fs::path> overlay_dir(const fs::path& dir) const;
@@ -154,6 +190,17 @@ private:
                                     size_t ndiscs, const Sidecar* sidecar, int64_t mtime);
     std::vector<Entry> sacd_tracks(const std::shared_ptr<const SacdDisc>& disc, std::optional<uint32_t> disc_no, size_t ndiscs, const Sidecar* sidecar,
                                    int64_t mtime, bool mc);
+
+    std::optional<std::string> vpath_of(const Placements& p, const fs::path& dir) const;
+    std::optional<std::string> entry_target(const Placements& p, const fs::path& dir, const Entry& e) const;
+    std::shared_ptr<VListing> build_vlisting(const std::string& vpath, const std::shared_ptr<const Placements>& p);
+
+    std::mutex place_mu_;  // guards the placement state below
+    std::shared_ptr<const Placements> placements_ = std::make_shared<Placements>();
+    std::map<fs::path, std::pair<int64_t, std::shared_ptr<const Sidecar>>> placement_files_;  // tags-tree sidecars with targets
+    std::optional<Clock::time_point> placements_checked_;
+    std::map<std::string, int64_t> vbumps_;  // mount directories whose contents moved, and when
+    std::map<std::string, std::shared_ptr<VListing>> vlistings_;
 
     std::mutex edit_mu_;     // serializes sidecar writes
     mutable std::mutex mu_;  // guards the maps below
