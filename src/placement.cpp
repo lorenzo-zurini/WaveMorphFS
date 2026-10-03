@@ -66,7 +66,7 @@ void Library::refresh_placements(bool force) {
     g.unlock();
 
     // sidecars of the tags tree: <tags>/<root name>/<relative dir>/wavemorph.json
-    std::map<fs::path, std::pair<int64_t, std::shared_ptr<const Sidecar>>> files;
+    std::map<fs::path, std::pair<int64_t, std::shared_ptr<const SidecarTargets>>> files;
     for (auto& r : cfg.roots) {
         fs::path base = cfg.tags_dir / r.name;
         std::error_code ec;
@@ -82,32 +82,35 @@ void Library::refresh_placements(bool force) {
                 files[src] = o->second;
                 continue;
             }
-            std::shared_ptr<const Sidecar> sc;
-            if (auto text = try_read_text(it->path())) {
+            // keep only the targets: most sidecars have none, and their tags are large
+            std::shared_ptr<const SidecarTargets> st;
+            if (auto text = try_read_text(it->path()); text && text->find("_target") != std::string::npos) {
                 try {
-                    sc = std::make_shared<const Sidecar>(Sidecar::parse(*text));
+                    Sidecar sc = Sidecar::parse(*text);
+                    if (sc.target || !sc.track_targets.empty() || !sc.file_targets.empty())
+                        st = std::make_shared<const SidecarTargets>(SidecarTargets{sc.target, sc.track_targets, sc.file_targets});
                 } catch (const std::exception& e) {
                     // the folder's listing reports the parse error
                 }
             }
-            files[src] = {*m, sc};
+            files[src] = {*m, st};
         }
     }
 
     auto p = std::make_shared<Placements>();
     for (auto& [src, ms] : files) {
-        auto& sc = ms.second;
-        if (!sc) continue;
-        if (sc->target) {
-            p->folder[src] = *sc->target;
-            p->folder_by_target.emplace(*sc->target, src);
-            p->targets.insert(*sc->target);
+        auto& st = ms.second;
+        if (!st) continue;
+        if (st->folder) {
+            p->folder[src] = *st->folder;
+            p->folder_by_target.emplace(*st->folder, src);
+            p->targets.insert(*st->folder);
             p->sources.insert(src.string());
         }
-        if (!sc->track_targets.empty() || !sc->file_targets.empty()) {
+        if (!st->tracks.empty() || !st->files.empty()) {
             auto& et = p->entries[src];
-            et.tracks = sc->track_targets;
-            et.files = sc->file_targets;
+            et.tracks = st->tracks;
+            et.files = st->files;
             for (auto* m : {&et.tracks, &et.files})
                 for (auto& [k, t] : *m) {
                     p->entries_by_target[t].insert(src);
@@ -160,6 +163,11 @@ std::shared_ptr<const VListing> Library::list_vdir(const std::string& vpath) {
     auto l = build_vlisting(vpath, p);
     std::lock_guard g(place_mu_);
     vlistings_[vpath] = l;
+    // listings are reused briefly (lookups of one directory come in bursts), not kept
+    if (++vlist_inserts_ % 256 == 0) {
+        auto now = Clock::now();
+        std::erase_if(vlistings_, [&](auto& kv) { return now - kv.second->built > 4 * VLIST_RECHECK; });
+    }
     return l;
 }
 
