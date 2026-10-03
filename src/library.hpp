@@ -197,7 +197,13 @@ private:
 
     std::mutex place_mu_;  // guards the placement state below
     std::shared_ptr<const Placements> placements_ = std::make_shared<Placements>();
-    std::map<fs::path, std::pair<int64_t, std::shared_ptr<const Sidecar>>> placement_files_;  // tags-tree sidecars with targets
+    struct SidecarTargets {  // just the "_target"s of a tags-tree sidecar
+        std::optional<std::string> folder;
+        std::map<std::string, std::string> tracks, files;
+    };
+    // tags-tree sidecars by source folder: mtime, and their targets (null: none)
+    std::map<fs::path, std::pair<int64_t, std::shared_ptr<const SidecarTargets>>> placement_files_;
+    size_t vlist_inserts_ = 0;
     std::optional<Clock::time_point> placements_checked_;
     std::map<std::string, int64_t> vbumps_;  // mount directories whose contents moved, and when
     std::map<std::string, std::shared_ptr<VListing>> vlistings_;
