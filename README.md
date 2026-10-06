@@ -114,10 +114,18 @@ services:
     container_name: wavemorphfs
     devices:
       - /dev/fuse
+    # only what mounting needs: SYS_ADMIN for the FUSE mount (made by the
+    # setuid fusermount3), SETUID/SETGID to switch to PUID/PGID; the
+    # filesystem itself runs with no capabilities at all
+    cap_drop:
+      - ALL
     cap_add:
       - SYS_ADMIN
+      - SETUID
+      - SETGID
     security_opt:
-      - apparmor:unconfined       # AppArmor blocks FUSE mounts in containers
+      # Docker's default profile, plus the FUSE mount (see notes below)
+      - apparmor=wavemorphfs
     environment:
       # the user the filesystem runs as: owner of wavemorph/, able to read the music
       - PUID=1000
@@ -208,6 +216,16 @@ Notes:
 
 * The host directory holding `wavemorph/` must be on a shared mount for `rshared`
   to work (the default on systemd hosts; otherwise `mount --make-rshared /`).
+* `apparmor=wavemorphfs` is the profile in
+  [`docker/apparmor-wavemorphfs`](docker/apparmor-wavemorphfs): Docker's default
+  profile, which denies all mounts, with only WaveMorphFS's FUSE mount allowed.
+  On an AppArmor host (Debian, Ubuntu, …) load it once before starting:
+  `sudo cp docker/apparmor-wavemorphfs /etc/apparmor.d/wavemorphfs && sudo
+  apparmor_parser -r -W /etc/apparmor.d/wavemorphfs` (Docker refuses to start the
+  container until it is loaded). Hosts without AppArmor ignore the option.
+  `apparmor:unconfined` also works but drops all of Docker's AppArmor protection.
+* `security_opt: no-new-privileges` can't be used: the mount is made by the
+  setuid `fusermount3`, which that option disables.
 * The container starts as root only to switch to `PUID`/`PGID`. Running it with
   compose's `user:` instead works for uid 1000 only (`fusermount3` needs a passwd
   entry for the user it runs as).
