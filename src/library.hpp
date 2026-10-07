@@ -194,6 +194,7 @@ private:
     /// Sidecar "_cover"s resolved while building one listing (loaded once each).
     struct CoverSet {
         const fs::path& covers_dir;
+        const fs::path& cache_dir;  // scaled-down copies of large images
         std::map<std::string, std::optional<Cover>> loaded;
         std::vector<std::pair<fs::path, std::optional<int64_t>>> used;  // for Listing::covers
         const Cover* get(const std::string* spec);

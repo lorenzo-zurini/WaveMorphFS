@@ -1,7 +1,7 @@
 # WaveMorphFS: build, then a slim runtime with the tools it shells out to
 FROM debian:trixie AS build
 RUN apt-get update \
- && apt-get install -y --no-install-recommends g++ cmake ninja-build pkg-config libfuse3-dev libflac-dev nlohmann-json3-dev libavformat-dev libavcodec-dev libavutil-dev flac ffmpeg \
+ && apt-get install -y --no-install-recommends g++ cmake ninja-build pkg-config libfuse3-dev libflac-dev nlohmann-json3-dev libavformat-dev libavcodec-dev libavutil-dev libswscale-dev flac ffmpeg \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .

@@ -393,6 +393,21 @@ TEST(sidecar_cover_embedded_by_reference) {
     CHECK(s && s->file->describe().starts_with("retagged-flac:"));
     auto ps = flac_pictures(*s->file);
     CHECK_MSG(ps.size() == 1 && ps[0].second == jpg, "the file's own picture is replaced");
+    // a large image is scaled to COVER_EDGE (once, as JPEG) before it is embedded
+    ok(run({"ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=3000x2000", "-frames:v", "1", (covers / "big.png").string()}));
+    auto big = [&] {
+        auto c = prepare_cover(covers / "big.png", dir / "cache");
+        CHECK(c.has_value());
+        return c ? *try_read_file(*c->path) : Bytes{};
+    };
+    Bytes scaled = big();
+    fs::path tmp = dir / "scaled.jpg";
+    atomic_write(tmp, scaled);
+    auto probe = load_cover(tmp);
+    CHECK_MSG(probe && probe->mime == "image/jpeg" && probe->width == COVER_EDGE && probe->height == 682, "scaled to {}x{}",
+              probe ? probe->width : 0, probe ? probe->height : 0);
+    fs::remove_all(dir / "cache" / "covers");
+    CHECK_MSG(big() == scaled, "scaling is deterministic");
     fs::remove_all(dir);
 }
 
