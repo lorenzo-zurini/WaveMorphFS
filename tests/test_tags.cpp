@@ -286,6 +286,39 @@ TEST(targets_place_folders_and_files) {
     fs::remove_all(dir);
 }
 
+TEST(standalone_wavpack_served_as_flac) {
+    fs::path dir = fs::temp_directory_path() / std::format("wm-loose-{}", ::getpid());
+    fs::path src = dir / "lib" / "Album";
+    fs::create_directories(src);
+    fs::create_directories(dir / "tags" / "Lib" / "Album");
+    fs::path wv = src / "1-01 Sonata - Allegro.wv";
+    auto st = run({"ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=f=330:d=3", "-ac", "2", "-ar", "44100", "-sample_fmt", "s16p", "-c:a", "wavpack",
+                   "-metadata", "title=Allegro", "-metadata", "artist=Someone", wv.string()});
+    CHECK_MSG(st.ok(), "ffmpeg: {}", st.err);
+    fs::last_write_time(wv, fs::file_time_type::clock::now() - std::chrono::hours(1));  // not "still being written"
+    atomic_write(dir / "tags" / "Lib" / "Album" / SIDECAR_NAME, R"({"file": {"1-01 Sonata - Allegro.flac": {"TITLE": "I. Allegro", "artist": ""}}})");
+    Config cfg;
+    cfg.roots = {{"Lib", dir / "lib"}};
+    cfg.tags_dir = dir / "tags";
+    cfg.cache_dir = dir / "cache";
+    cfg.workers = 0;
+    auto lib = Library::create(std::move(cfg));
+    auto l = lib->list_dir(src);
+    CHECK_MSG(l->entries.size() == 1 && l->entries[0].name == "1-01 Sonata - Allegro.flac", "served as FLAC, source hidden");
+    auto& e = l->entries[0];
+    CHECK(e.tag_section == "file" && e.tag_key == "1-01 Sonata - Allegro.flac" && e.tag_ext == "flac");
+    CHECK(e.file->describe().starts_with("flac-encoded:"));
+    fs::path out = dir / "out.flac";
+    atomic_write(out, e.file->read_at(0, size_t(e.file->size())));
+    CHECK(run({"flac", "-t", "-s", out.string()}).ok());
+    auto pcm = [](const fs::path& p) { return run({"ffmpeg", "-v", "error", "-i", p.string(), "-f", "s16le", "-"}).out; };
+    CHECK_MSG(pcm(out) == pcm(wv), "same samples");
+    auto tags = read_file_tags("flac", [&](uint64_t off, size_t len) { return e.file->read_at(off, len); }, e.file->size());
+    CHECK(tags.get("TITLE") && *tags.get("TITLE") == "I. Allegro");
+    CHECK_MSG(tags.get("ARTIST") == nullptr, "source tag removed by the sidecar");
+    fs::remove_all(dir);
+}
+
 TEST(sidecar_pinned_track_names) {
     auto sc = Sidecar::parse(R"({"track": {"3": {"_name": "03 - Old.flac", "TITLE": "New"}, "2-05": {"_name": "x.dsf"}}})");
     CHECK(*sc.track_name(std::nullopt, 3) == "03 - Old.flac");
