@@ -330,8 +330,10 @@ folders, e.g. by work):
 * At the top level or in `"album"` it applies to every track of the folder; in a
   `track` or `file` entry it overrides that one.
 * Paths are absolute or relative to `--covers-dir` (env `WAVEMORPH_COVERS_DIR`).
-  JPEG and PNG up to 2 MB; a missing or unusable image is logged and the track
-  keeps its own pictures.
+  JPEG or PNG; images larger than 1024 px on the long edge or 2 MB are scaled
+  down to 1024 px once (a JPEG kept in the cache directory), so full-resolution
+  artwork can be referenced directly. A missing or unusable image is logged and
+  the track keeps its own pictures.
 * FLAC (split, encoded and retagged) gets a PICTURE block, DSF and MP3 an APIC
   frame; M4A files are not changed. The image is read from its file whenever a
   player reads that part of a track, so it costs no memory per track. Replacing

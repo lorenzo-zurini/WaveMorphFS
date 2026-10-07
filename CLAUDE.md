@@ -41,7 +41,7 @@ src/
   retag.cpp      regular FLAC/MP3/M4A/DSF with sidecar tags (Spliced VFile)
   writeback.cpp  tag edits on the mount: WriteSession overlay, read_file_tags(), tag_changes() diff
   sidecar.cpp    wavemorph.json (nlohmann ordered_json, // comments allowed, "_name" pins track file names, "_hide", "_target", "_cover")
-  cover.cpp      "_cover" images: probe (JPEG/PNG, 2 MB cap), FLAC PICTURE / ID3 APIC bodies referencing the image file (FileRange)
+  cover.cpp      "_cover" images: probe, scale >1024 px / >2 MB to a cached JPEG (libswscale), FLAC PICTURE / ID3 APIC bodies referencing the file (FileRange)
   placement.cpp  the mount tree: "_target" placement index (from the tags tree), virtual directory listings
   tags.cpp       Tags model (case-insensitive keys keeping spelling), synonyms, cue mapping, sanitize_name
   cue.cpp charset.cpp  CUE parsing; charset detection via iconv + script/language scoring (no chardetng)

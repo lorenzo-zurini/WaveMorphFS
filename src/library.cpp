@@ -552,7 +552,7 @@ std::shared_ptr<Listing> Library::build_listing(const fs::path& dir, const Sig& 
     }
     std::optional<int64_t> sidecar_mtime = sidecar ? sidecar->mtime : std::nullopt;
     const Sidecar* sc = sidecar ? &*sidecar : nullptr;
-    CoverSet covers{cfg.covers_dir, {}, {}};
+    CoverSet covers{cfg.covers_dir, cfg.cache_dir, {}, {}};
     std::set<std::string> hidden;
     std::vector<Entry> virtuals;
     std::optional<Clock::time_point> retry_at;
@@ -820,7 +820,7 @@ const Cover* Library::CoverSet::get(const std::string* spec) {
             p = covers_dir / p;
         }
         used.emplace_back(p, mtime_ns(p));
-        it = loaded.emplace(*spec, load_cover(p)).first;  // a missing or bad image keeps the original pictures
+        it = loaded.emplace(*spec, prepare_cover(p, cache_dir)).first;  // a missing or bad image keeps the original pictures
     }
     return it->second ? &*it->second : nullptr;
 }

@@ -11,7 +11,7 @@ endif()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(FUSE3 REQUIRED IMPORTED_TARGET fuse3)
 pkg_check_modules(FLAC REQUIRED IMPORTED_TARGET flac)
-pkg_check_modules(LIBAV REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil)
+pkg_check_modules(LIBAV REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale)
 find_package(nlohmann_json 3.10 REQUIRED)
 find_package(Threads REQUIRED)
 
