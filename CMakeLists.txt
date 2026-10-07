@@ -39,6 +39,7 @@ add_library(wmcore STATIC
   src/writeback.cpp
   src/library.cpp
   src/placement.cpp
+  src/cover.cpp
   src/fs.cpp
 )
 target_include_directories(wmcore PUBLIC src)

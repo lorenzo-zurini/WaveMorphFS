@@ -301,10 +301,12 @@ std::vector<Seg> header_segments(const std::array<uint8_t, 34>& si, const std::v
     append(head, si);
     out.emplace_back(std::move(head));
     for (size_t i = 0; i < blocks.size(); i++) {
+        uint64_t len = 0;
+        for (auto& s : blocks[i].body) len += seg_size(s);
         Bytes h;
-        block_header(h, blocks[i].kind, seg_size(blocks[i].body), i + 1 == blocks.size());
+        block_header(h, blocks[i].kind, len, i + 1 == blocks.size());
         out.emplace_back(std::move(h));
-        out.push_back(blocks[i].body);
+        out.insert(out.end(), blocks[i].body.begin(), blocks[i].body.end());
     }
     return out;
 }

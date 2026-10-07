@@ -96,7 +96,9 @@ Bytes build_header(const std::array<uint8_t, 34>& si, const std::vector<MetaBloc
 /// (e.g. a picture, by MetaBlock::offset) or zeros (padding).
 struct HeaderBlock {
     uint8_t kind = 0;
-    Seg body;
+    std::vector<Seg> body;
+    HeaderBlock(uint8_t k, Seg s) : kind(k), body{std::move(s)} {}
+    HeaderBlock(uint8_t k, std::vector<Seg> b) : kind(k), body(std::move(b)) {}
 };
 /// The same bytes as build_header, as segments.
 std::vector<Seg> header_segments(const std::array<uint8_t, 34>& si, const std::vector<HeaderBlock>& blocks);

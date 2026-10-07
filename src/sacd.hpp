@@ -15,6 +15,7 @@
 #include <mutex>
 #include <optional>
 
+#include "cover.hpp"
 #include "tags.hpp"
 #include "vfile.hpp"
 
@@ -99,7 +100,8 @@ private:
 /// One SACD track as a DSF file.
 class DsfTrack : public VFile {
 public:
-    DsfTrack(std::shared_ptr<const SacdDisc> disc, size_t track, const Tags& tags);
+    /// With `cover`, the ID3 tag carries it as the front cover.
+    DsfTrack(std::shared_ptr<const SacdDisc> disc, size_t track, const Tags& tags, const Cover* cover = nullptr);
     uint64_t size() const override { return header_.size() + data_len_ + id3_.size(); }
     Bytes read_at(uint64_t off, size_t len) const override;
     std::string describe() const override;
@@ -110,7 +112,7 @@ private:
     uint64_t f0_, bytes_per_ch_;
     Bytes header_;
     uint64_t data_len_;
-    Bytes id3_;
+    Segments id3_;
 };
 
 }  // namespace wm

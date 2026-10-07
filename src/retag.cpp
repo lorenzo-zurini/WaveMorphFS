@@ -9,7 +9,7 @@
 
 namespace wm {
 
-std::shared_ptr<Spliced> retag_file(const fs::path& p, const std::string& ext, const Tags& overlay) {
+std::shared_ptr<Spliced> retag_file(const fs::path& p, const std::string& ext, const Tags& overlay, const Cover* cover) {
     uint64_t len = File(p).size();
     if (ext == "flac") {
         auto meta = flac::FlacMeta::read(p);
@@ -19,7 +19,8 @@ std::shared_ptr<Spliced> retag_file(const fs::path& p, const std::string& ext, c
         // keep every other block (SEEKTABLE offsets are relative to the first frame, so
         // still valid), read from the source rather than held: pictures can be large
         for (auto& b : meta.blocks)
-            if (b.kind != flac::BLOCK_VORBIS) blocks.push_back({b.kind, SrcRange{b.offset, b.data.size()}});
+            if (b.kind != flac::BLOCK_VORBIS && !(cover && b.kind == flac::BLOCK_PICTURE)) blocks.push_back({b.kind, SrcRange{b.offset, b.data.size()}});
+        if (cover) blocks.push_back({flac::BLOCK_PICTURE, flac_picture(*cover)});
         blocks.push_back({flac::BLOCK_PADDING, Zeros{flac::EDIT_PADDING}});
         // min/max frame size fields are informational; keep them unknown rather than re-derive
         auto segs = flac::header_segments(meta.streaminfo.encode(0, 0), blocks);
@@ -27,8 +28,9 @@ std::shared_ptr<Spliced> retag_file(const fs::path& p, const std::string& ext, c
         return std::make_shared<Spliced>(p, "retagged-flac", std::move(segs));
     }
     if (ext == "mp3") {
-        auto [tag, start] = id3::retag_mp3(p, overlay);
-        return std::make_shared<Spliced>(p, "retagged-mp3", std::vector<Seg>{std::move(tag), SrcRange{start, len - start}});
+        auto [segs, start] = id3::retag_at(File(p), 0, overlay, cover);
+        segs.push_back(SrcRange{start, len - start});
+        return std::make_shared<Spliced>(p, "retagged-mp3", std::move(segs));
     }
     if (ext == "m4a") {
         auto r = mp4::retag_m4a(p, overlay);
@@ -53,11 +55,15 @@ std::shared_ptr<Spliced> retag_file(const fs::path& p, const std::string& ext, c
         uint64_t audio_end = data_pos + le64(data + 4);
         WM_ENSURE(audio_end <= len, "data chunk runs past the end of the file");
         uint64_t meta = le64(h + 20);
-        Bytes tag = id3::retag_at(f, meta ? meta : audio_end, overlay).first;
+        auto tag = id3::retag_at(f, meta ? meta : audio_end, overlay, cover).first;
+        uint64_t tag_len = 0;
+        for (auto& s : tag) tag_len += seg_size(s);
         Bytes dsd(h, h + 12);
-        put_le64(dsd, audio_end + tag.size());
+        put_le64(dsd, audio_end + tag_len);
         put_le64(dsd, audio_end);
-        return std::make_shared<Spliced>(p, "retagged-dsf", std::vector<Seg>{std::move(dsd), SrcRange{28, audio_end - 28}, std::move(tag)});
+        std::vector<Seg> segs = {std::move(dsd), SrcRange{28, audio_end - 28}};
+        segs.insert(segs.end(), tag.begin(), tag.end());
+        return std::make_shared<Spliced>(p, "retagged-dsf", std::move(segs));
     }
     fail("cannot retag .{} files", ext);
 }

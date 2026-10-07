@@ -314,6 +314,29 @@ file:
   effect within a few seconds. Tag edits of moved files still go to their own
   folder's sidecar.
 
+### Cover art
+
+`"_cover"` embeds an image as the front cover of tracks, replacing their own
+pictures (useful when a music server groups tracks into albums that span many
+folders, e.g. by work):
+
+```json
+{
+  "album": {"_cover": "Sibelius/Symphony 5.jpg"},
+  "track": {"7": {"_cover": "/srv/covers/Finlandia.jpg"}}
+}
+```
+
+* At the top level or in `"album"` it applies to every track of the folder; in a
+  `track` or `file` entry it overrides that one.
+* Paths are absolute or relative to `--covers-dir` (env `WAVEMORPH_COVERS_DIR`).
+  JPEG and PNG up to 2 MB; a missing or unusable image is logged and the track
+  keeps its own pictures.
+* FLAC (split, encoded and retagged) gets a PICTURE block, DSF and MP3 an APIC
+  frame; M4A files are not changed. The image is read from its file whenever a
+  player reads that part of a track, so it costs no memory per track. Replacing
+  the image file updates the tracks (and their mtime) within seconds.
+
 ### Editing tags on the mount
 
 FLAC, DSF, MP3 and M4A files on the mount can be edited in place with any tag
