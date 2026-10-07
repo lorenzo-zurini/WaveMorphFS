@@ -188,6 +188,11 @@ private:
     /// nullopt while the tracks are still being measured
     std::optional<std::vector<Entry>> image_tracks(const fs::path& dir, const CueSheet& cue, const ReadyImage& ready, std::optional<uint32_t> disc, bool multi,
                                     size_t ndiscs, const Sidecar* sidecar, int64_t mtime);
+    /// A standalone APE/WavPack/... file as one FLAC track ("<stem>.flac", edits go to
+    /// file."<stem>.flac"); nullopt while being measured.
+    std::optional<Entry> standalone_track(const fs::path& dir, const std::string& src_name, const ReadyImage& ready, const Sidecar* sidecar, int64_t mt);
+    /// Encoded-track layouts of `ranges` of a decoded image; nullopt while being measured.
+    std::optional<std::vector<TrackLayout>> track_layouts(const std::shared_ptr<const AvImage>& av, const Ranges& ranges, const fs::path& dir);
     std::vector<Entry> sacd_tracks(const std::shared_ptr<const SacdDisc>& disc, std::optional<uint32_t> disc_no, size_t ndiscs, const Sidecar* sidecar,
                                    int64_t mtime, bool mc);
 

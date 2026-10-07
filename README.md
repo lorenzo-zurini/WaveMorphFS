@@ -11,6 +11,7 @@ is duplicated.
 | `Album.cue` + `Album.ape` / `.wv` / `.wav` | same, encoded to FLAC on the fly from the decoded image |
 | `Disc.iso` (SACD, plain DSD **or DST**)    | `01 - Title.dsf`, `02 - Title.dsf`, …                  |
 | `*.flac`, `*.mp3`, `*.m4a`, `*.dsf`        | the same file with sidecar tags applied                |
+| `Track.ape` / `.wv` / `.tta` / `.tak`      | `Track.flac`, encoded on the fly (sidecar tags apply)  |
 | any other file                             | passed through untouched                               |
 | incomplete files (`*.parts`), dotfiles     | hidden                                                 |
 

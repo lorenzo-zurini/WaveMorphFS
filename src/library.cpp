@@ -691,6 +691,26 @@ std::shared_ptr<Listing> Library::build_listing(const fs::path& dir, const Sig& 
         }
         if (is_cover_name(n.name)) has_cover = true;
         std::string ext = ext_lower(n.name);
+        // standalone tracks in formats players and taggers handle poorly: served
+        // as FLAC encoded on the fly, like the tracks of such images
+        if (ext == "ape" || ext == "wv" || ext == "tta" || ext == "tak") {
+            if (incomplete(n.name)) continue;
+            auto st = image_state(p, dir);
+            if (st.st == Work<ReadyImage>::Pending) continue;
+            if (st.st == Work<ReadyImage>::Settling) {
+                note_settle(st.until);
+                continue;
+            }
+            if (st.st == Work<ReadyImage>::Ready && st.ready->av) {
+                try {
+                    if (auto e = standalone_track(dir, n.name, *st.ready, sc, max_mtime({n.mtime, sidecar_mtime}))) virtuals.push_back(std::move(*e));
+                    continue;  // shown once measured
+                } catch (const std::exception& e) {
+                    warn("encoding {}: {}", p.string(), e.what());
+                }
+            }
+            // failed: shown as it is
+        }
         bool taggable = ext == "flac" || ext == "mp3" || ext == "m4a" || ext == "dsf";
         VFilePtr vf;
         if (sc && taggable && (!sc->album.empty() || sc->file(n.name))) {
@@ -758,6 +778,45 @@ std::shared_ptr<Listing> Library::build_listing(const fs::path& dir, const Sig& 
     return l;
 }
 
+std::optional<std::vector<TrackLayout>> Library::track_layouts(const std::shared_ptr<const AvImage>& av, const Ranges& ranges, const fs::path& dir) {
+    if (auto layout = load_layout(*av, ranges, cache)) return layout;
+    bool fresh;
+    {
+        std::lock_guard g(mu_);
+        fresh = encode_queued_.insert(av->path).second;
+    }
+    if (!fresh) return std::nullopt;
+    if (enqueue(EncodeJob{av, ranges, dir})) return std::nullopt;
+    std::optional<std::vector<TrackLayout>> layout;
+    try {
+        layout = build_layout(*av, ranges, &cache);
+    } catch (...) {
+        std::lock_guard g(mu_);
+        encode_queued_.erase(av->path);
+        throw;
+    }
+    std::lock_guard g(mu_);
+    encode_queued_.erase(av->path);
+    return layout;
+}
+
+std::optional<Entry> Library::standalone_track(const fs::path& dir, const std::string& src_name, const ReadyImage& ready, const Sidecar* sidecar,
+                                               int64_t mt) {
+    auto& av = ready.av;
+    Ranges ranges = {{0, av->total}};
+    auto layout = track_layouts(av, ranges, dir);
+    if (!layout) return std::nullopt;
+    std::string name = stem_of(src_name) + ".flac";
+    Tags tg = ready.source_tags;
+    if (sidecar) {
+        tg.overlay(sidecar->album);
+        if (auto f = sidecar->file(name)) tg.overlay(*f);
+    }
+    auto k = SrcKey::of(av->path);
+    mt = std::max({mt, mtime_ns(cache.av_index_path(av->path, k)).value_or(0), mtime_ns(layout_path(*av, ranges, cache)).value_or(0), OUTPUT_EPOCH_NS});
+    return Entry{name, false, {}, std::make_shared<EncodedTrack>(av, 0, av->total, tg, (*layout)[0]), mt, "file", name, "flac"};
+}
+
 std::optional<std::vector<Entry>> Library::image_tracks(const fs::path& dir, const CueSheet& cue, const ReadyImage& ready,
                                                         std::optional<uint32_t> disc, bool multi, size_t ndiscs, const Sidecar* sidecar, int64_t mt) {
     auto& img = ready.flac;
@@ -775,25 +834,8 @@ std::optional<std::vector<Entry>> Library::image_tracks(const fs::path& dir, con
     }
     std::optional<std::vector<TrackLayout>> layout;
     if (ready.av) {
-        layout = load_layout(*ready.av, ranges, cache);
-        if (!layout) {
-            bool fresh;
-            {
-                std::lock_guard g(mu_);
-                fresh = encode_queued_.insert(ready.av->path).second;
-            }
-            if (!fresh) return std::nullopt;
-            if (enqueue(EncodeJob{ready.av, ranges, dir})) return std::nullopt;
-            try {
-                layout = build_layout(*ready.av, ranges, &cache);
-            } catch (...) {
-                std::lock_guard g(mu_);
-                encode_queued_.erase(ready.av->path);
-                throw;
-            }
-            std::lock_guard g(mu_);
-            encode_queued_.erase(ready.av->path);
-        }
+        layout = track_layouts(ready.av, ranges, dir);
+        if (!layout) return std::nullopt;
     }
     Md5Map md5s = img ? cache.load_md5s(img->path) : Md5Map{};
     bool missing = img && std::any_of(ranges.begin(), ranges.end(), [&](auto& r) { return !md5s.contains(r); });
