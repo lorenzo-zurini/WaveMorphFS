@@ -24,6 +24,7 @@
 #include <variant>
 
 #include "cache.hpp"
+#include "cover.hpp"
 #include "cue.hpp"
 #include "encoded.hpp"
 #include "sacd.hpp"
@@ -43,6 +44,8 @@ struct Root {
 struct Config {
     std::vector<Root> roots;
     fs::path tags_dir, cache_dir;
+    /// where relative sidecar "_cover" paths point (empty: only absolute ones work)
+    fs::path covers_dir;
     size_t workers = 2;
     /// also expose SACD multichannel areas ("MC NN - Title.dsf", album "... (Multichannel)")
     bool sacd_multichannel = false;
@@ -74,6 +77,8 @@ struct Listing {
     mutable Clock::time_point checked;
     /// rebuild after this instant even if nothing changed (files still settling)
     std::optional<Clock::time_point> retry_at;
+    /// cover images used, with their mtime then: the listing is rebuilt when one changes
+    std::vector<std::pair<fs::path, std::optional<int64_t>>> covers;
 
     const Entry* find(std::string_view name) const;
 };
@@ -186,15 +191,23 @@ private:
     Sig signature(const fs::path& dir) const;
     std::shared_ptr<Listing> build_listing(const fs::path& dir, const Sig& sig);
     /// nullopt while the tracks are still being measured
+    /// Sidecar "_cover"s resolved while building one listing (loaded once each).
+    struct CoverSet {
+        const fs::path& covers_dir;
+        std::map<std::string, std::optional<Cover>> loaded;
+        std::vector<std::pair<fs::path, std::optional<int64_t>>> used;  // for Listing::covers
+        const Cover* get(const std::string* spec);
+    };
     std::optional<std::vector<Entry>> image_tracks(const fs::path& dir, const CueSheet& cue, const ReadyImage& ready, std::optional<uint32_t> disc, bool multi,
-                                    size_t ndiscs, const Sidecar* sidecar, int64_t mtime);
+                                    size_t ndiscs, const Sidecar* sidecar, int64_t mtime, CoverSet& covers);
     /// A standalone APE/WavPack/... file as one FLAC track ("<stem>.flac", edits go to
     /// file."<stem>.flac"); nullopt while being measured.
-    std::optional<Entry> standalone_track(const fs::path& dir, const std::string& src_name, const ReadyImage& ready, const Sidecar* sidecar, int64_t mt);
+    std::optional<Entry> standalone_track(const fs::path& dir, const std::string& src_name, const ReadyImage& ready, const Sidecar* sidecar, int64_t mt,
+                                          CoverSet& covers);
     /// Encoded-track layouts of `ranges` of a decoded image; nullopt while being measured.
     std::optional<std::vector<TrackLayout>> track_layouts(const std::shared_ptr<const AvImage>& av, const Ranges& ranges, const fs::path& dir);
     std::vector<Entry> sacd_tracks(const std::shared_ptr<const SacdDisc>& disc, std::optional<uint32_t> disc_no, size_t ndiscs, const Sidecar* sidecar,
-                                   int64_t mtime, bool mc);
+                                   int64_t mtime, bool mc, CoverSet& covers);
 
     std::optional<std::string> vpath_of(const Placements& p, const fs::path& dir) const;
     std::optional<std::string> entry_target(const Placements& p, const fs::path& dir, const Entry& e) const;

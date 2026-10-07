@@ -39,7 +39,9 @@ std::vector<TrackLayout> build_layout(const AvImage& img, const Ranges& ranges, 
 
 class EncodedTrack : public VFile, public Trimmable, public std::enable_shared_from_this<EncodedTrack> {
 public:
-    EncodedTrack(std::shared_ptr<const AvImage> img, uint64_t start, uint64_t end, const Tags& tags, const TrackLayout& layout);
+    /// `pictures`: PICTURE blocks for the header (a sidecar cover).
+    EncodedTrack(std::shared_ptr<const AvImage> img, uint64_t start, uint64_t end, const Tags& tags, const TrackLayout& layout,
+                 const std::vector<flac::HeaderBlock>& pictures = {});
     uint64_t size() const override { return size_; }
     Bytes read_at(uint64_t off, size_t len) const override;
     std::string describe() const override;

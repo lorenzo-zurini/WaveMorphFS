@@ -497,13 +497,13 @@ SacdDisc::Chunk SacdDisc::chunk(uint64_t c) const {
   }
 }
 
-DsfTrack::DsfTrack(std::shared_ptr<const SacdDisc> disc, size_t track, const Tags& tags) : disc_(std::move(disc)) {
+DsfTrack::DsfTrack(std::shared_ptr<const SacdDisc> disc, size_t track, const Tags& tags, const Cover* cover) : disc_(std::move(disc)) {
     const auto& t = disc_->tracks[track];
     uint64_t ch = disc_->channels;
     f0_ = t.start;
     bytes_per_ch_ = (t.end - t.start) * SACD_FRAME_BYTES;
     data_len_ = (bytes_per_ch_ + DSF_BLOCK - 1) / DSF_BLOCK * DSF_BLOCK * ch;
-    id3_ = id3::build(tags);
+    id3_ = Segments(id3::build_segments(tags, cover));
     uint64_t total = 28 + 52 + 12 + data_len_ + id3_.size();
     Bytes& h = header_;
     append(h, std::string_view("DSD "));
@@ -568,7 +568,7 @@ Bytes DsfTrack::read_at(uint64_t off, size_t len) const {
     uint64_t end = off + len, h = header_.size();
     copy_overlap(out, header_, 0, off, len);
     if (off < h + data_len_ && end > h) read_data(std::max(off, h) - h, std::min(end, h + data_len_) - h, out);
-    copy_overlap(out, id3_, h + data_len_, off, len);
+    id3_.read_at_base(disc_->path, h + data_len_, off, len, out);
     WM_ENSURE(out.size() == len, "internal: produced {} of {}", out.size(), len);
     return out;
 }

@@ -6,6 +6,7 @@
 #include <memory>
 
 #include "tags.hpp"
+#include "cover.hpp"
 #include "vfile.hpp"
 
 namespace wm {
@@ -14,6 +15,7 @@ namespace wm {
 /// all other metadata blocks are kept. MP3: new ID3v2.4 tag. M4A: new ilst.
 /// DSF: new ID3v2.4 tag at the end, DSD chunk sizes patched.
 /// `ext` is the lower-case extension ("flac", "mp3", "m4a", "dsf").
-std::shared_ptr<Spliced> retag_file(const fs::path& p, const std::string& ext, const Tags& overlay);
+/// With `cover`, the file's pictures are replaced by it (not for M4A).
+std::shared_ptr<Spliced> retag_file(const fs::path& p, const std::string& ext, const Tags& overlay, const Cover* cover = nullptr);
 
 }  // namespace wm

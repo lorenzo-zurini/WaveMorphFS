@@ -518,7 +518,10 @@ std::shared_ptr<const Listing> Library::list_dir(const fs::path& dir) {
         std::lock_guard g(mu_);
         if (auto it = listings_.find(dir); it != listings_.end()) cached = it->second;
     }
-    if (cached && cached->sig == sig && !(cached->retry_at && Clock::now() >= *cached->retry_at)) {
+    auto covers_unchanged = [](const Listing& l) {
+        return std::all_of(l.covers.begin(), l.covers.end(), [](auto& c) { return mtime_ns(c.first) == c.second; });
+    };
+    if (cached && cached->sig == sig && !(cached->retry_at && Clock::now() >= *cached->retry_at) && covers_unchanged(*cached)) {
         std::lock_guard g(cached->mu);
         cached->checked = Clock::now();
         return cached;
@@ -549,6 +552,7 @@ std::shared_ptr<Listing> Library::build_listing(const fs::path& dir, const Sig& 
     }
     std::optional<int64_t> sidecar_mtime = sidecar ? sidecar->mtime : std::nullopt;
     const Sidecar* sc = sidecar ? &*sidecar : nullptr;
+    CoverSet covers{cfg.covers_dir, {}, {}};
     std::set<std::string> hidden;
     std::vector<Entry> virtuals;
     std::optional<Clock::time_point> retry_at;
@@ -636,7 +640,7 @@ std::shared_ptr<Listing> Library::build_listing(const fs::path& dir, const Sig& 
             if (!disc && multi) disc = uint32_t(gi + 1);
             try {
                 auto v = image_tracks(dir, cue, *st.ready, disc, multi, groups.size(), sc,
-                                      max_mtime({mtime_ns(dir / cue_name), mtime_ns(img_path), sidecar_mtime}));
+                                      max_mtime({mtime_ns(dir / cue_name), mtime_ns(img_path), sidecar_mtime}), covers);
                 hidden.insert(cue_name);
                 hidden.insert(img_name);
                 if (v)
@@ -666,12 +670,12 @@ std::shared_ptr<Listing> Library::build_listing(const fs::path& dir, const Sig& 
         int64_t mt = max_mtime({mtime_ns(p), sidecar_mtime});
         if (auto k = SrcKey::try_of(p)) mt = std::max(mt, mtime_ns(cache.sacd_frames_path(p, *k, false)).value_or(0));
         if (st.st == Work<SacdDisc>::Ready) {
-            for (auto& e : sacd_tracks(st.ready, disc_no, isos.size(), sc, mt, false)) virtuals.push_back(std::move(e));
+            for (auto& e : sacd_tracks(st.ready, disc_no, isos.size(), sc, mt, false, covers)) virtuals.push_back(std::move(e));
             hidden.insert(n);
             if (cfg.sacd_multichannel) {
                 auto mc = sacd_state(p, dir, true);
                 if (mc.st == Work<SacdDisc>::Ready)
-                    for (auto& e : sacd_tracks(mc.ready, disc_no, isos.size(), sc, mt, true)) virtuals.push_back(std::move(e));
+                    for (auto& e : sacd_tracks(mc.ready, disc_no, isos.size(), sc, mt, true, covers)) virtuals.push_back(std::move(e));
             }
         } else if (st.st == Work<SacdDisc>::Pending || st.st == Work<SacdDisc>::Settling) {
             if (st.st == Work<SacdDisc>::Settling) note_settle(st.until);
@@ -703,7 +707,7 @@ std::shared_ptr<Listing> Library::build_listing(const fs::path& dir, const Sig& 
             }
             if (st.st == Work<ReadyImage>::Ready && st.ready->av) {
                 try {
-                    if (auto e = standalone_track(dir, n.name, *st.ready, sc, max_mtime({n.mtime, sidecar_mtime}))) virtuals.push_back(std::move(*e));
+                    if (auto e = standalone_track(dir, n.name, *st.ready, sc, max_mtime({n.mtime, sidecar_mtime}), covers)) virtuals.push_back(std::move(*e));
                     continue;  // shown once measured
                 } catch (const std::exception& e) {
                     warn("encoding {}: {}", p.string(), e.what());
@@ -713,11 +717,12 @@ std::shared_ptr<Listing> Library::build_listing(const fs::path& dir, const Sig& 
         }
         bool taggable = ext == "flac" || ext == "mp3" || ext == "m4a" || ext == "dsf";
         VFilePtr vf;
-        if (sc && taggable && (!sc->album.empty() || sc->file(n.name))) {
+        const Cover* cv = sc && taggable && ext != "m4a" ? covers.get(sc->cover_for(n.name, nullptr)) : nullptr;
+        if (sc && taggable && (!sc->album.empty() || sc->file(n.name) || cv)) {
             Tags ov = sc->album;
             if (auto f = sc->file(n.name)) ov.merge(*f);  // keeps removals for retag_file
             try {
-                vf = retag_file(p, ext, ov);
+                vf = retag_file(p, ext, ov, cv);
             } catch (const std::exception& e) {
                 warn("retag {}: {}", p.string(), e.what());
             }
@@ -725,7 +730,7 @@ std::shared_ptr<Listing> Library::build_listing(const fs::path& dir, const Sig& 
         bool retagged = vf != nullptr;
         if (!vf) vf = std::make_shared<Passthrough>(p, n.size);
         int64_t mt = taggable ? std::max(n.mtime, sidecar_mtime.value_or(n.mtime)) : n.mtime;
-        if (retagged) mt = std::max(mt, OUTPUT_EPOCH_NS);
+        if (retagged) mt = std::max({mt, OUTPUT_EPOCH_NS, cv ? cv->mtime : 0});
         Entry e{n.name, false, {}, vf, mt};
         if (taggable) e.tag_section = "file", e.tag_key = n.name, e.tag_ext = ext;
         entries.push_back(std::move(e));
@@ -774,6 +779,7 @@ std::shared_ptr<Listing> Library::build_listing(const fs::path& dir, const Sig& 
     l->sig = sig;
     l->checked = Clock::now();
     l->retry_at = retry_at;
+    l->covers = std::move(covers.used);
     (void)item;
     return l;
 }
@@ -800,8 +806,27 @@ std::optional<std::vector<TrackLayout>> Library::track_layouts(const std::shared
     return layout;
 }
 
+const Cover* Library::CoverSet::get(const std::string* spec) {
+    if (!spec) return nullptr;
+    auto it = loaded.find(*spec);
+    if (it == loaded.end()) {
+        fs::path p = *spec;
+        if (p.is_relative()) {
+            if (covers_dir.empty()) {
+                warn("cover {}: a relative path needs --covers-dir", *spec);
+                loaded.emplace(*spec, std::nullopt);
+                return nullptr;
+            }
+            p = covers_dir / p;
+        }
+        used.emplace_back(p, mtime_ns(p));
+        it = loaded.emplace(*spec, load_cover(p)).first;  // a missing or bad image keeps the original pictures
+    }
+    return it->second ? &*it->second : nullptr;
+}
+
 std::optional<Entry> Library::standalone_track(const fs::path& dir, const std::string& src_name, const ReadyImage& ready, const Sidecar* sidecar,
-                                               int64_t mt) {
+                                               int64_t mt, CoverSet& covers) {
     auto& av = ready.av;
     Ranges ranges = {{0, av->total}};
     auto layout = track_layouts(av, ranges, dir);
@@ -814,11 +839,17 @@ std::optional<Entry> Library::standalone_track(const fs::path& dir, const std::s
     }
     auto k = SrcKey::of(av->path);
     mt = std::max({mt, mtime_ns(cache.av_index_path(av->path, k)).value_or(0), mtime_ns(layout_path(*av, ranges, cache)).value_or(0), OUTPUT_EPOCH_NS});
-    return Entry{name, false, {}, std::make_shared<EncodedTrack>(av, 0, av->total, tg, (*layout)[0]), mt, "file", name, "flac"};
+    std::vector<flac::HeaderBlock> pictures;
+    if (auto* cv = sidecar ? covers.get(sidecar->cover_for(name, nullptr)) : nullptr) {
+        pictures.push_back({flac::BLOCK_PICTURE, flac_picture(*cv)});
+        mt = std::max(mt, cv->mtime);
+    }
+    return Entry{name, false, {}, std::make_shared<EncodedTrack>(av, 0, av->total, tg, (*layout)[0], pictures), mt, "file", name, "flac"};
 }
 
 std::optional<std::vector<Entry>> Library::image_tracks(const fs::path& dir, const CueSheet& cue, const ReadyImage& ready,
-                                                        std::optional<uint32_t> disc, bool multi, size_t ndiscs, const Sidecar* sidecar, int64_t mt) {
+                                                        std::optional<uint32_t> disc, bool multi, size_t ndiscs, const Sidecar* sidecar, int64_t mt,
+                                                        CoverSet& covers) {
     auto& img = ready.flac;
     uint32_t rate = img ? img->si().sample_rate : ready.av->sample_rate;
     uint64_t total = img ? img->si().total_samples : ready.av->total;
@@ -887,19 +918,24 @@ std::optional<std::vector<Entry>> Library::image_tracks(const fs::path& dir, con
         if (sidecar)
             if (auto ft = sidecar->file(name)) tg.overlay(*ft);
         std::string key = multi && disc ? std::format("{}-{:02}", *disc, t.number) : std::to_string(t.number);
+        // a sidecar cover replaces the image's picture
+        const Cover* cv = sidecar ? covers.get(sidecar->cover_for(name, &key)) : nullptr;
+        std::vector<flac::HeaderBlock> cover_block;
+        if (cv) cover_block.push_back({flac::BLOCK_PICTURE, flac_picture(*cv)});
+        int64_t tmt = cv ? std::max(mt, cv->mtime) : mt;
         if (ready.av) {
-            out.push_back({name, false, {}, std::make_shared<EncodedTrack>(ready.av, s, e, tg, (*layout)[i]), mt, "track", key, "flac"});
+            out.push_back({name, false, {}, std::make_shared<EncodedTrack>(ready.av, s, e, tg, (*layout)[i], cover_block), tmt, "track", key, "flac"});
             continue;
         }
         std::optional<std::array<uint8_t, 16>> md5;
         if (auto it = md5s.find({s, e}); it != md5s.end()) md5 = it->second;
-        out.push_back({name, false, {}, std::make_shared<FlacTrack>(img, s, e, tg, ready.pictures, md5), mt, "track", key, "flac"});
+        out.push_back({name, false, {}, std::make_shared<FlacTrack>(img, s, e, tg, cv ? cover_block : ready.pictures, md5), tmt, "track", key, "flac"});
     }
     return out;
 }
 
 std::vector<Entry> Library::sacd_tracks(const std::shared_ptr<const SacdDisc>& disc, std::optional<uint32_t> disc_no, size_t ndiscs,
-                                        const Sidecar* sidecar, int64_t mt, bool mc) {
+                                        const Sidecar* sidecar, int64_t mt, bool mc, CoverSet& covers) {
     size_t n = disc->tracks.size();
     mt = std::max(mt, OUTPUT_EPOCH_NS);
     std::vector<Entry> out;
@@ -931,7 +967,8 @@ std::vector<Entry> Library::sacd_tracks(const std::shared_ptr<const SacdDisc>& d
         if (sidecar)
             if (auto ft = sidecar->file(name)) tg.overlay(*ft);
         std::string key = disc_no ? std::format("{}-{:02}", *disc_no, num) : std::to_string(num);
-        out.push_back({name, false, {}, std::make_shared<DsfTrack>(disc, i, tg), mt, "track", key, "dsf"});
+        const Cover* cv = sidecar ? covers.get(sidecar->cover_for(name, &key)) : nullptr;
+        out.push_back({name, false, {}, std::make_shared<DsfTrack>(disc, i, tg, cv), cv ? std::max(mt, cv->mtime) : mt, "track", key, "dsf"});
     }
     return out;
 }

@@ -10,6 +10,7 @@
 
 #include <utility>
 
+#include "cover.hpp"
 #include "tags.hpp"
 #include "util.hpp"
 
@@ -24,6 +25,11 @@ std::pair<Bytes, uint64_t> retag_mp3(const fs::path& p, const Tags& overlay);
 /// The ID3v2 tag of `f` at `pos` (none if no tag starts there) with `overlay`
 /// applied, and the length of the source tag.
 std::pair<Bytes, uint64_t> retag_at(const File& f, uint64_t pos, const Tags& overlay);
+/// The same as segments; with `cover`, the source's pictures are replaced by it
+/// (a front-cover APIC frame whose image is read from the cover file).
+std::pair<std::vector<Seg>, uint64_t> retag_at(const File& f, uint64_t pos, const Tags& overlay, const Cover* cover);
+/// A tag built from scratch (DSF output), with an optional front cover.
+std::vector<Seg> build_segments(const Tags& tags, const Cover* cover);
 
 /// Tags of an ID3v2 tag (as written by this program or a tag editor), with
 /// frames mapped back to Vorbis-style names (TIT2 -> TITLE, TRCK -> TRACKNUMBER

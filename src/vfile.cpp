@@ -22,6 +22,7 @@ void copy_overlap(Bytes& out, std::span<const uint8_t> seg, uint64_t seg_start, 
 uint64_t seg_size(const Seg& s) {
     if (auto* b = std::get_if<Bytes>(&s)) return b->size();
     if (auto* r = std::get_if<SrcRange>(&s)) return r->len;
+    if (auto* f = std::get_if<FileRange>(&s)) return f->len;
     return std::get<Zeros>(s).len;
 }
 
@@ -57,10 +58,23 @@ void Segments::read(const fs::path& src, uint64_t off, size_t len, Bytes& out) c
             out.resize(old + size_t(e - a));
             size_t got = f->read_at(out.data() + old, size_t(e - a), r->off + (a - start));
             WM_ENSURE(got == e - a, "short read in {}", src.string());
+        } else if (auto* x = std::get_if<FileRange>(&seg)) {
+            File other(*x->path);
+            size_t old = out.size();
+            out.resize(old + size_t(e - a));
+            size_t got = other.read_at(out.data() + old, size_t(e - a), x->off + (a - start));
+            WM_ENSURE(got == e - a, "short read in {} (changed since it was listed?)", x->path->string());
         } else {
             out.insert(out.end(), size_t(e - a), uint8_t(0));
         }
     }
+}
+
+void Segments::read_at_base(const fs::path& src, uint64_t base, uint64_t off, size_t len, Bytes& out) const {
+    uint64_t end = off + len;
+    if (end <= base || off >= base + size_) return;
+    uint64_t a = std::max(off, base) - base, b = std::min(end, base + size_) - base;
+    read(src, a, size_t(b - a), out);
 }
 
 Bytes Spliced::read_at(uint64_t off, size_t len) const {

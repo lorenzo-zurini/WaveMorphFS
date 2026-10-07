@@ -48,6 +48,7 @@ global options:
                             (env WAVEMORPH_TAGS_DIR; default $XDG_DATA_HOME/wavemorphfs/tags)
   --cache-dir DIR           frame/packet indexes
                             (env WAVEMORPH_CACHE_DIR; default $XDG_CACHE_HOME/wavemorphfs)
+  --covers-dir DIR          base of relative sidecar "_cover" paths (env WAVEMORPH_COVERS_DIR)
 
 environment: WAVEMORPH_LOG=debug|info|warn|error
 )USAGE";
@@ -79,6 +80,7 @@ struct Cli {
     std::vector<Root> roots;
     std::string tags_dir = env_dir("WAVEMORPH_TAGS_DIR", "XDG_DATA_HOME", ".local/share", "wavemorphfs/tags");
     std::string cache_dir = env_dir("WAVEMORPH_CACHE_DIR", "XDG_CACHE_HOME", ".cache", "wavemorphfs");
+    std::string covers_dir = std::getenv("WAVEMORPH_COVERS_DIR") ? std::getenv("WAVEMORPH_COVERS_DIR") : "";
     std::string cmd;
     std::vector<std::string> pos;
     size_t workers = 2, threads = 8;
@@ -124,6 +126,7 @@ Cli parse_args(int argc, char** argv) {
             c.roots.push_back({v.substr(0, eq), expand(v.substr(eq + 1))});
         } else if (arg == "--tags-dir") c.tags_dir = value();
         else if (arg == "--cache-dir") c.cache_dir = value();
+        else if (arg == "--covers-dir") c.covers_dir = value();
         else if (arg == "--workers") c.workers = size_t(number());
         else if (arg == "--threads") c.threads = size_t(number());
         else if (arg == "--prescan") c.prescan = number();
@@ -146,6 +149,7 @@ std::shared_ptr<Library> library(const Cli& cli, size_t workers) {
     cfg.roots = roots;
     cfg.tags_dir = expand(cli.tags_dir);
     cfg.cache_dir = expand(cli.cache_dir);
+    if (!cli.covers_dir.empty()) cfg.covers_dir = expand(cli.covers_dir);
     cfg.workers = workers;
     cfg.sacd_multichannel = cli.cmd == "mount" && cli.sacd_multichannel;
     return Library::create(std::move(cfg));

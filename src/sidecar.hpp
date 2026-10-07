@@ -33,8 +33,10 @@
 // unless they have their own), in a track or file table it moves that one file;
 // the value is a directory path relative to the mount root ("Classical Music/
 // Mahler/Symphony No. 5 (Bernstein, 1987)"). Targets are read from the sidecars
-// of the tags tree. Other top-level keys (e.g. "_comment") are ignored, and // or
-// /* */ comments are allowed.
+// of the tags tree. "_cover" (top level, in "album", or in a track or file table)
+// names an image (absolute, or relative to --covers-dir) embedded as the front
+// cover of the tracks, replacing their pictures. Other top-level keys (e.g.
+// "_comment") are ignored, and // or /* */ comments are allowed.
 #pragma once
 
 #include <map>
@@ -64,6 +66,11 @@ struct Sidecar {
     std::optional<std::string> target;                // "_target" of the folder (normalized)
     std::map<std::string, std::string> track_targets;  // canonical track key -> "_target"
     std::map<std::string, std::string> file_targets;   // file name -> "_target"
+    std::optional<std::string> cover;                 // "_cover" for the folder (top level or in "album")
+    std::map<std::string, std::string> track_covers;  // canonical track key -> "_cover"
+    std::map<std::string, std::string> file_covers;   // file name -> "_cover"
+    /// "_cover" for a file (by name), else for its track key, else the folder's.
+    const std::string* cover_for(const std::string& name, const std::string* track_key) const;
     /// newest mtime among the sidecar files that contributed
     std::optional<int64_t> mtime;
     std::vector<fs::path> sources;

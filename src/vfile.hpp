@@ -51,7 +51,12 @@ struct SrcRange {
 struct Zeros {
     uint64_t len;
 };
-using Seg = std::variant<Bytes, SrcRange, Zeros>;
+/// (offset, length) of another file (e.g. a cover image shared by many tracks).
+struct FileRange {
+    std::shared_ptr<const fs::path> path;
+    uint64_t off, len;
+};
+using Seg = std::variant<Bytes, SrcRange, Zeros, FileRange>;
 uint64_t seg_size(const Seg& s);
 
 /// Segments laid end to end from offset 0 (adjacent in-memory bytes are merged).
@@ -62,6 +67,8 @@ public:
     uint64_t size() const { return size_; }
     /// Append the part of [off, off+len) these segments cover; source ranges are read from `src`.
     void read(const fs::path& src, uint64_t off, size_t len, Bytes& out) const;
+    /// The same with the segments placed at offset `base` of the request's file.
+    void read_at_base(const fs::path& src, uint64_t base, uint64_t off, size_t len, Bytes& out) const;
 
 private:
     std::vector<std::pair<uint64_t, Seg>> segs_;  // with start offsets

@@ -165,7 +165,10 @@ TEST(sidecar_retags_regular_dsf) {
     append(f, audio);
     append(f, id3);
     atomic_write(src / "t.dsf", f);
-    atomic_write(dir / "tags" / "Lib" / "Album" / SIDECAR_NAME, R"({"file": {"t.dsf": {"TITLE": "new", "MUSICBRAINZ_ALBUMID": ""}}})");
+    auto img = run({"ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=c=green:s=16x16", "-frames:v", "1", (dir / "c.jpg").string()});
+    CHECK_MSG(img.ok(), "{}", img.err);
+    atomic_write(dir / "tags" / "Lib" / "Album" / SIDECAR_NAME,
+                 std::format(R"({{"file": {{"t.dsf": {{"TITLE": "new", "MUSICBRAINZ_ALBUMID": "", "_cover": "{}"}}}}}})", (dir / "c.jpg").string()));
     Config cfg;
     cfg.roots = {{"Lib", dir / "lib"}};
     cfg.tags_dir = dir / "tags";
@@ -183,6 +186,12 @@ TEST(sidecar_retags_regular_dsf) {
     auto tags = read_file_tags("dsf", [&](uint64_t off, size_t len) { return vf->read_at(off, len); }, vf->size());
     CHECK(*tags.get("TITLE") == "new" && *tags.get("ARTIST") == "a");
     CHECK_MSG(tags.get("MUSICBRAINZ_ALBUMID") == nullptr, "removal applied");
+    // the cover: one APIC frame (front cover) holding the image bytes
+    Bytes jpg = *try_read_file(dir / "c.jpg");
+    std::string_view tail(reinterpret_cast<const char*>(out.data()) + audio_end, out.size() - size_t(audio_end));
+    auto at = tail.find("APIC");
+    CHECK(at != std::string_view::npos && tail.find("APIC", at + 1) == std::string_view::npos);
+    CHECK_MSG(tail.find(std::string_view(reinterpret_cast<const char*>(jpg.data()), jpg.size())) != std::string_view::npos, "image bytes embedded");
     fs::remove_all(dir);
 }
 
@@ -316,6 +325,74 @@ TEST(standalone_wavpack_served_as_flac) {
     auto tags = read_file_tags("flac", [&](uint64_t off, size_t len) { return e.file->read_at(off, len); }, e.file->size());
     CHECK(tags.get("TITLE") && *tags.get("TITLE") == "I. Allegro");
     CHECK_MSG(tags.get("ARTIST") == nullptr, "source tag removed by the sidecar");
+    fs::remove_all(dir);
+}
+
+namespace {
+/// The PICTURE blocks of a FLAC file's header: (type, image data).
+std::vector<std::pair<uint32_t, Bytes>> flac_pictures(const VFile& vf) {
+    Bytes h = vf.read_at(0, 4 << 20);
+    std::vector<std::pair<uint32_t, Bytes>> out;
+    for (size_t p = 4; p + 4 <= h.size();) {
+        bool last = h[p] & 0x80;
+        size_t len = size_t(h[p + 1]) << 16 | size_t(h[p + 2]) << 8 | h[p + 3];
+        if ((h[p] & 0x7F) == 6) {
+            const uint8_t* b = &h[p + 4];
+            uint32_t type = be32(b), ml = be32(b + 4), dl = be32(b + 8 + ml);
+            size_t data = 8 + ml + 4 + dl + 16;
+            uint32_t n = be32(b + data);
+            out.emplace_back(type, Bytes(b + data + 4, b + data + 4 + n));
+        }
+        p += 4 + len;
+        if (last) break;
+    }
+    return out;
+}
+}  // namespace
+
+TEST(sidecar_cover_embedded_by_reference) {
+    fs::path dir = fs::temp_directory_path() / std::format("wm-cover-{}", ::getpid());
+    fs::path src = dir / "lib" / "Album", covers = dir / "covers";
+    fs::create_directories(src);
+    fs::create_directories(covers);
+    fs::create_directories(dir / "tags" / "Lib" / "Album");
+    auto ok = [](const ProcResult& r) { CHECK_MSG(r.ok(), "{}", r.err); };
+    ok(run({"ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=c=red:s=64x48", "-frames:v", "1", (covers / "work.jpg").string()}));
+    ok(run({"ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=c=blue:s=32x32", "-frames:v", "1", (dir / "old.png").string()}));
+    // an image rip, and a regular FLAC with its own picture
+    ok(run({"ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=f=440:d=4", "-ac", "2", "-ar", "44100", "-sample_fmt", "s16", "-c:a", "flac",
+            (src / "Image.flac").string()}));
+    atomic_write(src / "Image.cue", std::string_view("FILE \"Image.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"A\"\n    INDEX 01 00:00:00\n"
+                                                     "  TRACK 02 AUDIO\n    TITLE \"B\"\n    INDEX 01 00:02:00\n"));
+    fs::create_directories(src / "Single");
+    ok(run({"ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=f=220:d=1", "-c:a", "flac", (src / "Single" / "s.flac").string()}));
+    ok(run({"metaflac", "--import-picture-from=" + (dir / "old.png").string(), (src / "Single" / "s.flac").string()}));
+    for (auto& e : fs::recursive_directory_iterator(src)) fs::last_write_time(e.path(), fs::file_time_type::clock::now() - std::chrono::hours(1));
+    atomic_write(dir / "tags" / "Lib" / "Album" / SIDECAR_NAME, R"({"album": {"_cover": "work.jpg"}, "track": {"2": {"_cover": "missing.jpg"}}})");
+    fs::create_directories(dir / "tags" / "Lib" / "Album" / "Single");
+    atomic_write(dir / "tags" / "Lib" / "Album" / "Single" / SIDECAR_NAME, std::format(R"({{"file": {{"s.flac": {{"_cover": "{}"}}}}}})", (covers / "work.jpg").string()));
+    Config cfg;
+    cfg.roots = {{"Lib", dir / "lib"}};
+    cfg.tags_dir = dir / "tags";
+    cfg.cache_dir = dir / "cache";
+    cfg.covers_dir = covers;
+    cfg.workers = 0;
+    auto lib = Library::create(std::move(cfg));
+    Bytes jpg = *try_read_file(covers / "work.jpg");
+    auto l = lib->list_dir(src);
+    auto* t1 = l->find("01 - A.flac");
+    auto* t2 = l->find("02 - B.flac");
+    CHECK(t1 && t2);
+    auto p1 = flac_pictures(*t1->file);
+    CHECK_MSG(p1.size() == 1 && p1[0].first == 3 && p1[0].second == jpg, "split track: the cover, read from the image file");
+    CHECK_MSG(flac_pictures(*t2->file).empty(), "missing cover: the original pictures (none here)");
+    fs::path out = dir / "t1.flac";
+    atomic_write(out, t1->file->read_at(0, size_t(t1->file->size())));
+    CHECK(run({"flac", "-t", "-s", out.string()}).ok());
+    auto s = lib->list_dir(src / "Single")->find("s.flac");
+    CHECK(s && s->file->describe().starts_with("retagged-flac:"));
+    auto ps = flac_pictures(*s->file);
+    CHECK_MSG(ps.size() == 1 && ps[0].second == jpg, "the file's own picture is replaced");
     fs::remove_all(dir);
 }
 

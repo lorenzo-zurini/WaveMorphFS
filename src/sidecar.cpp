@@ -70,6 +70,9 @@ Sidecar Sidecar::parse(const std::string& text) {
         }
         return false;
     };
+    for (const json* where : {&doc, doc.contains("album") ? &doc["album"] : nullptr})
+        if (where && where->is_object())
+            if (auto c = where->find("_cover"); c != where->end() && c->is_string() && !c->get<std::string>().empty()) sc.cover = c->get<std::string>();
     if (auto t = doc.find("_target"); t != doc.end() && t->is_string()) {
         sc.target = normalize_target(t->get<std::string>());
         if (!sc.target) warn("sidecar: ignoring invalid _target '{}'", t->get<std::string>());
@@ -89,6 +92,10 @@ Sidecar Sidecar::parse(const std::string& text) {
             if (target == &sc.tracks)
                 if (auto n = v.find("_name"); n != v.end() && n->is_string() && !n->get<std::string>().empty()) sc.track_names[k] = n->get<std::string>();
             if (auto h = v.find("_hide"); h != v.end() && truthy(*h)) (target == &sc.tracks ? sc.hidden_tracks : sc.hidden).insert(k);
+            if (auto c = v.find("_cover"); c != v.end() && c->is_string() && !c->get<std::string>().empty()) {
+                if (target == &sc.files) sc.file_covers[k] = c->get<std::string>();
+                else if (auto ck = canonical_track_key(k)) sc.track_covers[*ck] = c->get<std::string>();
+            }
             if (auto t = v.find("_target"); t != v.end() && t->is_string()) {
                 auto nt = normalize_target(t->get<std::string>());
                 if (!nt) warn("sidecar: ignoring invalid _target '{}'", t->get<std::string>());
@@ -121,6 +128,9 @@ std::optional<Sidecar> Sidecar::load(const fs::path& src_dir, const std::optiona
         if (sc.target) out->target = sc.target;
         for (auto& [k, v] : sc.track_targets) out->track_targets[k] = v;
         for (auto& [k, v] : sc.file_targets) out->file_targets[k] = v;
+        if (sc.cover) out->cover = sc.cover;
+        for (auto& [k, v] : sc.track_covers) out->track_covers[k] = v;
+        for (auto& [k, v] : sc.file_covers) out->file_covers[k] = v;
         out->mtime = std::max(out->mtime.value_or(*m), *m);
         out->sources.push_back(p);
     }
@@ -146,6 +156,13 @@ const std::string* Sidecar::track_name(std::optional<uint32_t> disc, uint32_t n)
     for (auto& k : keys)
         if (auto it = track_names.find(k); it != track_names.end()) return &it->second;
     return nullptr;
+}
+
+const std::string* Sidecar::cover_for(const std::string& name, const std::string* track_key) const {
+    if (auto it = file_covers.find(name); it != file_covers.end()) return &it->second;
+    if (track_key)
+        if (auto it = track_covers.find(*track_key); it != track_covers.end()) return &it->second;
+    return cover ? &*cover : nullptr;
 }
 
 bool Sidecar::hides_track(std::optional<uint32_t> disc, uint32_t n) const {

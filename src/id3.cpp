@@ -396,10 +396,70 @@ Tags read_tags(std::span<const uint8_t> tag) {
     return t;
 }
 
+namespace {
+
+/// serialize(), with the pictures replaced by `cover` (referenced, not copied).
+std::vector<Seg> serialize_segments(uint8_t flags, std::vector<Frame> frames, const Cover* cover) {
+    if (!cover) return {serialize(flags, frames)};
+    if (flags & 0x80) {  // whole-tag unsynchronisation: raw image bytes cannot be inserted
+        warn("cover {}: not embedded in an unsynchronised ID3 tag", cover->path->string());
+        return {serialize(flags, frames)};
+    }
+    std::erase_if(frames, [](const Frame& f) { return f.sid() == "APIC"; });
+    Bytes body;
+    for (auto& f : frames) {
+        body.insert(body.end(), f.id, f.id + 4);
+        append(body, synchsafe(uint32_t(f.data.size())));
+        body.push_back(f.flags[0]);
+        body.push_back(f.flags[1]);
+        append(body, f.data);
+    }
+    auto apic = id3_apic(*cover);
+    uint64_t apic_len = 0;
+    for (auto& s : apic) apic_len += seg_size(s);
+    append(body, std::string_view("APIC"));
+    append(body, synchsafe(uint32_t(apic_len)));
+    body.push_back(0);
+    body.push_back(0);
+    uint64_t total = body.size() + apic_len + 4096;
+    Bytes out = {'I', 'D', '3', 4, 0, flags};
+    append(out, synchsafe(uint32_t(total)));
+    append(out, body);
+    std::vector<Seg> segs = {std::move(out)};
+    segs.insert(segs.end(), apic.begin(), apic.end());
+    segs.push_back(Zeros{4096});  // padding, so tag editors can save in place
+    return segs;
+}
+
+}  // namespace
+
+std::vector<Seg> build_segments(const Tags& tags, const Cover* cover) {
+    std::vector<Frame> frames;
+    apply(frames, tags);
+    return serialize_segments(0, std::move(frames), cover);
+}
+
 Bytes build(const Tags& tags) {
     std::vector<Frame> frames;
     apply(frames, tags);
     return serialize(0, frames);
+}
+
+std::pair<std::vector<Seg>, uint64_t> retag_at(const File& f, uint64_t pos, const Tags& overlay, const Cover* cover) {
+    uint8_t head[10] = {};
+    size_t n = f.read_at(head, 10, pos);
+    SourceTag src;
+    uint64_t len = 0;
+    if (n == 10 && std::memcmp(head, "ID3", 3) == 0) {
+        size_t total = 10 + unsynchsafe(&head[6]);
+        Bytes b(total);
+        f.read_exact_at(b.data(), total, pos);
+        auto [tag, l] = parse_tag(b);
+        src = std::move(tag);
+        len = l;
+    }
+    apply(src.frames, overlay);
+    return {serialize_segments(src.flags, std::move(src.frames), cover), len};
 }
 
 std::pair<Bytes, uint64_t> retag_at(const File& f, uint64_t pos, const Tags& overlay) {
