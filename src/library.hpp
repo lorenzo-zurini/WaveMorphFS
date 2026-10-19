@@ -224,7 +224,9 @@ private:
     void run_job(Job job);
     bool enqueue(Job job);
     void bump(const fs::path& dir);
-    void walk(const fs::path& dir, size_t& n);
+    /// Prescan: list `dir` and its subfolders; `seen` holds the folders (device,
+    /// inode) already walked.
+    void walk(const fs::path& dir, size_t& n, std::set<std::pair<uint64_t, uint64_t>>& seen);
     /// Forget state of source files and folders that no longer exist.
     void prune();
     /// Store the outcome of processing version `key` of a file, unless a newer
@@ -247,7 +249,10 @@ private:
     Work<SacdDisc> sacd_state(const fs::path& src, const fs::path& dir, bool mc);
 
     Sig signature(const fs::path& dir) const;
-    std::shared_ptr<Listing> build_listing(const fs::path& dir, const Sig& sig);
+    /// The sidecars of `dir` that parse, merged; `broken` if one does not.
+    std::optional<Sidecar> load_sidecar(const fs::path& dir, const std::optional<fs::path>& overlay, bool& broken);
+    /// A new listing of `dir`; `previous` (if any) is kept while a sidecar is broken.
+    std::shared_ptr<Listing> build_listing(const fs::path& dir, const Sig& sig, const std::shared_ptr<const Listing>& previous);
     void add_image_groups(detail::ListingBuild& b);
     void add_sacd_isos(detail::ListingBuild& b);
     void add_source_file(detail::ListingBuild& b, const detail::DirItem& n);
@@ -294,6 +299,7 @@ private:
     std::map<fs::path, std::shared_ptr<std::mutex>> dir_locks_;
     std::set<fs::path> md5_queued_, encode_queued_;
     std::map<fs::path, JobFailure> md5_failed_, encode_failed_;
+    std::map<fs::path, std::string> sidecar_errors_;  // source folder -> why its sidecars do not parse
 
     std::mutex jobs_mu_;
     std::condition_variable jobs_cv_;

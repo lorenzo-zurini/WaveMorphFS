@@ -80,8 +80,12 @@ struct Sidecar {
     std::optional<int64_t> mtime;
 
     static Sidecar parse(const std::string& text);
+    /// The sidecar files that apply to `src_dir`, in the order they are merged.
+    static std::vector<fs::path> paths(const fs::path& src_dir, const std::optional<fs::path>& overlay_dir);
     /// Merge the sidecars that apply to `src_dir`; nullopt if there are none.
     static std::optional<Sidecar> load(const fs::path& src_dir, const std::optional<fs::path>& overlay_dir);
+    /// Layer `later` (a sidecar file with mtime `later_mtime`) over this one.
+    void merge(const Sidecar& later, int64_t later_mtime);
     /// Tags for track `n` of disc `disc` (disc only matters in multi-disc dirs).
     const Tags* track(std::optional<uint32_t> disc, uint32_t n) const;
     const Tags* file(const std::string& name) const;

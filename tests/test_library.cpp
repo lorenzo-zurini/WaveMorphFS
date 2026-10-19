@@ -2,6 +2,8 @@
 // Library: sidecar keys, tag edits stored in sidecars, listing rules.
 #include <unistd.h>
 
+#include <thread>
+
 #include <nlohmann/json.hpp>
 
 #include "library.hpp"
@@ -128,4 +130,141 @@ TEST(md5s_are_stored_for_the_version_they_were_read_from) {
     cache.store_md5s(f, old_key, m);
     CHECK_MSG(cache.load_md5s(f).empty(), "nothing for the current version");
     CHECK(fs::exists(cache.md5_path(f, old_key)));
+}
+
+namespace {
+
+void ok(const ProcResult& r) { CHECK_MSG(r.ok(), "{}", r.err); }
+
+/// Make `p` look settled (written long ago).
+void age(const fs::path& p) { fs::last_write_time(p, fs::file_time_type::clock::now() - std::chrono::hours(1)); }
+
+void sine(const fs::path& out, const char* codec, double seconds, const char* sample_fmt = "s16") {
+    ok(run({"ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", std::format("sine=f=440:d={}", seconds), "-ac", "2", "-ar", "44100", "-sample_fmt",
+            sample_fmt, "-c:a", codec, out.string()}));
+    age(out);
+}
+
+std::string two_track_cue(const std::string& file, const char* discnumber) {
+    return std::format("REM DISCNUMBER {}\nFILE \"{}\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"One\"\n    INDEX 01 00:00:00\n"
+                       "  TRACK 02 AUDIO\n    TITLE \"Two\"\n    INDEX 01 00:01:00\n",
+                       discnumber, file);
+}
+
+std::vector<std::string> names_of(const Listing& l) {
+    std::vector<std::string> v;
+    for (auto& e : l.entries) v.push_back(e.name);
+    return v;
+}
+
+void wait_recheck() { std::this_thread::sleep_for(std::chrono::milliseconds(1600)); }  // listings are re-checked after 1.5 s
+
+}  // namespace
+
+TEST(variable_blocksize_flac_images_are_decoded) {
+    // a split track is a variable-blocksize FLAC: as an image it is decoded and
+    // re-encoded, not split by copying frames
+    Scratch s("varblock");
+    sine(s.src / "a.flac", "flac", 4);
+    atomic_write(s.src / "a.cue", two_track_cue("a.flac", "1"));
+    age(s.src / "a.cue");
+    auto lib = s.library();
+    auto split = lib->list_dir(s.src);
+    auto t = split->find("01 - One.flac");
+    CHECK(t && t->file->describe().starts_with("flac-image:"));
+    fs::path v = s.dir / "lib" / "Var";
+    fs::create_directories(v);
+    atomic_write(v / "v.flac", t->file->read_at(0, size_t(t->file->size())));
+    age(v / "v.flac");
+    // track 1 of the original is one second long
+    atomic_write(v / "v.cue", std::string_view("FILE \"v.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"One\"\n    INDEX 01 00:00:00\n"
+                                               "  TRACK 02 AUDIO\n    TITLE \"Two\"\n    INDEX 01 00:00:40\n"));
+    age(v / "v.cue");
+    auto l = lib->list_dir(v);
+    CHECK_MSG((names_of(*l) == std::vector<std::string>{"01 - One.flac", "02 - Two.flac"}), "{}", names_of(*l)[0]);
+    CHECK(l->entries[0].file->describe().starts_with("flac-encoded:"));
+    fs::path out = s.dir / "out.flac";
+    atomic_write(out, l->entries[1].file->read_at(0, size_t(l->entries[1].file->size())));
+    CHECK(run({"flac", "-t", "-s", out.string()}).ok());
+}
+
+TEST(repeated_disc_numbers_fall_back_to_name_order) {
+    Scratch s("discno");
+    for (auto n : {"CD1", "CD2"}) {
+        sine(s.src / std::format("{}.flac", n), "flac", 3);
+        atomic_write(s.src / std::format("{}.cue", n), two_track_cue(std::format("{}.flac", n), "1"));  // both claim disc 1
+        age(s.src / std::format("{}.cue", n));
+    }
+    auto lib = s.library();
+    auto l = lib->list_dir(s.src);
+    CHECK_MSG((names_of(*l) == std::vector<std::string>{"1-01 - One.flac", "1-02 - Two.flac", "2-01 - One.flac", "2-02 - Two.flac"}), "{}",
+              l->entries.empty() ? "" : l->entries.back().name);
+    CHECK(l->find("2-02 - Two.flac")->tag_key == "2-02");
+}
+
+TEST(generated_names_never_clash) {
+    // x.wv and x.tta both become x.flac; x (2).flac exists as a real file
+    Scratch s("clash");
+    sine(s.src / "x.wv", "wavpack", 1, "s16p");
+    sine(s.src / "x.tta", "tta", 1);
+    atomic_write(s.src / "x (2).flac", std::string_view("not audio"));
+    age(s.src / "x (2).flac");
+    auto lib = s.library();
+    auto l = lib->list_dir(s.src);
+    CHECK_MSG((names_of(*l) == std::vector<std::string>{"x (2).flac", "x (3).flac", "x.flac"}), "{} entries", l->entries.size());
+}
+
+TEST(hiding_a_source_hides_what_is_made_from_it) {
+    Scratch s("hide-src");
+    sine(s.src / "x.wv", "wavpack", 1, "s16p");
+    atomic_write(s.tags / SIDECAR_NAME, R"({"_hide": ["x.wv"]})");
+    CHECK(s.library()->list_dir(s.src)->entries.empty());
+}
+
+TEST(files_still_being_written_are_listed_again_once_settled) {
+    Scratch s("settle");
+    atomic_write(s.src / "new.mp3", std::string_view("partial"));
+    auto lib = s.library();
+    auto l = lib->list_dir(s.src);
+    CHECK_MSG(l->retry_at && *l->retry_at > Clock::now() + std::chrono::seconds(50), "a fresh file schedules a rebuild");
+    age(s.src / "new.mp3");
+    fs::path o = s.dir / "lib" / "Old";
+    fs::create_directories(o);
+    atomic_write(o / "old.mp3", std::string_view("done"));
+    age(o / "old.mp3");
+    CHECK(!lib->list_dir(o)->retry_at);
+}
+
+TEST(broken_sidecar_keeps_the_previous_listing) {
+    // a typo while editing must not rename or unhide anything
+    Scratch s("broken");
+    for (auto n : {"a.txt", "b.txt"}) {
+        atomic_write(s.src / n, std::string_view("x"));
+        age(s.src / n);
+    }
+    atomic_write(s.tags / SIDECAR_NAME, R"({"_hide": ["b.txt"]})");
+    auto lib = s.library();
+    CHECK((names_of(*lib->list_dir(s.src)) == std::vector<std::string>{"a.txt"}));
+    atomic_write(s.tags / SIDECAR_NAME, R"({"_hide": ["b.txt"],)");
+    wait_recheck();
+    CHECK_MSG((names_of(*lib->list_dir(s.src)) == std::vector<std::string>{"a.txt"}), "still hidden");
+    atomic_write(s.tags / SIDECAR_NAME, R"({"_hide": []})");
+    wait_recheck();
+    CHECK((names_of(*lib->list_dir(s.src)) == std::vector<std::string>{"a.txt", "b.txt"}));
+}
+
+TEST(removing_a_sidecar_does_not_turn_mtimes_back) {
+    // servers re-read files whose mtime moved forward; the tags go back to the
+    // source's when the sidecar is deleted, so the mtime must move forward too
+    Scratch s("rm-sidecar");
+    sine(s.src / "t.flac", "flac", 1);
+    atomic_write(s.tags / SIDECAR_NAME, R"({"album": {"ALBUM": "From sidecar"}})");
+    auto lib = s.library();
+    int64_t before = lib->list_dir(s.src)->find("t.flac")->mtime;
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    fs::remove(s.tags / SIDECAR_NAME);
+    wait_recheck();
+    auto e = lib->list_dir(s.src)->find("t.flac");
+    CHECK(e->file->describe().starts_with("passthrough:"));
+    CHECK_MSG(e->mtime > before, "{} <= {}", e->mtime, before);
 }
