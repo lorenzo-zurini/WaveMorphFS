@@ -6,6 +6,7 @@
 
 #include "apetag.hpp"
 #include "charset.hpp"
+#include "cover.hpp"
 #include "cue.hpp"
 #include "id3.hpp"
 #include "mp4.hpp"
@@ -451,4 +452,34 @@ TEST(cue_parser_survives_any_prefix_and_byte_noise) {
         } catch (const Error&) {
         }
     }
+}
+
+TEST(cover_jpeg_dimensions_past_large_segments_and_no_enlarging) {
+    auto d = scratch("cover");
+    fs::path src = d / "small.jpg";
+    auto r = run({"ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=s=600x400", "-frames:v", "1", src.string()});
+    CHECK_MSG(r.ok(), "ffmpeg: {}", r.err);
+    Bytes jpg = read_file(src);
+    // APP segments (EXIF thumbnails, ICC profiles) before the frame header: past
+    // the first 64 KiB with 2, past MAX_COVER_BYTES with 40
+    auto padded = [&](int segments) {
+        Bytes out(jpg.begin(), jpg.begin() + 2);
+        for (int i = 0; i < segments; i++) {
+            Bytes app(2 + 0xFFFF, 'i');  // marker APP2, then the longest segment length
+            app[0] = 0xFF, app[1] = 0xE2, app[2] = 0xFF, app[3] = 0xFF;
+            append(out, app);
+        }
+        out.insert(out.end(), jpg.begin() + 2, jpg.end());
+        return out;
+    };
+    atomic_write(d / "icc.jpg", padded(2));
+    auto c = load_cover(d / "icc.jpg");
+    CHECK_MSG(c && c->width == 600 && c->height == 400, "{}x{}", c ? c->width : 0, c ? c->height : 0);
+    auto same = prepare_cover(d / "icc.jpg", d / "cache");
+    CHECK_MSG(same && *same->path == d / "icc.jpg", "embedded as it is");
+    atomic_write(d / "big.jpg", padded(40));
+    auto small = prepare_cover(d / "big.jpg", d / "cache");
+    CHECK_MSG(small && *small->path != d / "big.jpg" && small->width == 600 && small->height == 400, "re-encoded, not enlarged: {}x{}",
+              small ? small->width : 0, small ? small->height : 0);
+    fs::remove_all(d);
 }
