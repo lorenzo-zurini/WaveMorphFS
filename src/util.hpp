@@ -83,6 +83,7 @@ char32_t utf8_at(std::string_view s, size_t i, size_t& len);
 /// True if the UTF-8 sequence at s[i] is white space; sets `len` to its byte length.
 bool ws_at(std::string_view s, size_t i, size_t& len);
 std::vector<std::string> split(std::string_view s, char sep);
+std::string join(const std::vector<std::string>& parts, std::string_view sep);
 std::string hex(std::span<const uint8_t> b);
 std::optional<uint64_t> parse_u64(std::string_view s);
 /// `b` as well-formed UTF-8: every ill-formed byte becomes U+FFFD.
