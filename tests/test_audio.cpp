@@ -352,6 +352,24 @@ TEST(av_image_index_is_checked_and_dropped_when_stale) {
     CHECK(!fs::exists(idx));
 }
 
+// ---- split tracks
+
+TEST(split_track_has_no_short_block_before_its_last) {
+    // a 6-sample head directly followed by the tail: one block, not 6 + 104
+    TmpDir dir("shorthead");
+    fs::path img = dir.path / "img.flac";
+    uint32_t bs = 1024;
+    Bytes pcm = make_flac(img, 44100, 2, 16, bs, bs * 4);
+    auto meta = flac::FlacMeta::read(img);
+    auto image = FlacImage::open(img, meta, flac::FrameIndex::build(img, meta));
+    uint64_t s = bs - 6, e = bs + 104;
+    FlacTrack tr(image, s, e, Tags{}, {}, std::nullopt);
+    Bytes bytes = whole(tr);
+    auto si = flac::StreamInfo::parse(std::span(bytes).subspan(8, 34));
+    CHECK(si.min_block == 110 && si.max_block == 110);
+    check_flac(dir.path, bytes, std::span(pcm).subspan(size_t(s) * 4, size_t(e - s) * 4), "short head");
+}
+
 TEST(stitch_reads_only_what_each_piece_covers) {
     Bytes a = {1, 2, 3}, c = {7, 8, 9, 10};
     int empty_reads = 0;
