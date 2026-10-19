@@ -1,9 +1,10 @@
-# Build the image natively on amd64 and arm64 (the Dockerfile runs the test suite
-# on each) and publish a multi-arch manifest to the GitHub Container Registry as
-# ghcr.io/<owner>/wavemorphfs:
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Test with sanitizers, build the image natively on amd64 and arm64 (the
+# Dockerfile runs the test suite on each, warnings as errors) and publish a
+# multi-arch manifest to the GitHub Container Registry as ghcr.io/<owner>/wavemorphfs:
 #   push to main  -> :edge
-#   tag vX.Y.Z    -> :X.Y.Z, :X.Y, :latest
-# Pull requests only build.
+#   tag vX.Y.Z    -> :X.Y.Z, :X.Y, :latest, and a GitHub release
+# Pull requests only test and build.
 name: docker
 
 on:
@@ -13,12 +14,54 @@ on:
   pull_request:
   workflow_dispatch:
 
+# a newer push supersedes an unfinished run (so :edge is never published out of order)
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
 permissions:
   contents: read
-  packages: write
 
 jobs:
+  sanitizers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container: debian:trixie
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends g++ cmake ninja-build pkg-config libfuse3-dev libflac-dev libwavpack-dev \
+            nlohmann-json3-dev libavformat-dev libavcodec-dev libavutil-dev libswscale-dev flac ffmpeg ca-certificates
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - name: Build (Debug, ASan + UBSan, warnings as errors)
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DWAVEMORPH_WERROR=ON -DWAVEMORPH_SANITIZE=address,undefined
+          cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  version:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - id: v
+        name: Version (a release tag must match project(VERSION) in CMakeLists.txt)
+        run: |
+          project=$(sed -n 's/^project(wavemorphfs VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then
+            version="${GITHUB_REF_NAME#v}"
+            [ "$version" = "$project" ] || { echo "::error::tag $GITHUB_REF_NAME does not match project version $project"; exit 1; }
+          else
+            version="${project}-dev+${GITHUB_SHA::7}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: version
     strategy:
       matrix:
         include:
@@ -27,22 +70,28 @@ jobs:
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Image name   # registry names must be lower case
         run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/wavemorphfs" >> "$GITHUB_ENV"
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3
         if: github.event_name != 'pull_request'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6
         with:
           context: .
           platforms: ${{ matrix.platform }}
+          build-args: WAVEMORPH_VERSION=${{ needs.version.outputs.version }}
+          labels: org.opencontainers.image.revision=${{ github.sha }}
           cache-from: type=gha,scope=${{ matrix.platform }}
           cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
           outputs: ${{ github.event_name == 'pull_request' && 'type=cacheonly' || format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', env.IMAGE) }}
@@ -53,7 +102,7 @@ jobs:
           touch "/tmp/digests/${DIGEST#sha256:}"
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         if: github.event_name != 'pull_request'
         with:
           name: digest-${{ strategy.job-index }}
@@ -62,28 +111,33 @@ jobs:
 
   publish:
     if: github.event_name != 'pull_request'
-    needs: build
+    needs: [sanitizers, build]
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Image name
         run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/wavemorphfs" >> "$GITHUB_ENV"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           path: /tmp/digests
           pattern: digest-*
           merge-multiple: true
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051  # v5
         with:
           images: ${{ env.IMAGE }}
           tags: |
             type=edge,branch=main
+            type=ref,event=branch,enable=${{ github.ref != 'refs/heads/main' }}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
       - name: Create the multi-arch manifest
@@ -93,3 +147,22 @@ jobs:
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf "$IMAGE@sha256:%s " *)
           docker buildx imagetools inspect "$IMAGE:${{ steps.meta.outputs.version }}"
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - name: GitHub release with the changelog section of this version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '$0 ~ "^## \\[" v "\\]" {on=1; next} on && /^## \[/ {exit} on' CHANGELOG.md > notes.md
+          [ -s notes.md ] || echo "See CHANGELOG.md." > notes.md
+          printf '\nImage: `ghcr.io/%s/wavemorphfs:%s`\n' "${GITHUB_REPOSITORY_OWNER,,}" "$version" >> notes.md
+          gh release create "$GITHUB_REF_NAME" --title "WaveMorphFS $version" --notes-file notes.md --verify-tag

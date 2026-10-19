@@ -865,7 +865,10 @@ std::shared_ptr<const Listing> Library::list_dir(const fs::path& dir) {
         if (!l) l = std::make_shared<std::mutex>();
         lock = l;
     }
-    if (cached && Clock::now() - cached->checked.load() < RECHECK) return cached;
+    if (cached) {
+        std::lock_guard g(cached->mu);
+        if (Clock::now() - cached->checked < RECHECK) return cached;
+    }
     std::lock_guard dg(*lock);
     Sig sig = signature(dir);
     {
@@ -876,6 +879,7 @@ std::shared_ptr<const Listing> Library::list_dir(const fs::path& dir) {
         return std::all_of(l.covers.begin(), l.covers.end(), [](auto& c) { return mtime_ns(c.first) == c.second; });
     };
     if (cached && cached->sig == sig && !(cached->retry_at && Clock::now() >= *cached->retry_at) && covers_unchanged(*cached)) {
+        std::lock_guard g(cached->mu);
         cached->checked = Clock::now();
         return cached;
     }

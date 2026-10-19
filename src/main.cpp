@@ -11,16 +11,21 @@
 
 #include <unistd.h>
 
+#include <algorithm>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <set>
 
-#include "flac.hpp"
+#include <nlohmann/json.hpp>
+
 #include "fs.hpp"
 #include "library.hpp"
 #include "util.hpp"
 #include "version.hpp"
+#include "writeback.hpp"
 
 using namespace wm;
 
@@ -36,7 +41,7 @@ commands:
       --workers N           background workers (default 2)
       --threads N           FUSE threads (default 8)
       --allow-other         let other users (e.g. a container's user) access the mount
-      --prescan SECONDS     re-walk the library this often (default 900)
+      --prescan SECONDS     re-walk the library this often (default 900; 0: never)
       --sacd-multichannel   also expose SACD multichannel areas as "(Multichannel)" albums
                             (env WAVEMORPH_SACD_MULTICHANNEL; default off)
   ls <dir>                  show what a source directory looks like through the filesystem
@@ -51,24 +56,27 @@ global options:
   --cache-dir DIR           frame/packet indexes
                             (env WAVEMORPH_CACHE_DIR; default $XDG_CACHE_HOME/wavemorphfs)
   --covers-dir DIR          base of relative sidecar "_cover" paths (env WAVEMORPH_COVERS_DIR)
+  --                        end of options (for directory names starting with -)
+
+Directories given to ls, verify, compare and tags-init are matched against the
+roots as written, without resolving symbolic links.
 
 environment: WAVEMORPH_LOG=debug|info|warn|error
 )USAGE";
 
-fs::path expand(const std::string& p) {
-    if (starts_with(p, "~/")) {
-        const char* home = std::getenv("HOME");
-        return fs::path(home ? home : "") / p.substr(2);
-    }
-    return p;
+/// "~/x" -> $HOME/x; empty if HOME is not set.
+std::string expand(const std::string& p) {
+    if (!starts_with(p, "~/")) return p;
+    const char* home = std::getenv("HOME");
+    return home && *home ? (fs::path(home) / p.substr(2)).string() : "";
 }
 
-/// $VAR if set, else $XDG_VAR (falling back to ~/FALLBACK) / SUB.
+/// $VAR if set, else $XDG_VAR (falling back to ~/FALLBACK) / SUB; empty if none applies.
 std::string env_dir(const char* var, const char* xdg, const char* fallback, const char* sub) {
     if (const char* v = std::getenv(var); v && *v) return v;
     const char* x = std::getenv(xdg);
-    fs::path base = x && *x ? fs::path(x) : expand(std::string("~/") + fallback);
-    return (base / sub).string();
+    std::string base = x && *x ? std::string(x) : expand(std::string("~/") + fallback);
+    return base.empty() ? "" : (fs::path(base) / sub).string();
 }
 
 bool env_true(const char* name) {
@@ -84,6 +92,7 @@ struct Cli {
     std::string cache_dir = env_dir("WAVEMORPH_CACHE_DIR", "XDG_CACHE_HOME", ".cache", "wavemorphfs");
     std::string covers_dir = std::getenv("WAVEMORPH_COVERS_DIR") ? std::getenv("WAVEMORPH_COVERS_DIR") : "";
     std::string cmd;
+    int (*run)(const Cli&) = nullptr;
     std::vector<std::string> pos;
     size_t workers = 2, threads = 8;
     uint64_t prescan = 900;
@@ -95,30 +104,73 @@ struct Cli {
     std::exit(2);
 }
 
+int cmd_mount(const Cli& cli);
+int cmd_ls(const Cli& cli);
+int cmd_verify(const Cli& cli);
+int cmd_compare(const Cli& cli);
+int cmd_tags_init(const Cli& cli);
+
+struct Command {
+    std::string_view name;
+    size_t args;
+    const char* args_help;  // for "needs ..." errors
+    int (*run)(const Cli&);
+};
+const Command COMMANDS[] = {
+    {"mount", 1, "a mountpoint", cmd_mount},
+    {"ls", 1, "a directory", cmd_ls},
+    {"verify", 1, "a directory", cmd_verify},
+    {"compare", 2, "a directory and a split directory", cmd_compare},
+    {"tags-init", 1, "a directory", cmd_tags_init},
+};
+
+/// Options that only one command takes.
+const std::pair<std::string_view, std::string_view> COMMAND_OPTIONS[] = {
+    {"--workers", "mount"}, {"--threads", "mount"}, {"--allow-other", "mount"}, {"--prescan", "mount"},
+    {"--sacd-multichannel", "mount"}, {"--force", "tags-init"},
+};
+
 Cli parse_args(int argc, char** argv) {
     Cli c;
     c.sacd_multichannel = env_true("WAVEMORPH_SACD_MULTICHANNEL");
     std::vector<std::string> a(argv + 1, argv + argc);
+    std::set<std::string> given;
+    bool options = true;
     for (size_t i = 0; i < a.size(); i++) {
         std::string arg = a[i], val;
+        if (!options || arg == "-" || !starts_with(arg, "-")) {
+            if (c.cmd.empty()) c.cmd = arg;
+            else c.pos.push_back(arg);
+            continue;
+        }
+        if (arg == "--") {
+            options = false;
+            continue;
+        }
         bool has_val = false;
-        if (starts_with(arg, "--") && arg.find('=') != std::string::npos) {
-            val = arg.substr(arg.find('=') + 1);
-            arg = arg.substr(0, arg.find('='));
+        if (auto eq = arg.find('='); starts_with(arg, "--") && eq != std::string::npos) {
+            val = arg.substr(eq + 1);
+            arg = arg.substr(0, eq);
             has_val = true;
         }
+        given.insert(arg);
         auto value = [&]() -> std::string {
             if (has_val) return val;
             if (i + 1 >= a.size()) usage_error(arg + " needs a value");
             return a[++i];
         };
-        auto number = [&]() -> uint64_t {
+        auto flag = [&] {
+            if (has_val) usage_error(arg + " takes no value");
+            return true;
+        };
+        auto number = [&](uint64_t min) -> uint64_t {
             std::string v = value();
             auto n = parse_u64(v);
             if (!n) usage_error(arg + ": not a number: " + v);
+            if (*n < min) usage_error(std::format("{} must be at least {}", arg, min));
             return *n;
         };
-        if (arg == "-h" || arg == "--help" || arg == "help") {
+        if (arg == "-h" || arg == "--help") {
             std::fputs(USAGE, stdout);
             std::exit(0);
         } else if (arg == "-V" || arg == "--version") {
@@ -128,62 +180,110 @@ Cli parse_args(int argc, char** argv) {
             std::string v = value();
             auto eq = v.find('=');
             if (eq == std::string::npos) usage_error("--root expects NAME=PATH");
-            c.roots.push_back({v.substr(0, eq), expand(v.substr(eq + 1))});
+            c.roots.push_back({v.substr(0, eq), v.substr(eq + 1)});
         } else if (arg == "--tags-dir") c.tags_dir = value();
         else if (arg == "--cache-dir") c.cache_dir = value();
         else if (arg == "--covers-dir") c.covers_dir = value();
-        else if (arg == "--workers") c.workers = size_t(number());
-        else if (arg == "--threads") c.threads = size_t(number());
-        else if (arg == "--prescan") c.prescan = number();
-        else if (arg == "--allow-other") c.allow_other = true;
-        else if (arg == "--sacd-multichannel") c.sacd_multichannel = true;
-        else if (arg == "--force") c.force = true;
-        else if (starts_with(arg, "-")) usage_error("unknown option " + arg);
-        else if (c.cmd.empty()) c.cmd = arg;
-        else c.pos.push_back(arg);
+        else if (arg == "--workers") c.workers = size_t(number(1));
+        else if (arg == "--threads") c.threads = size_t(number(1));
+        else if (arg == "--prescan") c.prescan = number(0);
+        else if (arg == "--allow-other") c.allow_other = flag();
+        else if (arg == "--sacd-multichannel") c.sacd_multichannel = flag();
+        else if (arg == "--force") c.force = flag();
+        else usage_error("unknown option " + arg);
+    }
+    if (c.cmd == "help") {
+        std::fputs(USAGE, stdout);
+        std::exit(0);
     }
     if (c.cmd.empty()) usage_error("no command given");
+    auto cmd = std::find_if(std::begin(COMMANDS), std::end(COMMANDS), [&](auto& k) { return k.name == c.cmd; });
+    if (cmd == std::end(COMMANDS)) usage_error("unknown command " + c.cmd);
+    c.run = cmd->run;
+    if (c.pos.size() != cmd->args) usage_error(std::format("{} needs {}", c.cmd, cmd->args_help));
+    for (auto& [opt, only] : COMMAND_OPTIONS)
+        if (given.contains(std::string(opt)) && c.cmd != only) usage_error(std::format("{} only applies to {}", opt, only));
     if (c.roots.empty()) usage_error("no --root given");
     return c;
 }
 
+/// Absolute and lexically normal, without a trailing separator. Symlinks are
+/// not resolved: source paths are cache keys and must stay as configured.
+fs::path normal_path(const std::string& p) {
+    fs::path n = fs::absolute(p).lexically_normal();
+    return n.has_filename() || n == n.root_path() ? n : n.parent_path();
+}
+
+/// Roots as the library needs them: distinct, reachable names (a top-level
+/// directory of the mount and of the tags tree) and normal, disjoint paths
+/// (source folders are matched to their root lexically).
+std::vector<Root> checked_roots(const std::vector<Root>& given) {
+    std::vector<Root> roots;
+    for (auto& g : given) {
+        WM_ENSURE(!g.name.empty() && g.name.find('/') == std::string::npos && !starts_with(g.name, "."),
+                  "root name '{}': must be non-empty, without '/' and not start with '.'", g.name);
+        std::string p = expand(g.path.string());
+        WM_ENSURE(!p.empty(), "root {}: HOME is not set for {}", g.name, g.path.string());
+        Root r{g.name, normal_path(p)};
+        WM_ENSURE(fs::is_directory(r.path), "root {} does not exist: {}", r.name, r.path.string());
+        for (auto& o : roots) {
+            WM_ENSURE(o.name != r.name, "root name {} given twice", r.name);
+            auto inside = [](const fs::path& a, const fs::path& b) {
+                auto rel = a.lexically_relative(b);
+                return !rel.empty() && *rel.begin() != "..";
+            };
+            WM_ENSURE(!inside(r.path, o.path) && !inside(o.path, r.path), "roots {} and {} overlap", o.name, r.name);
+        }
+        roots.push_back(std::move(r));
+    }
+    return roots;
+}
+
 std::shared_ptr<Library> library(const Cli& cli, size_t workers) {
-    auto roots = cli.roots;
-    for (auto& r : roots) WM_ENSURE(fs::is_directory(r.path), "root {} does not exist: {}", r.name, r.path.string());
     Config cfg;
-    cfg.roots = roots;
-    cfg.tags_dir = expand(cli.tags_dir);
-    cfg.cache_dir = expand(cli.cache_dir);
-    if (!cli.covers_dir.empty()) cfg.covers_dir = expand(cli.covers_dir);
+    cfg.roots = checked_roots(cli.roots);
+    auto dir = [](const std::string& given, const char* what) {
+        std::string p = expand(given);
+        WM_ENSURE(!p.empty(), "no {} (give --{} or set HOME)", what, what);
+        return fs::path(p);
+    };
+    cfg.tags_dir = dir(cli.tags_dir, "tags-dir");
+    cfg.cache_dir = dir(cli.cache_dir, "cache-dir");
+    if (!cli.covers_dir.empty()) cfg.covers_dir = dir(cli.covers_dir, "covers-dir");
     cfg.workers = workers;
     cfg.sacd_multichannel = cli.cmd == "mount" && cli.sacd_multichannel;
     return Library::create(std::move(cfg));
 }
 
-fs::path abs_path(const std::string& p) {
-    return with_context(p, [&] { return fs::canonical(p); });
-}
-
-fs::path tempdir() {
-    fs::path d = fs::temp_directory_path() / std::format("wavemorphfs-{}", ::getpid());
-    fs::create_directories(d);
+/// A source directory named on the command line, as the library knows it.
+fs::path source_dir(const std::string& p) {
+    fs::path d = normal_path(p);
+    WM_ENSURE(fs::is_directory(d), "not a directory: {}", p);
     return d;
 }
 
+/// A private temporary directory, removed with everything in it.
+struct TempDir {
+    fs::path path = fs::temp_directory_path() / std::format("wavemorphfs-{}", ::getpid());
+    TempDir() { fs::create_directories(path); }
+    ~TempDir() {
+        std::error_code ec;
+        fs::remove_all(path, ec);
+    }
+    TempDir(const TempDir&) = delete;
+    TempDir& operator=(const TempDir&) = delete;
+};
+
 void dump(const VFile& vf, const fs::path& out) {
-    FILE* f = std::fopen(out.c_str(), "wb");
-    WM_ENSURE(f, "create {}", out.string());
-    uint64_t off = 0;
-    while (off < vf.size()) {
+    std::unique_ptr<FILE, int (*)(FILE*)> f(std::fopen(out.c_str(), "wb"), std::fclose);
+    WM_ENSURE(f, "create {}: {}", out.string(), std::strerror(errno));
+    for (uint64_t off = 0; off < vf.size();) {
         Bytes b = vf.read_at(off, 1 << 20);
-        if (b.empty()) {
-            std::fclose(f);
-            fail("short read at {}", off);
-        }
-        std::fwrite(b.data(), 1, b.size(), f);
+        WM_ENSURE(!b.empty(), "short read at {}", off);
+        WM_ENSURE(std::fwrite(b.data(), 1, b.size(), f.get()) == b.size(), "write {}: {}", out.string(), std::strerror(errno));
         off += b.size();
     }
-    std::fclose(f);
+    WM_ENSURE(std::fclose(f.release()) == 0, "write {}: {}", out.string(), std::strerror(errno));
 }
 
 /// Run a checker; with `strict_stderr`, any stderr output counts as failure.
@@ -206,29 +306,9 @@ std::string pcm_md5(const fs::path& p) {
     return w.empty() ? "" : w[0];
 }
 
-/// Tags of a (virtual) FLAC file, read from its generated header.
-std::optional<Tags> read_tags(const VFile& vf, const std::string& name) {
-    if (!iends_with(name, ".flac")) return std::nullopt;
-    Bytes head = vf.read_at(0, 1 << 20);
-    if (head.size() < 4 || std::memcmp(head.data(), "fLaC", 4) != 0) return std::nullopt;
-    size_t p = 4;
-    while (p + 4 <= head.size()) {
-        bool last = head[p] & 0x80;
-        size_t len = size_t(head[p + 1]) << 16 | size_t(head[p + 2]) << 8 | head[p + 3];
-        if ((head[p] & 0x7F) == flac::BLOCK_VORBIS) {
-            if (p + 4 + len > head.size()) return std::nullopt;
-            return Tags::from_pairs(flac::parse_vorbis(std::span(head).subspan(p + 4, len)));
-        }
-        if (last) return std::nullopt;
-        p += 4 + len;
-    }
-    return std::nullopt;
-}
-
 int cmd_ls(const Cli& cli) {
-    if (cli.pos.size() != 1) usage_error("ls needs a directory");
     auto lib = library(cli, 0);
-    auto l = lib->list_dir(abs_path(cli.pos[0]));
+    auto l = lib->list_dir(source_dir(cli.pos[0]));
     for (auto& e : l->entries) {
         if (e.is_dir) std::cout << std::format("{:>14}  {}/\n", "<dir>", e.name);
         else std::cout << std::format("{:>14}  {}\n{:>16}{}\n", e.file->size(), e.name, "", e.file->describe());
@@ -236,50 +316,67 @@ int cmd_ls(const Cli& cli) {
     return 0;
 }
 
+/// How verify checks a kind of file, by the prefix of VFile::describe().
+enum class Check {
+    Flac,       // flac -t: every frame's CRC and the stream MD5
+    Decode,     // decodes cleanly with ffmpeg
+    DecodeCrc,  // decodes with every block's audio CRC checked
+    SameAudio,  // retagged: the same compressed audio as the source, and it decodes
+};
+const std::pair<std::string_view, Check> CHECKS[] = {
+    {"flac-image:", Check::Flac},         {"flac-encoded:", Check::Flac},      {"retagged-flac:", Check::Flac},
+    {"sacd:", Check::Decode},             {"wavpack-image:", Check::DecodeCrc}, {"retagged-mp3:", Check::SameAudio},
+    {"retagged-m4a:", Check::SameAudio},  {"retagged-wv:", Check::SameAudio},  {"retagged-dsf:", Check::SameAudio},
+};
+
+bool verify_file(Check check, const fs::path& out, const std::string& describe) {
+    auto decodes = [&](bool crc) {
+        std::vector<std::string> argv = {"ffmpeg", "-v", "error", "-xerror"};
+        if (crc) argv.insert(argv.end(), {"-err_detect", "crccheck"});
+        argv.insert(argv.end(), {"-i", out.string(), "-f", "null", "-"});
+        return argv;
+    };
+    switch (check) {
+    case Check::Flac: return run_ok({"flac", "-t", "-s", out.string()}, false);
+    case Check::Decode: return run_ok(decodes(false), true);
+    case Check::DecodeCrc: return run_ok(decodes(true), true);
+    case Check::SameAudio: {
+        auto a = stream_md5(out);
+        return a && a == stream_md5(describe.substr(describe.find(':') + 1)) && run_ok(decodes(false), false);
+    }
+    }
+    return false;
+}
+
 int cmd_verify(const Cli& cli) {
-    if (cli.pos.size() != 1) usage_error("verify needs a directory");
     auto lib = library(cli, 0);
-    auto l = lib->list_dir(abs_path(cli.pos[0]));
-    auto tmp = tempdir();
-    int ok = 0, n = 0;
+    auto l = lib->list_dir(source_dir(cli.pos[0]));
+    TempDir tmp;
+    int ok = 0, n = 0, skipped = 0;
     for (auto& e : l->entries) {
         if (e.is_dir) continue;
         std::string d = e.file->describe();
-        bool retag_other = starts_with(d, "retagged-mp3:") || starts_with(d, "retagged-m4a:") || starts_with(d, "retagged-wv:");
-        bool wavpack = starts_with(d, "wavpack-image:");
-        if (!(starts_with(d, "flac-image:") || starts_with(d, "flac-encoded:") || starts_with(d, "sacd:") || starts_with(d, "retagged-flac:") || retag_other ||
-              wavpack))
+        auto c = std::find_if(std::begin(CHECKS), std::end(CHECKS), [&](auto& kc) { return starts_with(d, kc.first); });
+        if (c == std::end(CHECKS)) {  // passed through unchanged
+            skipped++;
             continue;
-        n++;
-        fs::path out = tmp / e.name;
-        dump(*e.file, out);
-        bool good;
-        if (retag_other) {
-            // same compressed audio as the source, and it decodes
-            auto a = stream_md5(out);
-            good = a && a == stream_md5(d.substr(d.find(':') + 1)) &&
-                   run_ok({"ffmpeg", "-v", "error", "-xerror", "-i", out.string(), "-f", "null", "-"}, false);
-        } else if (wavpack) {
-            // decodes with every block's audio CRC checked
-            good = run_ok({"ffmpeg", "-v", "error", "-xerror", "-err_detect", "crccheck", "-i", out.string(), "-f", "null", "-"}, true);
-        } else if (starts_with(d, "sacd:")) {
-            good = run_ok({"ffmpeg", "-v", "error", "-xerror", "-i", out.string(), "-f", "null", "-"}, true);
-        } else {
-            good = run_ok({"flac", "-t", "-s", out.string()}, false);
         }
+        n++;
+        fs::path out = tmp.path / e.name;
+        dump(*e.file, out);
+        bool good = verify_file(c->second, out, d);
         if (good) ok++;
         std::cout << std::format("{}  {:>11}  {}\n", good ? "OK  " : "FAIL", e.file->size(), e.name) << std::flush;
         std::error_code ec;
         fs::remove(out, ec);
     }
-    std::cout << std::format("{}/{} virtual tracks valid\n", ok, n);
+    std::cout << std::format("{}/{} virtual tracks valid ({} files passed through unchanged)\n", ok, n, skipped);
     return ok == n ? 0 : 1;
 }
 
 int cmd_compare(const Cli& cli) {
-    if (cli.pos.size() != 2) usage_error("compare needs a directory and a split directory");
     auto lib = library(cli, 0);
-    auto l = lib->list_dir(abs_path(cli.pos[0]));
+    auto l = lib->list_dir(source_dir(cli.pos[0]));
     std::vector<const Entry*> virt;
     for (auto& e : l->entries)
         if (!e.is_dir && (starts_with(e.file->describe(), "flac-image:") || starts_with(e.file->describe(), "flac-encoded:"))) virt.push_back(&e);
@@ -288,10 +385,10 @@ int cmd_compare(const Cli& cli) {
         if (de.is_regular_file() && iequals(de.path().extension().string(), ".flac")) split_files.push_back(de.path());
     std::sort(split_files.begin(), split_files.end());
     WM_ENSURE(virt.size() == split_files.size(), "{} virtual tracks vs {} split files", virt.size(), split_files.size());
-    auto tmp = tempdir();
+    TempDir tmp;
     size_t same = 0;
     for (size_t i = 0; i < virt.size(); i++) {
-        fs::path out = tmp / virt[i]->name;
+        fs::path out = tmp.path / virt[i]->name;
         dump(*virt[i]->file, out);
         std::string a = pcm_md5(out), b = pcm_md5(split_files[i]);
         std::error_code ec;
@@ -304,19 +401,48 @@ int cmd_compare(const Cli& cli) {
     return same == virt.size() ? 0 : 1;
 }
 
+/// Keys starting with "_" anywhere a sidecar may have them ("_target", "_hide",
+/// "_cover", "_name", ...): a freshly rendered sidecar would drop them silently.
+std::vector<std::string> directives(const std::string& sidecar_text) {
+    using json = nlohmann::ordered_json;
+    json doc = json::parse(sidecar_text, nullptr, /*allow_exceptions=*/false, /*ignore_comments=*/true);
+    std::vector<std::string> out;
+    if (!doc.is_object()) return out;
+    auto scan = [&](const json& obj, const std::string& where) {
+        if (!obj.is_object()) return;
+        for (auto& [k, v] : obj.items())
+            if (starts_with(k, "_")) out.push_back(where + k);
+    };
+    scan(doc, "");
+    scan(doc.value("album", json()), "album.");
+    for (auto section : {"track", "file"})
+        if (auto s = doc.find(section); s != doc.end() && s->is_object())
+            for (auto& [k, v] : s->items()) scan(v, std::format("{}.\"{}\".", section, k));
+    return out;
+}
+
 int cmd_tags_init(const Cli& cli) {
-    if (cli.pos.size() != 1) usage_error("tags-init needs a directory");
     auto lib = library(cli, 0);
-    fs::path dir = abs_path(cli.pos[0]);
+    fs::path dir = source_dir(cli.pos[0]);
     auto ov = lib->overlay_dir(dir);
-    WM_ENSURE(ov.has_value(), "directory is not inside a configured root");
+    WM_ENSURE(ov.has_value(), "{} is not inside a configured root", dir.string());
     fs::path target = *ov / SIDECAR_NAME;
-    WM_ENSURE(!fs::exists(target) || cli.force, "{} exists (use --force)", target.string());
+    if (auto text = try_read_text(target)) {
+        WM_ENSURE(cli.force, "{} exists (use --force)", target.string());
+        std::string d;
+        for (auto& k : directives(*text)) d += (d.empty() ? "" : ", ") + k;
+        WM_ENSURE(d.empty(), "{} has settings a new sidecar would lose ({}): edit it by hand", target.string(), d);
+    }
     auto l = lib->list_dir(dir);
     std::vector<std::pair<std::string, Tags>> per;
-    for (auto& e : l->entries)
-        if (!e.is_dir)
-            if (auto t = read_tags(*e.file, e.name)) per.emplace_back(e.name, *t);
+    for (auto& e : l->entries) {
+        if (e.is_dir || e.tag_ext.empty()) continue;
+        try {
+            per.emplace_back(e.name, read_file_tags(e.tag_ext, [&](uint64_t o, size_t n) { return e.file->read_at(o, n); }, e.file->size()));
+        } catch (const std::exception& ex) {
+            warn("{}: {}", e.name, ex.what());
+        }
+    }
     WM_ENSURE(!per.empty(), "no taggable audio files in {}", dir.string());
     Tags album = per[0].second;
     std::erase_if(album.m, [&](auto& kv) {
@@ -333,28 +459,29 @@ int cmd_tags_init(const Cli& cli) {
     return 0;
 }
 
+int cmd_mount(const Cli& cli) {
+    info("WaveMorphFS {}", VERSION);
+    auto lib = library(cli, cli.workers);
+    lib->start_workers();
+    lib->refresh_placements(true);  // the tree is complete from the first request
+    if (cli.prescan > 0) lib->start_prescan(std::chrono::seconds(cli.prescan));
+    int rc = mount_fs(lib, {cli.pos[0], cli.threads, cli.allow_other});
+    // background workers and the prescan are detached and may be mid-job: leave
+    // without running static destructors under them. Nothing is lost: every
+    // file is written atomically.
+    std::fflush(nullptr);
+    std::_Exit(rc);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     log_init();
     Cli cli = parse_args(argc, argv);
     try {
-        if (cli.cmd == "mount") {
-            if (cli.pos.size() != 1) usage_error("mount needs a mountpoint");
-            info("WaveMorphFS {}", VERSION);
-            auto lib = library(cli, cli.workers);
-            lib->start_workers();
-            lib->refresh_placements(true);  // the tree is complete from the first request
-            lib->start_prescan(std::chrono::seconds(cli.prescan));
-            return mount_fs(lib, {cli.pos[0], cli.threads, cli.allow_other});
-        }
-        if (cli.cmd == "ls") return cmd_ls(cli);
-        if (cli.cmd == "verify") return cmd_verify(cli);
-        if (cli.cmd == "compare") return cmd_compare(cli);
-        if (cli.cmd == "tags-init") return cmd_tags_init(cli);
-        usage_error("unknown command " + cli.cmd);
+        return cli.run(cli);
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "Error: %s\n", e.what());
+        std::fprintf(stderr, "error: %s\n", e.what());
         return 1;
     }
 }
