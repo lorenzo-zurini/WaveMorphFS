@@ -4,6 +4,6 @@
 
 namespace wm {
 
-inline constexpr const char* VERSION = "@WAVEMORPH_VERSION@";
+inline constexpr const char* VERSION = "@WAVEMORPH_VERSION_STRING@";
 
 }  // namespace wm

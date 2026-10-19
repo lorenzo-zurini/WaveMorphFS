@@ -10,7 +10,7 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE RelWithDebInfo)
 endif()
 
-set(WAVEMORPH_VERSION "${PROJECT_VERSION}" CACHE STRING "Version reported by --version (CI sets it from the tag or commit)")
+set(WAVEMORPH_VERSION "" CACHE STRING "Version reported by --version; empty: the project version (CI sets it from the tag or commit)")
 option(WAVEMORPH_WERROR "Treat compiler warnings as errors" OFF)
 set(WAVEMORPH_SANITIZE "" CACHE STRING "Sanitizers to build with, e.g. address,undefined")
 
@@ -33,6 +33,11 @@ if(WAVEMORPH_SANITIZE)
   add_link_options(-fsanitize=${WAVEMORPH_SANITIZE})
 endif()
 
+# not cached itself, so a new project version reaches existing build directories
+set(WAVEMORPH_VERSION_STRING "${WAVEMORPH_VERSION}")
+if(NOT WAVEMORPH_VERSION_STRING)
+  set(WAVEMORPH_VERSION_STRING "${PROJECT_VERSION}")
+endif()
 configure_file(src/version.hpp.in generated/version.hpp @ONLY)
 
 # everything except main(), shared by the program and the tests
