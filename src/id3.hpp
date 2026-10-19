@@ -41,6 +41,9 @@ std::pair<std::vector<Seg>, uint64_t> retag_at(const File& f, uint64_t pos, cons
 /// + TRACKTOTAL, TXXX -> its description, COMM -> COMMENT, other text frames by
 /// id). Pictures and binary frames are not tags and are skipped.
 Tags read_tags(std::span<const uint8_t> tag);
+/// The image of an ID3v2 tag's front-cover picture (APIC type 3), else of its
+/// first picture; nullopt if it has none.
+std::optional<Bytes> front_picture(std::span<const uint8_t> tag);
 
 // exposed for tests
 struct Frame {

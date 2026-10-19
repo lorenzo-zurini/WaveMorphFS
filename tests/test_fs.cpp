@@ -10,6 +10,8 @@
 #include <cstring>
 #include <thread>
 
+#include "apetag.hpp"
+#include "cover.hpp"
 #include "fs.hpp"
 #include "library.hpp"
 #include "test.hpp"
@@ -301,4 +303,104 @@ TEST(mount_edits_sessions_and_stop) {
     statter.join();
 
     CHECK_MSG(m->stop_with_sigterm() == 0, "SIGTERM is a normal stop");
+}
+
+// ---------------------------------------------------------------- covers set on the mount
+
+namespace {
+
+Bytes image_file(const fs::path& p, const char* colour) {
+    auto st = run({"ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", std::format("color=c={}:s=40x30", colour), "-frames:v", "1", p.string()});
+    CHECK_MSG(st.ok(), "ffmpeg: {}", st.err);
+    return *try_read_file(p);
+}
+
+std::optional<Bytes> cover_of(const VFile& vf, const std::string& ext) {
+    return read_front_cover(ext, [&](uint64_t o, size_t n) { return vf.read_at(o, n); }, vf.size());
+}
+
+}  // namespace
+
+TEST(front_cover_read_from_flac_mp3_and_wavpack) {
+    wmtest::TempDir d("wm-frontcover");
+    Bytes jpg = image_file(d / "c.jpg", "red");
+    auto file_cover = [](const fs::path& p, const std::string& ext) { return cover_of(Passthrough(p, fs::file_size(p)), ext); };
+    // FLAC: a PICTURE block of type 3
+    make_flac(d / "a.flac", "A");
+    CHECK(!file_cover(d / "a.flac", "flac"));
+    CHECK(run({"metaflac", "--import-picture-from=" + (d / "c.jpg").string(), (d / "a.flac").string()}).ok());
+    CHECK(file_cover(d / "a.flac", "flac") == jpg);
+    // MP3: an APIC frame of type 3
+    CHECK(run({"ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=d=1", "-i", (d / "c.jpg").string(), "-map", "0", "-map", "1", "-c:a",
+               "libmp3lame", "-c:v", "copy", "-metadata:s:v", "comment=Cover (front)", (d / "a.mp3").string()})
+              .ok());
+    CHECK(file_cover(d / "a.mp3", "mp3") == jpg);
+    // WavPack: an APEv2 "Cover Art (Front)" item
+    CHECK(run({"ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=d=1", "-map_metadata", "-1", "-c:a", "wavpack", (d / "a.wv").string()}).ok());
+    auto cov = load_cover(d / "c.jpg");
+    CHECK(cov.has_value());
+    Bytes wv = *try_read_file(d / "a.wv");
+    for (auto& s : ape::build(Tags::from_pairs({{"TITLE", "A"}}), &*cov, std::nullopt)) {
+        if (auto* b = std::get_if<Bytes>(&s)) append(wv, *b);
+        else append(wv, jpg);  // the referenced image
+    }
+    atomic_write(d / "b.wv", wv);
+    CHECK(file_cover(d / "b.wv", "wv") == jpg);
+}
+
+TEST(covers_set_on_the_mount_are_stored_and_served) {
+    Fixture f("editcover");
+    make_flac(f.src / "A" / "img.flac", "Image");
+    atomic_write(f.src / "A" / "img.cue", std::string_view("FILE \"img.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"One\"\n    INDEX 01 00:00:00\n"
+                                                           "  TRACK 02 AUDIO\n    TITLE \"Two\"\n    INDEX 01 00:00:40\n"));
+    for (auto& e : fs::directory_iterator(f.src / "A")) fs::last_write_time(e.path(), fs::file_time_type::clock::now() - std::chrono::hours(1));
+    auto& lib = f.open();
+    Bytes blue = image_file(f.dir / "blue.jpg", "blue");
+    // the same picture embedded in both tracks: stored once, referenced by both
+    lib.apply_edit(f.src / "A", "01 - One.flac", std::string(EDIT_TRACK), "1", Tags{}, Library::CoverEdit{blue});
+    lib.apply_edit(f.src / "A", "02 - Two.flac", std::string(EDIT_TRACK), "2", Tags{}, Library::CoverEdit{blue});
+    std::vector<fs::path> stored;
+    for (auto& e : fs::directory_iterator(f.tags / "A" / EDITED_COVERS)) stored.push_back(e.path());
+    CHECK_MSG(stored.size() == 1 && *try_read_file(stored[0]) == blue, "{} stored images", stored.size());
+    auto sc = Sidecar::parse(*try_read_text(f.tags / "A" / SIDECAR_NAME));
+    std::string key1 = "1", key2 = "2";
+    CHECK(sc.cover_for("01 - One.flac", &key1) && sc.cover_for("02 - Two.flac", &key2));
+    CHECK(sc.cover_for("01 - One.flac", &key1)->starts_with("./"));
+    lib.invalidate(f.src / "A");
+    auto l = lib.list_dir(f.src / "A");
+    for (auto* n : {"01 - One.flac", "02 - Two.flac"}) {
+        auto e = l->find(n);
+        CHECK_MSG(e && cover_of(*e->file, "flac") == blue, "{} carries the new cover", n);
+    }
+    // removed: the track goes back to its own picture (none here)
+    lib.apply_edit(f.src / "A", "01 - One.flac", std::string(EDIT_TRACK), "1", Tags{}, Library::CoverEdit{std::nullopt});
+    lib.invalidate(f.src / "A");
+    l = lib.list_dir(f.src / "A");
+    CHECK(!cover_of(*l->find("01 - One.flac")->file, "flac"));
+    CHECK(cover_of(*l->find("02 - Two.flac")->file, "flac") == blue);
+    // only JPEG and PNG are taken
+    CHECK_THROWS(lib.apply_edit(f.src / "A", "02 - Two.flac", std::string(EDIT_TRACK), "2", Tags{}, Library::CoverEdit{Bytes{'G', 'I', 'F', '8', '9', 'a'}}));
+}
+
+TEST(mount_cover_embedded_by_a_tag_editor) {
+    Fixture f("mountcover");
+    make_flac(f.src / "A" / "a.flac", "Song");
+    f.sidecar("A", R"({"album": {"ALBUM": "X"}})");
+    f.open();
+    fs::path mnt = f.dir / "mnt";
+    auto m = Mount::start(f.lib, mnt);
+    if (!m) {
+        std::printf("      (skipped: FUSE is not available here)\n");
+        return;
+    }
+    Bytes green = image_file(f.dir / "green.png", "green");
+    std::string path = (mnt / "Lib" / "A" / "a.flac").string();
+    auto st = run({"metaflac", "--import-picture-from=" + (f.dir / "green.png").string(), path});
+    CHECK_MSG(st.ok(), "metaflac: {}", st.err);
+    auto served = [&] { return cover_of(Passthrough(path, fs::file_size(path)), "flac"); };
+    auto t0 = Clock::now();
+    while (served() != green && Clock::now() - t0 < std::chrono::seconds(3)) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    CHECK_MSG(served() == green, "the mount serves the cover the editor embedded");
+    CHECK(try_read_text(f.tags / "A" / SIDECAR_NAME)->find("\"_cover\": \"./.covers/") != std::string::npos);
+    CHECK_MSG(!fs::exists(f.src / "A" / ".covers"), "nothing is written next to the source");
 }

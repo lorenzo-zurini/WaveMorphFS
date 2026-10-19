@@ -10,6 +10,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "md5.hpp"
 #include "retag.hpp"
 
 namespace wm {
@@ -147,6 +148,7 @@ struct DirItem {
 struct CoverSet {
     const fs::path& covers_dir;
     const fs::path& cache_dir;  // scaled-down copies of large images
+    std::optional<fs::path> sidecar_dir;  // the folder's tags-tree folder: base of "./" paths
     std::map<std::string, std::optional<Cover>> loaded;
     std::vector<std::pair<fs::path, std::optional<int64_t>>> used;  // for Listing::covers
 
@@ -155,7 +157,9 @@ struct CoverSet {
         auto it = loaded.find(*spec);
         if (it == loaded.end()) {
             fs::path p = *spec;
-            if (p.is_relative()) {
+            if (spec->starts_with("./") && sidecar_dir) {
+                p = *sidecar_dir / spec->substr(2);  // e.g. a cover set on the mount (EDITED_COVERS)
+            } else if (p.is_relative()) {
                 if (covers_dir.empty()) {
                     // once per process, not on every rebuild of every folder using it
                     static std::mutex mu;
@@ -670,7 +674,8 @@ void Library::write_status() const {
     }
 }
 
-void Library::apply_edit(const fs::path& dir, const std::string& file_name, const std::string& section, const std::string& key, const Tags& changes) {
+void Library::apply_edit(const fs::path& dir, const std::string& file_name, const std::string& section, const std::string& key, const Tags& changes,
+                         const std::optional<CoverEdit>& cover) {
     using json = nlohmann::ordered_json;
     auto ov = overlay_dir(dir);
     WM_ENSURE(ov.has_value(), "{} is not inside a library root", dir.string());
@@ -764,6 +769,36 @@ void Library::apply_edit(const fs::path& dir, const std::string& file_name, cons
             f[*spelled] = value;
         } else if (doc.contains("file") && doc["file"].contains(file_name) && doc["file"][file_name].is_object()) {
             erase_field(doc["file"][file_name], k, "");
+        }
+    }
+    if (cover) {
+        // the edited entry's "_cover" replaces any other spelling of the track's
+        // table, and (for a track) an own file table's, which would win over it
+        auto drop_others = [&] {
+            for (auto& a : aliases)
+                if (a != table) doc[section][a].erase("_cover");
+            if (track && doc.contains("file") && doc["file"].contains(file_name) && doc["file"][file_name].is_object())
+                doc["file"][file_name].erase("_cover");
+        };
+        if (cover->image) {
+            const Bytes& img = *cover->image;
+            bool png = img.size() >= 8 && std::memcmp(img.data(), "\x89PNG", 4) == 0;
+            bool jpeg = img.size() >= 3 && img[0] == 0xFF && img[1] == 0xD8;
+            WM_ENSURE(png || jpeg, "the new cover is not a JPEG or PNG image");
+            Md5 h;
+            h.update(img);
+            auto d = h.finish();
+            std::string rel = std::format("{}/{}.{}", EDITED_COVERS, hex(std::span(d).subspan(0, 8)), png ? "png" : "jpg");
+            fs::path file = *ov / rel;
+            if (!fs::exists(file)) {  // named by its content: tracks sharing a picture share one file
+                fs::create_directories(file.parent_path());
+                atomic_write(file, img);
+            }
+            drop_others();
+            entry()["_cover"] = "./" + rel;
+        } else {
+            drop_others();
+            entry().erase("_cover");
         }
     }
     fs::create_directories(*ov);
@@ -919,6 +954,7 @@ std::shared_ptr<Listing> Library::build_listing(const fs::path& dir, const Sig& 
     b.names = with_context("read_dir " + dir.string(), [&] { return read_dir(dir); });
     for (auto& n : b.names) b.name_set.insert(n.name);
     b.overlay = overlay_dir(dir);
+    b.covers.sidecar_dir = b.overlay;
     bool broken = false;
     b.sidecar = load_sidecar(dir, b.overlay, broken);
     if (broken && previous) {

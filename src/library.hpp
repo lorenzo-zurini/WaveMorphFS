@@ -58,6 +58,10 @@ struct Config {
     std::chrono::milliseconds recheck{1500};
 };
 
+/// Folder (in a source folder's tags-tree folder) holding covers set on the
+/// mount; "_cover" paths starting with "./" are relative to the tags-tree folder.
+inline constexpr std::string_view EDITED_COVERS = ".covers";
+
 /// Sidecar sections that tag edits made on the mount are stored in.
 inline constexpr std::string_view EDIT_TRACK = "track", EDIT_FILE = "file";
 
@@ -185,9 +189,17 @@ public:
     /// Root this source path belongs to and the path relative to it.
     std::optional<std::pair<const Root*, fs::path>> root_of(const fs::path& p) const;
     std::optional<fs::path> overlay_dir(const fs::path& dir) const;
+    /// A front cover changed on the mount: the new image, or none (removed).
+    struct CoverEdit {
+        std::optional<Bytes> image;
+    };
     /// Store tag changes made to file `file_name` of source folder `dir` in the
-    /// folder's sidecar, under `section`/`key`. Existing spellings are kept.
-    void apply_edit(const fs::path& dir, const std::string& file_name, const std::string& section, const std::string& key, const Tags& changes);
+    /// folder's sidecar, under `section`/`key`. Existing spellings are kept. A
+    /// new cover is stored in the tags tree (EDITED_COVERS, named by its content)
+    /// and referenced by the entry's "_cover"; a removed one drops the entry's
+    /// "_cover", so the album's or the file's own cover shows again.
+    void apply_edit(const fs::path& dir, const std::string& file_name, const std::string& section, const std::string& key, const Tags& changes,
+                    const std::optional<CoverEdit>& cover = std::nullopt);
 
 private:
     explicit Library(Config cfg);

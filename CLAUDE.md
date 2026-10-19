@@ -50,7 +50,7 @@ src/
   dst.cpp        DST decoder (port of FFmpeg dstdec.c, LGPL-2.1+ used under GPL)
   id3.cpp mp4.cpp  ID3v2.4 writer/reader (DSF + MP3 retag), MP4 ilst rewrite/reader (stco/co64 shift)
   retag.cpp      regular FLAC/MP3/M4A/DSF with sidecar tags (Spliced VFile)
-  writeback.cpp  tag edits on the mount: WriteSession overlay, read_file_tags(), tag_changes() diff
+  writeback.cpp  tag edits on the mount: WriteSession overlay, read_file_tags(), read_front_cover(), tag_changes() diff
   sidecar.cpp    wavemorph.json (nlohmann ordered_json, // comments allowed, "_name" pins track file names, "_hide", "_target", "_cover")
   cover.cpp      "_cover" images: probe, scale >1024 px / >2 MB to a cached JPEG (libswscale), FLAC PICTURE / ID3 APIC bodies referencing the file (FileRange)
   placement.cpp  the mount tree: "_target" placement index (from the tags tree), virtual directory listings
@@ -104,7 +104,10 @@ file, mtime, tag_section/tag_key/tag_ext for edit routing).
   generated file (`tag_changes`: synonyms one field, placeholder zeros and a YEAR
   echoing DATE ignored, track numbers compared numerically) and stored by
   `Library::apply_edit` (track."N" for split tracks + `_name` pin, file."<name>"
-  for regular files). Create/rename/delete → EROFS.
+  for regular files). A changed front cover (read_front_cover, before vs after)
+  is stored as `<tags dir>/.covers/<md5>.jpg|png` and set as the entry's
+  `_cover: "./.covers/..."` (removed picture → `_cover` dropped); `./` cover paths
+  resolve against the tags-tree folder. Create/rename/delete → EROFS.
 - **Concurrency**: two worker lanes (`submit(task, Lane::Decode|Encode)`). Decode
   jobs never wait on other jobs; encode jobs may wait only on decode jobs. The
   item a reader needs right now is produced in the reader's thread; pools only do

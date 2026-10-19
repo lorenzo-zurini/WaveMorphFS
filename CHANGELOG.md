@@ -9,6 +9,15 @@ Generated files carry an *output epoch*: when a release changes what generated
 files contain, their modification times move forward, so music servers re-read
 them once on their next scan.
 
+## [Unreleased]
+
+### Added
+- Cover art can be set on the mount: a front cover embedded with a tag editor
+  is stored in the tags tree (`.covers/`, named by its content) and becomes the
+  track's `_cover`; removing the picture removes it. FLAC, DSF, MP3 and WavPack.
+- `_cover` paths starting with `./` are relative to the folder's sidecar in the
+  tags tree.
+
 ## [0.2.0] - 2026-10-19
 
 A release-readiness pass: every part of the code was reviewed, and the bugs,
@@ -142,6 +151,7 @@ lossless images (APE, WavPack, TTA, TAK, WAV, ALAC) encoded to FLAC on the fly,
 SACD ISOs (plain DSD and DST) as DSF, sidecar tags for every file kind, tag edits
 on the mount stored in sidecars, and a container image for amd64 and arm64.
 
+[Unreleased]: https://github.com/lorenzo-zurini/WaveMorphFS/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/lorenzo-zurini/WaveMorphFS/compare/v0.1.9...v0.2.0
 [0.1.9]: https://github.com/lorenzo-zurini/WaveMorphFS/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/lorenzo-zurini/WaveMorphFS/compare/v0.1.7...v0.1.8

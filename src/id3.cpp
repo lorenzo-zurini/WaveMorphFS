@@ -425,6 +425,27 @@ void apply(std::vector<Frame>& frames, const Tags& overlay) {
     }
 }
 
+std::optional<Bytes> front_picture(std::span<const uint8_t> tag) {
+    if (tag.size() < 10 || std::memcmp(tag.data(), "ID3", 3) != 0) return std::nullopt;
+    std::optional<Bytes> first;
+    for (auto& f : parse_tag(tag).first.frames) {
+        if (f.sid() != "APIC") continue;
+        auto b = body_of(f);
+        // encoding, MIME type (Latin-1, NUL), picture type, description (NUL in its encoding), image
+        if (!b || b->size() < 4) continue;
+        uint8_t enc = (*b)[0];
+        auto mime_end = std::find(b->begin() + 1, b->end(), 0);
+        if (mime_end == b->end() || mime_end + 2 > b->end()) continue;
+        uint8_t type = *(mime_end + 1);
+        auto rest = b->subspan(size_t(mime_end + 2 - b->begin()));
+        auto image = split_terminated(enc, rest).second;
+        if (image.empty()) continue;
+        if (type == 3) return Bytes(image.begin(), image.end());
+        if (!first) first = Bytes(image.begin(), image.end());
+    }
+    return first;
+}
+
 Tags read_tags(std::span<const uint8_t> tag) {
     Tags t;
     if (tag.size() < 10 || std::memcmp(tag.data(), "ID3", 3) != 0) return t;

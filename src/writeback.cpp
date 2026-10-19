@@ -86,6 +86,58 @@ Tags read_file_tags(const std::string& ext, const ByteReader& read, uint64_t siz
     fail("no tag reader for .{} files", ext);
 }
 
+std::optional<Bytes> read_front_cover(const std::string& ext, const ByteReader& read, uint64_t size) {
+    auto id3_at = [&](uint64_t pos) -> std::optional<Bytes> {
+        auto len = id3::tag_length(read(pos, 10));
+        if (!len || *len > size || pos > size - *len) return std::nullopt;
+        return id3::front_picture(read(pos, size_t(*len)));
+    };
+    if (ext == "flac") {
+        std::optional<Bytes> first;
+        for (uint64_t pos = 4; pos + 4 <= size;) {
+            Bytes bh = read(pos, 4);
+            if (bh.size() < 4) break;
+            bool last = bh[0] & 0x80;
+            size_t len = size_t(bh[1]) << 16 | size_t(bh[2]) << 8 | bh[3];
+            if ((bh[0] & 0x7F) == flac::BLOCK_PICTURE) {
+                // type, MIME, description, width, height, depth, colours, image
+                Bytes b = read(pos + 4, len);
+                auto image = [&]() -> std::optional<Bytes> {
+                    size_t p = 4;
+                    for (int s = 0; s < 2; s++) {  // MIME type, description
+                        if (p + 4 > b.size()) return std::nullopt;
+                        p += 4 + be32(&b[p]);
+                    }
+                    p += 16;
+                    if (p + 4 > b.size() || be32(&b[p]) > b.size() - p - 4) return std::nullopt;
+                    return Bytes(b.begin() + ptrdiff_t(p + 4), b.begin() + ptrdiff_t(p + 4 + be32(&b[p])));
+                }();
+                if (image && b.size() >= 4 && be32(b.data()) == 3) return image;
+                if (image && !first) first = std::move(image);
+            }
+            pos += 4 + len;
+            if (last) break;
+        }
+        return first;
+    }
+    if (ext == "dsf") {
+        Bytes h = read(0, 28);
+        if (h.size() < 28) return std::nullopt;
+        uint64_t meta = le64(&h[20]);
+        return meta ? id3_at(meta) : std::nullopt;
+    }
+    if (ext == "mp3") return id3_at(0);
+    if (ext == "wv") {
+        auto a = ape::read(read, size);
+        if (!a || !a->front_cover) return std::nullopt;
+        Bytes v = read(a->front_cover->off, size_t(a->front_cover->len));  // file name, NUL, image
+        auto nul = std::find(v.begin(), v.end(), 0);
+        if (nul == v.end() || nul + 1 == v.end()) return std::nullopt;
+        return Bytes(nul + 1, v.end());
+    }
+    return std::nullopt;
+}
+
 Tags tag_changes(const Tags& before, const Tags& after) {
     struct Field {
         std::string name;

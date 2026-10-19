@@ -184,13 +184,21 @@ int commit(Handle& h) {
             return read_file_tags(ve.e.tag_ext, [&](uint64_t o, size_t l) { return ws.read(o, l); }, ws.size());
         });
         Tags diff = tag_changes(before, after);
-        if (diff.empty()) {
+        // the front cover: a new picture becomes the entry's "_cover", a removed one drops it
+        std::optional<Library::CoverEdit> cover;
+        {
+            auto was = read_front_cover(ve.e.tag_ext, [&](uint64_t o, size_t l) { return ve.e.file->read_at(o, l); }, ve.e.file->size());
+            auto now = read_front_cover(ve.e.tag_ext, [&](uint64_t o, size_t l) { return ws.read(o, l); }, ws.size());
+            if (was != now) cover = Library::CoverEdit{std::move(now)};
+        }
+        if (diff.empty() && !cover) {
             info("edit of {}: no tag changes", h.path);
         } else {
-            g_lib->apply_edit(ve.src_dir, ve.src_name, ve.e.tag_section, ve.e.tag_key, diff);
+            g_lib->apply_edit(ve.src_dir, ve.src_name, ve.e.tag_section, ve.e.tag_key, diff, cover);
             g_lib->invalidate(ve.src_dir);  // editors read the file back right away
             std::string what;
             for (auto& [k, v] : diff.m) what += (what.empty() ? "" : ", ") + k + (v.empty() ? " (removed)" : "");
+            if (cover) what += std::string(what.empty() ? "" : ", ") + (cover->image ? "front cover" : "front cover (removed)");
             info("edit of {}: {} -> sidecar {}[{}]", h.path, what, ve.e.tag_section, ve.e.tag_key);
         }
         ws.mark_stored(changes);

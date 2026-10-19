@@ -24,6 +24,12 @@ namespace wm {
 /// editor left half-written is never taken for one whose tags were all removed.
 Tags read_file_tags(const std::string& ext, const ByteReader& read, uint64_t size);
 
+/// The front-cover image of a FLAC / DSF / MP3 / WavPack file (the picture of
+/// type "front cover", else the first one), read through `read`; nullopt if it
+/// has none. M4A covers are not read: sidecar covers cannot be shown in M4A
+/// output, so a change to one could not be honoured.
+std::optional<Bytes> read_front_cover(const std::string& ext, const ByteReader& read, uint64_t size);
+
 /// What changed from `before` to `after`, field by field (synonyms are the same
 /// field): changed or added fields with their new values, removed fields with
 /// an empty value list.

@@ -53,12 +53,13 @@ The main use is turning a messy collection into a clean one without touching it:
    moving and renaming files turned off (the mount decides names and places).
    Editors save as they would to any file; WaveMorphFS writes the changes to its
    sidecar files and serves them straight back, so there is nothing to manage by
-   hand. Tags already in the files, the CUE sheet and the SACD text are the
-   starting point.
+   hand. Cover art works the same way: embed a picture with the editor and the
+   track is served with it. Tags already in the files, the CUE sheet and the SACD
+   text are the starting point.
 3. **Organize it.** A line in a folder's sidecar places that folder, a disc or a
    single track anywhere in the mount, so the tree follows artist, composer or work
    rather than whatever the folders on disk are called. The same way, junk can be
-   hidden and a front cover set per album or per work.
+   hidden and one front cover set for a whole album or work.
 4. **Stream it.** The music server sees an ordinary, tidy folder of tagged tracks,
    and rescans it like any other.
 
@@ -98,11 +99,12 @@ Beyond splitting and converting:
   with all of them. Tag names are kept exactly as given, so Picard's
   `MusicBrainz Album Id`, ffprobe's `album_artist` and plain Vorbis names all work
   and are never renamed.
-- **Edit tags on the mount.** Open a track in Picard, Kid3, beets or any other
-  tag editor and save. The change is stored in the folder's sidecar and shows up
-  at once; the source file is not touched.
-- **Per-work cover art.** A sidecar can name the front cover for a folder, a
-  track or a file. Large images are scaled to 1024 px once and cached.
+- **Edit tags and covers on the mount.** Open a track in Picard, Kid3, beets or
+  any other tag editor, change its tags or embed a new front cover, and save. The
+  change is stored alongside the folder's sidecar and shows up at once; the
+  source file is not touched.
+- **Per-work cover art.** A sidecar can also name the front cover for a whole
+  folder, a track or a file. Large images are scaled to 1024 px once and cached.
 - **Several discs in one folder.** Two images in one folder become discs 1 and
   2 (`1-01 - Title.flac`, `2-01 - ...`).
 - **Exact, verifiable output.** File sizes are known before any byte is read,
@@ -462,7 +464,9 @@ album, for example by work:
 
 - At the top level or in `album` it covers every track of the folder; in a
   `track` or `file` entry it applies to that one.
-- Paths are absolute, or relative to `--covers-dir` (`WAVEMORPH_COVERS_DIR`).
+- Paths are absolute, relative to `--covers-dir` (`WAVEMORPH_COVERS_DIR`), or,
+  when they start with `./`, relative to the folder's sidecar in the tags tree.
+  Covers embedded on the mount are stored there, as `./.covers/<hash>.jpg`.
 - JPEG or PNG. Images larger than 1024 px on the long edge or 2 MB are scaled to
   1024 px once and kept in the cache, so you can point at full-resolution
   artwork. Smaller images are never enlarged. A missing or unreadable image is
@@ -482,6 +486,14 @@ sidecar: under `track."N"` for split tracks (which also pins the file's name,
 so retitling a track doesn't rename it), and under `file."<name>"` for regular
 files. Names already used in the sidecar keep their spelling, and removed tags
 are stored as `""`.
+
+The front cover works the same way. A new picture embedded by the editor is
+stored in the tags tree, next to the sidecar under `.covers/`, named by its
+content (twelve tracks given the same picture share one file), and the track's
+entry gets a `_cover` pointing at it. Removing the picture removes that
+`_cover`, so the track shows the album's cover or its own again. This works for
+FLAC, DSF, MP3 and WavPack; M4A output can't carry sidecar covers yet, so a
+cover changed on an M4A file is not kept.
 
 Changes to the audio itself are discarded. Files can't be created, renamed or
 deleted. Only the user running WaveMorphFS (and root) may edit; everyone else
@@ -569,7 +581,8 @@ on every change.
 - Hybrid WavPack (a lossy `.wv` plus a `.wvc` correction file): the correction
   file isn't used, so integer hybrid files are served from the lossy `.wv` part,
   and float hybrid files are left as they are.
-- Fragmented MP4 files aren't retagged, and `_cover` leaves M4A files alone.
+- Fragmented MP4 files aren't retagged, and covers (from `_cover` or embedded on
+  the mount) leave M4A files alone.
 - Sidecar tags apply to FLAC, MP3, M4A, DSF and WavPack. Ogg, Opus and
   standalone WAV or AIFF files are passed through as they are.
 - FUSE can't notify music servers of changes, so they need to rescan on a timer.
