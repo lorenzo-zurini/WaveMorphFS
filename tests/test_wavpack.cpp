@@ -170,3 +170,21 @@ TEST(float_wavpack_image_split_by_blocks) {
     }
     fs::remove_all(dir);
 }
+
+TEST(wavpack_block_numbers_as_libwavpack_stores_them) {
+    std::vector<int32_t> pcm(4000 * 2, 0);
+    Bytes wv = make_float_wavpack(pcm, 44100);
+    uint32_t len = le32(&wv[4]) + 8;
+    Bytes block(wv.begin(), wv.begin() + len);
+    // 40-bit sample numbers; totals of 2^32 - 1 and more are stored shifted (all
+    // ones in the low word would mean "unknown length")
+    for (uint64_t total : {uint64_t(4000), uint64_t(0xFFFFFFFE), uint64_t(0xFFFFFFFF), uint64_t(0x1234567890)}) {
+        uint64_t index = total / 2;
+        Bytes b = rebuild_block(block, index, total, true);
+        WavpackHeader h;
+        std::memcpy(&h, b.data(), sizeof h);  // little-endian host, as in the CI images
+        CHECK_MSG(GET_BLOCK_INDEX(h) == int64_t(index), "index {}", index);
+        CHECK_MSG(GET_TOTAL_SAMPLES(h) == int64_t(total), "total {} read as {}", total, GET_TOTAL_SAMPLES(h));
+        CHECK(h.ckSize + 8 == b.size());
+    }
+}
