@@ -576,52 +576,76 @@ Bytes encode_verbatim(const std::vector<std::span<const int32_t>>& chans, uint32
 // ------------------------------------------------------------------ encoding (libFLAC)
 
 namespace {
-struct FrameSink {
-    Bytes frame;
-};
 
-FLAC__StreamEncoderWriteStatus enc_write(const FLAC__StreamEncoder*, const FLAC__byte buffer[], size_t bytes, uint32_t samples, uint32_t, void* cd) {
-    // metadata is written with samples == 0; only the audio frame is kept
-    if (samples > 0) static_cast<FrameSink*>(cd)->frame.insert(static_cast<FrameSink*>(cd)->frame.end(), buffer, buffer + bytes);
+/// Keeps the audio frames libFLAC writes, by frame number (metadata comes with samples == 0).
+FLAC__StreamEncoderWriteStatus enc_write(const FLAC__StreamEncoder*, const FLAC__byte buffer[], size_t bytes, uint32_t samples, uint32_t current_frame,
+                                         void* cd) {
+    auto& frames = *static_cast<std::vector<Bytes>*>(cd);
+    if (samples == 0) return FLAC__STREAM_ENCODER_WRITE_STATUS_OK;
+    if (current_frame >= frames.size()) frames.resize(size_t(current_frame) + 1);
+    frames[current_frame].insert(frames[current_frame].end(), buffer, buffer + bytes);
     return FLAC__STREAM_ENCODER_WRITE_STATUS_OK;
 }
+
+struct EncoderDelete {
+    void operator()(FLAC__StreamEncoder* e) const { FLAC__stream_encoder_delete(e); }
+};
+
 }  // namespace
 
-Bytes encode_frame(const std::vector<std::span<const int32_t>>& chans, uint32_t bps, uint32_t sample_rate, uint32_t block_size, uint64_t frame_number) {
+std::vector<Bytes> encode_frames(const std::vector<std::span<const int32_t>>& chans, uint32_t bps, uint32_t sample_rate, uint32_t block_size,
+                                 uint64_t first_frame) {
     size_t n = chans[0].size();
-    WM_ENSURE(n >= 1 && n <= block_size, "bad block of {} samples", n);
-    FLAC__StreamEncoder* e = FLAC__stream_encoder_new();
+    WM_ENSURE(n >= 1 && block_size >= 16, "bad run of {} samples in blocks of {}", n, block_size);
+    std::unique_ptr<FLAC__StreamEncoder, EncoderDelete> e(FLAC__stream_encoder_new());
     WM_ENSURE(e, "out of memory");
-    struct Free {
-        FLAC__StreamEncoder* e;
-        ~Free() { FLAC__stream_encoder_delete(e); }
-    } guard{e};
-    FLAC__stream_encoder_set_channels(e, uint32_t(chans.size()));
-    FLAC__stream_encoder_set_bits_per_sample(e, bps);
-    FLAC__stream_encoder_set_sample_rate(e, sample_rate);
-    FLAC__stream_encoder_set_compression_level(e, 5);
+    FLAC__stream_encoder_set_channels(e.get(), uint32_t(chans.size()));
+    FLAC__stream_encoder_set_bits_per_sample(e.get(), bps);
+    FLAC__stream_encoder_set_sample_rate(e.get(), sample_rate);
+    FLAC__stream_encoder_set_compression_level(e.get(), 5);
     // per-frame stereo decisions only (loose mid-side would carry state between frames)
-    FLAC__stream_encoder_set_loose_mid_side_stereo(e, false);
-    FLAC__stream_encoder_set_blocksize(e, block_size);
-    FLAC__stream_encoder_set_total_samples_estimate(e, n);
-    FrameSink sink;
-    if (FLAC__stream_encoder_init_stream(e, enc_write, nullptr, nullptr, nullptr, &sink) != FLAC__STREAM_ENCODER_INIT_STATUS_OK)
-        fail("FLAC encoder init failed");
+    FLAC__stream_encoder_set_loose_mid_side_stereo(e.get(), false);
+    FLAC__stream_encoder_set_blocksize(e.get(), block_size);
+    FLAC__stream_encoder_set_total_samples_estimate(e.get(), n);
+    std::vector<Bytes> frames;
+    auto init = [&] { return FLAC__stream_encoder_init_stream(e.get(), enc_write, nullptr, nullptr, nullptr, &frames); };
+    auto st = init();
+    if (st == FLAC__STREAM_ENCODER_INIT_STATUS_NOT_STREAMABLE) {
+        // outside the streamable subset (e.g. 28 bits per sample, or rates over
+        // 655350 Hz) libFLAC refuses by default; only these streams are made
+        // non-subset, so every other stream keeps the exact encoder setup
+        FLAC__stream_encoder_set_streamable_subset(e.get(), false);
+        st = init();
+    }
+    if (st != FLAC__STREAM_ENCODER_INIT_STATUS_OK) fail("FLAC encoder init failed: {}", FLAC__StreamEncoderInitStatusString[st]);
     std::vector<const FLAC__int32*> ptrs;
     for (auto& c : chans) ptrs.push_back(c.data());
-    bool ok = FLAC__stream_encoder_process(e, ptrs.data(), uint32_t(n)) && FLAC__stream_encoder_finish(e);
-    WM_ENSURE(ok, "FLAC encoding failed: {}", FLAC__StreamEncoderStateString[FLAC__stream_encoder_get_state(e)]);
-    // the frame was numbered 0; renumber it
-    auto h = FrameHeader::parse(sink.frame);
-    WM_ENSURE(h.has_value() && !h->variable && h->number == 0, "unexpected encoder output");
-    Bytes out(sink.frame.begin(), sink.frame.begin() + 4);
-    encode_number(frame_number, out);
-    size_t es = 4 + h->number_len;
-    out.insert(out.end(), sink.frame.begin() + ptrdiff_t(es), sink.frame.begin() + ptrdiff_t(es + h->extra_len));
-    out.push_back(crc8(out));
-    out.insert(out.end(), sink.frame.begin() + ptrdiff_t(h->len), sink.frame.end() - 2);
-    put_be16(out, crc16(out));
-    return out;
+    bool ok = FLAC__stream_encoder_process(e.get(), ptrs.data(), uint32_t(n)) && FLAC__stream_encoder_finish(e.get());
+    WM_ENSURE(ok, "FLAC encoding failed: {}", FLAC__StreamEncoderStateString[FLAC__stream_encoder_get_state(e.get())]);
+    WM_ENSURE(frames.size() == (n + block_size - 1) / block_size, "FLAC encoder wrote {} frames for {} samples", frames.size(), n);
+    // renumber: the frames were numbered from 0
+    for (size_t i = 0; i < frames.size(); i++) {
+        auto& fr = frames[i];
+        auto h = FrameHeader::parse(fr);
+        WM_ENSURE(h.has_value() && !h->variable && h->number == i, "unexpected encoder output");
+        auto f = h->fields(fr);
+        f.number = first_frame + i;
+        auto hdr = write_header(f);
+        std::span<const uint8_t> body(fr.data() + h->len, fr.size() - h->len - 2);
+        Bytes out(hdr.len + body.size() + 2);
+        std::copy(hdr.b.begin(), hdr.b.begin() + ptrdiff_t(hdr.len), out.begin());
+        std::copy(body.begin(), body.end(), out.begin() + ptrdiff_t(hdr.len));
+        uint16_t crc = crc16(std::span(out).first(out.size() - 2));
+        out[out.size() - 2] = uint8_t(crc >> 8);
+        out[out.size() - 1] = uint8_t(crc);
+        fr = std::move(out);
+    }
+    return frames;
+}
+
+Bytes encode_frame(const std::vector<std::span<const int32_t>>& chans, uint32_t bps, uint32_t sample_rate, uint32_t block_size, uint64_t frame_number) {
+    WM_ENSURE(chans[0].size() <= block_size, "bad block of {} samples", chans[0].size());
+    return std::move(encode_frames(chans, bps, sample_rate, block_size, frame_number)[0]);
 }
 
 // ------------------------------------------------------------------ decoding (libFLAC)

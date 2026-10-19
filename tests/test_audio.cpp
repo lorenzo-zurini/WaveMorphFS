@@ -190,3 +190,69 @@ TEST(future_lru_evicts_finished_least_recent_and_spares_kept) {
     c.drop_ready();
     CHECK(c.size() == 0 && c.total_cost() == 0);
 }
+
+// ---- FLAC primitives
+
+TEST(crc16_shift_updates_a_crc_for_a_changed_prefix) {
+    uint64_t seed = 5;
+    auto rnd = [&] {
+        seed = seed * 6364136223846793005ull + 1442695040888963407ull;
+        return uint8_t(seed >> 56);
+    };
+    for (size_t n : {size_t(0), size_t(1), size_t(2), size_t(255), size_t(4097), size_t(70001), size_t(1) << 20}) {
+        Bytes a(1 + n % 13), a2(1 + n % 7), body(n);
+        for (auto* v : {&a, &a2, &body})
+            for (auto& x : *v) x = rnd();
+        Bytes ab = a, a2b = a2;
+        append(ab, body);
+        append(a2b, body);
+        CHECK(flac::crc16(ab) == (flac::crc16_shift(flac::crc16(a), n) ^ flac::crc16(body)));
+        CHECK(flac::crc16(a2b) == (flac::crc16(ab) ^ flac::crc16_shift(flac::crc16(a) ^ flac::crc16(a2), n)));
+    }
+}
+
+TEST(encode_frames_matches_one_encoder_per_frame) {
+    // one encoder for a run of frames must give exactly the frames that a fresh
+    // encoder per frame gives: layouts measured one way are served the other
+    struct Case {
+        uint32_t bps, rate, block;
+        size_t ch, total;
+        int kind;  // 0 tone + noise, 1 silence, 2 full-scale noise, 3 square wave
+    };
+    std::vector<Case> cases;
+    for (uint32_t bps : {8u, 16u, 24u, 32u})
+        for (size_t ch : {size_t(1), size_t(2), size_t(6)})
+            for (int kind : {0, 1, 2, 3}) cases.push_back({bps, 44100, 4096, ch, 4096 * 5 + 77, kind});
+    cases.push_back({16, 48000, 1152, 2, 1152 * 9 + 1, 0});
+    cases.push_back({24, 96000, 1000, 2, 1000 * 4, 0});
+    cases.push_back({20, 705600, 4096, 2, 4096 * 3 + 5, 0});  // outside the streamable subset
+    cases.push_back({28, 44100, 4096, 2, 4096 * 2 + 9, 2});   // likewise
+    for (auto& c : cases) {
+        auto sig = signal(c.total, c.ch, std::min(c.bps, 24u));
+        int64_t hi = (int64_t(1) << (c.bps - 1)) - 1, lo = -hi - 1;
+        uint64_t seed = 1;
+        for (auto& chan : sig)
+            for (size_t i = 0; i < chan.size(); i++) {
+                seed = seed * 6364136223846793005ull + 1442695040888963407ull;
+                int64_t v = c.kind == 0 ? int64_t(chan[i]) << (c.bps > 24 ? c.bps - 24 : 0)
+                            : c.kind == 1 ? 0
+                            : c.kind == 2 ? lo + int64_t(seed >> 1) % (hi - lo + 1)
+                                          : ((i / 37) % 2 ? hi : lo);
+                chan[i] = int32_t(v);
+            }
+        std::vector<std::span<const int32_t>> all(sig.begin(), sig.end());
+        uint64_t first = 1000;
+        auto run = flac::encode_frames(all, c.bps, c.rate, c.block, first);
+        CHECK(run.size() == (c.total + c.block - 1) / c.block);
+        for (size_t k = 0; k < run.size(); k++) {
+            std::vector<std::span<const int32_t>> one;
+            for (auto& s : all) one.push_back(s.subspan(k * c.block, std::min<size_t>(c.block, c.total - k * c.block)));
+            Bytes alone = flac::encode_frame(one, c.bps, c.rate, c.block, first + k);
+            CHECK_MSG(alone == run[k], "{} bit {} ch kind {} block {}: frame {} differs", c.bps, c.ch, c.kind, c.block, k);
+            // (decode_frame needs codes a frame header can carry for bps and rate)
+            if (flac::bps_code_for(c.bps) == 0 || c.rate > 655350) continue;
+            auto dec = flac::decode_frame(run[k], c.bps, c.rate);
+            for (size_t ci = 0; ci < c.ch; ci++) CHECK(std::equal(dec[ci].begin(), dec[ci].end(), one[ci].begin(), one[ci].end()));
+        }
+    }
+}

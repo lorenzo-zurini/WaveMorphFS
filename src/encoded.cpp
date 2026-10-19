@@ -66,11 +66,8 @@ std::vector<TrackLayout> build_layout(const AvImage& img, const Ranges& ranges, 
             uint64_t j1 = std::min(nf, j0 + BATCH);
             uint64_t a = s + j0 * ENCODED_BLOCK, b = std::min(e, s + j1 * ENCODED_BLOCK);
             auto pcm = img.decode_range(a, b);
-            for (uint64_t j = j0; j < j1; j++) {
-                size_t from = size_t((j - j0) * ENCODED_BLOCK);
-                size_t n = size_t(std::min<uint64_t>(ENCODED_BLOCK, b - a - from));
-                tl.frame_sizes.push_back(uint32_t(flac::encode_frame(slice(pcm, from, n), img.bps, img.sample_rate, ENCODED_BLOCK, j).size()));
-            }
+            for (auto& fr : flac::encode_frames(slice(pcm, 0, size_t(b - a)), img.bps, img.sample_rate, ENCODED_BLOCK, j0))
+                tl.frame_sizes.push_back(uint32_t(fr.size()));
             pcm_bytes.clear();
             for (size_t i = 0; i < pcm[0].size(); i++)
                 for (auto& c : pcm) {
@@ -149,13 +146,19 @@ void EncodedTrack::produce(const Promises& ps) const {
     try {
         uint64_t sa = start_ + fa * ENCODED_BLOCK, sb = std::min(end_, start_ + fb * ENCODED_BLOCK);
         auto pcm = img_->decode_range(sa, sb);
-        for (auto& [j, p] : ps) {
-            size_t from = size_t((j - fa) * ENCODED_BLOCK);
-            size_t n = size_t(std::min<uint64_t>(ENCODED_BLOCK, sb - sa - from));
-            auto fr = std::make_shared<const Bytes>(flac::encode_frame(slice(pcm, from, n), img_->bps, img_->sample_rate, ENCODED_BLOCK, j));
-            if (fr->size() != offsets_[j + 1] - offsets_[j])
-                fail("frame {} encoded to {} bytes, layout says {}", j, fr->size(), offsets_[j + 1] - offsets_[j]);
-            p->set_value(fr);
+        // each run of consecutive claimed frames is encoded by one encoder
+        for (size_t r = 0, r2; r < ps.size(); r = r2) {
+            for (r2 = r + 1; r2 < ps.size() && ps[r2].first == ps[r2 - 1].first + 1;) r2++;
+            size_t from = size_t((ps[r].first - fa) * ENCODED_BLOCK);
+            size_t n = size_t(std::min<uint64_t>((r2 - r) * ENCODED_BLOCK, sb - sa - from));
+            auto frames = flac::encode_frames(slice(pcm, from, n), img_->bps, img_->sample_rate, ENCODED_BLOCK, ps[r].first);
+            for (size_t i = r; i < r2; i++) {
+                auto& [j, p] = ps[i];
+                auto fr = std::make_shared<const Bytes>(std::move(frames[i - r]));
+                if (fr->size() != offsets_[j + 1] - offsets_[j])
+                    fail("frame {} encoded to {} bytes, layout says {}", j, fr->size(), offsets_[j + 1] - offsets_[j]);
+                p->set_value(std::move(fr));
+            }
         }
     } catch (...) {
         std::lock_guard g(mu_);

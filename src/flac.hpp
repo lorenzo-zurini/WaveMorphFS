@@ -162,11 +162,15 @@ uint64_t verbatim_size(uint32_t samples, uint32_t channels, uint32_t bps, uint64
 Bytes encode_verbatim(const std::vector<std::span<const int32_t>>& chans, uint32_t bps, uint64_t sample_number, uint8_t sr_code,
                       std::span<const uint8_t> sr_extra);
 
-/// Encode one block of per-channel samples as a compressed FLAC frame (libFLAC,
-/// compression level 5) numbered `frame_number` in a fixed-blocksize stream of
-/// `block_size`-sample frames. Frames are encoded independently, so the result
-/// depends only on the samples and the number: the same frame can be produced
-/// again at any time, byte for byte.
+/// Encode per-channel samples as compressed FLAC frames (libFLAC, compression
+/// level 5) of `block_size` samples each (the last may be shorter), numbered from
+/// `first_frame` in a fixed-blocksize stream. Frames are encoded independently, so
+/// each depends only on its samples and number: the same frame can be produced
+/// again at any time, alone or in another run, byte for byte. One encoder serves
+/// the whole run (setting one up costs about a third of encoding a frame).
+std::vector<Bytes> encode_frames(const std::vector<std::span<const int32_t>>& chans, uint32_t bps, uint32_t sample_rate, uint32_t block_size,
+                                 uint64_t first_frame);
+/// One frame of encode_frames.
 Bytes encode_frame(const std::vector<std::span<const int32_t>>& chans, uint32_t bps, uint32_t sample_rate, uint32_t block_size, uint64_t frame_number);
 
 /// Decode one complete frame (first header byte to CRC-16) to per-channel samples.
