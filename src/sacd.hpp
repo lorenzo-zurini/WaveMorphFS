@@ -75,7 +75,7 @@ public:
 
     /// audio frames per decoded chunk
     static constexpr uint64_t CHUNK_FRAMES = 8;
-    using Chunk = std::shared_ptr<const std::vector<Bytes>>;  // per-channel DSD bytes (MSB-first)
+    using Chunk = std::shared_ptr<const std::vector<Bytes>>;  // per-channel DSD bytes, LSB first as in DSF
     /// Chunk c (frames [c*CHUNK_FRAMES, ...)), decoded here if nobody has started
     /// it; the following chunks are decoded ahead in the background.
     Chunk chunk(uint64_t c) const;
