@@ -2,6 +2,8 @@
 #include "cache.hpp"
 
 #include <bit>
+#include <cctype>
+#include <cstdlib>
 #include <cstring>
 
 #include "md5.hpp"
@@ -102,15 +104,11 @@ Md5Map Cache::load_md5s(const fs::path& flac) const {
     return m;
 }
 
-void Cache::store_md5s(const fs::path& flac, const Md5Map& entries) const {
-    auto key = SrcKey::of(flac);
-    auto m = load_md5s(flac);
+void Cache::store_md5s(const fs::path& flac, const SrcKey& key, const Md5Map& entries) const {
+    Md5Map m = SrcKey::try_of(flac) == key ? load_md5s(flac) : Md5Map{};
     for (auto& [r, d] : entries) m[r] = d;
-    std::vector<std::string> lines;
-    for (auto& [r, d] : m) lines.push_back(std::format("{} {} {}", r.first, r.second, hex(d)));
-    std::sort(lines.begin(), lines.end());
     std::string text;
-    for (auto& l : lines) text += l + "\n";
+    for (auto& [r, d] : m) text += std::format("{} {} {}\n", r.first, r.second, hex(d));
     atomic_write(md5_path(flac, key), text);
 }
 
