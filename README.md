@@ -11,9 +11,9 @@ collection is ready to stream.
 
 Nothing on disk changes. Files are not moved, renamed, converted or rewritten, so
 rip logs and checksums keep matching. You tag the tracks on the mount with Picard,
-beets or any tag editor, as you would any other files; WaveMorphFS keeps what you
-change in small sidecar files of its own, and assembles every track from the
-original file at the moment it is read.
+beets or any tag editor, cover art included, as you would any other files;
+WaveMorphFS keeps what you change in small sidecar files of its own, and
+assembles every track from the original file at the moment it is read.
 
 ```
 On disk, as it came                          Mounted at /srv/library
