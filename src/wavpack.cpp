@@ -365,7 +365,7 @@ Plan plan(const WvImage& img, uint64_t s, uint64_t e) {
 
 }  // namespace
 
-fs::path wv_layout_path(const WvImage& img, const std::vector<std::pair<uint64_t, uint64_t>>& ranges, const Cache& cache) {
+fs::path wv_layout_path(const WvImage& img, const Ranges& ranges, const Cache& cache) {
     // sizes depend on the encoder, so its version is part of the name, and so is
     // LAYOUT_VERSION, for changes to how tracks are planned or encoded here
     std::string extra = std::format("wavpack-tracks v{} {}", LAYOUT_VERSION, WavpackGetLibraryVersionString());
@@ -373,15 +373,16 @@ fs::path wv_layout_path(const WvImage& img, const std::vector<std::pair<uint64_t
     return cache.dir() / "flacidx" / (Cache::name_for(img.path, SrcKey::of(img.path), extra) + ".wvlayout");
 }
 
-std::vector<WvLayout> wv_layouts(const WvImage& img, const std::vector<std::pair<uint64_t, uint64_t>>& ranges, const Cache* cache) {
-    fs::path p = cache ? wv_layout_path(img, ranges, *cache) : fs::path();
+std::optional<std::vector<WvLayout>> load_wv_layout(const WvImage& img, const Ranges& ranges, const Cache& cache) {
+    auto b = try_read_file(wv_layout_path(img, ranges, cache));
+    if (!b || b->size() != 16 + 8 * ranges.size() || std::memcmp(b->data(), LAYOUT_MAGIC, 8) != 0 || le64(&(*b)[8]) != ranges.size()) return std::nullopt;
     std::vector<WvLayout> out;
-    if (cache)
-        if (auto b = try_read_file(p); b && b->size() == 16 + 8 * ranges.size() && std::memcmp(b->data(), LAYOUT_MAGIC, 8) == 0 &&
-                                       le64(&(*b)[8]) == ranges.size()) {
-            for (size_t i = 0; i < ranges.size(); i++) out.push_back({le32(&(*b)[16 + 8 * i]), le32(&(*b)[20 + 8 * i])});
-            return out;
-        }
+    for (size_t i = 0; i < ranges.size(); i++) out.push_back({le32(&(*b)[16 + 8 * i]), le32(&(*b)[20 + 8 * i])});
+    return out;
+}
+
+std::vector<WvLayout> build_wv_layout(const WvImage& img, const Ranges& ranges, const Cache* cache) {
+    std::vector<WvLayout> out;
     for (auto [s, e] : ranges) {
         auto pl = plan(img, s, e);
         WvLayout l;
@@ -396,9 +397,15 @@ std::vector<WvLayout> wv_layouts(const WvImage& img, const std::vector<std::pair
             put_le32(b, l.head);
             put_le32(b, l.tail);
         }
-        atomic_write(p, b);
+        atomic_write(wv_layout_path(img, ranges, *cache), b);
     }
     return out;
+}
+
+std::vector<WvLayout> wv_layouts(const WvImage& img, const Ranges& ranges, const Cache* cache) {
+    if (cache)
+        if (auto l = load_wv_layout(img, ranges, *cache)) return std::move(*l);
+    return build_wv_layout(img, ranges, cache);
 }
 
 WvTrack::WvTrack(std::shared_ptr<const WvImage> img, uint64_t start, uint64_t end, const Tags& tags, const WvLayout& layout, const Cover* cover)
@@ -434,7 +441,7 @@ void WvTrack::drop_cached() const {
     vstarts_.reset();
 }
 
-WvTrack::Shared WvTrack::block_bytes(size_t i) const {
+WvTrack::Shared WvTrack::block_bytes(size_t i, std::optional<File>& file) const {
     {
         std::lock_guard g(mu_);
         if (auto it = blocks_.find(i); it != blocks_.end()) {
@@ -444,7 +451,8 @@ WvTrack::Shared WvTrack::block_bytes(size_t i) const {
     }
     auto& k = img_->blocks[b1_ + i];
     Bytes raw(k.size);
-    File(img_->path).read_exact_at(raw.data(), raw.size(), k.off);
+    if (!file) file.emplace(img_->path);
+    file->read_exact_at(raw.data(), raw.size(), k.off);
     auto b = std::make_shared<const Bytes>(rebuild_block(raw, k.first - start_, end_ - start_, true));
     WM_ENSURE(b->size() == k.kept, "{}: block at {} changed", img_->path.string(), k.off);
     std::lock_guard g(mu_);
@@ -477,7 +485,8 @@ void WvTrack::read_copy(uint64_t off, size_t len, Bytes& out) const {
     size_t i0 = size_t(std::upper_bound(vs.begin(), vs.end(), off) - vs.begin()) - 1;
     size_t i1 = i0;
     while (i1 + 1 < vs.size() && vs[i1] < end) i1++;
-    for (size_t i = i0; i < i1; i++) copy_overlap(out, *block_bytes(i), vs[i], off, len);
+    std::optional<File> file;  // opened once per request, if a block is not at hand
+    for (size_t i = i0; i < i1; i++) copy_overlap(out, *block_bytes(i, file), vs[i], off, len);
 }
 
 Bytes WvTrack::read_at(uint64_t off, size_t len) const {

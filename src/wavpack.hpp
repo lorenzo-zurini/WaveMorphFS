@@ -73,9 +73,15 @@ Bytes rebuild_block(std::span<const uint8_t> block, uint64_t index, uint64_t tot
 struct WvLayout {
     uint32_t head = 0, tail = 0;
 };
-/// Layouts of tracks [s, e) of `img`, from the cache or measured (and cached) now.
-std::vector<WvLayout> wv_layouts(const WvImage& img, const std::vector<std::pair<uint64_t, uint64_t>>& ranges, const Cache* cache);
-fs::path wv_layout_path(const WvImage& img, const std::vector<std::pair<uint64_t, uint64_t>>& ranges, const Cache& cache);
+using Ranges = std::vector<std::pair<uint64_t, uint64_t>>;
+/// Layouts of tracks [s, e) of `img` from the cache, if they have been measured.
+std::optional<std::vector<WvLayout>> load_wv_layout(const WvImage& img, const Ranges& ranges, const Cache& cache);
+/// Measure them now (re-encoding each track's head and tail, which can take a
+/// while in the slower WavPack modes: a job for a background worker) and cache them.
+std::vector<WvLayout> build_wv_layout(const WvImage& img, const Ranges& ranges, const Cache* cache);
+/// From the cache, or measured (and cached) now.
+std::vector<WvLayout> wv_layouts(const WvImage& img, const Ranges& ranges, const Cache* cache);
+fs::path wv_layout_path(const WvImage& img, const Ranges& ranges, const Cache& cache);
 
 class WvTrack : public VFile, public Trimmable, public std::enable_shared_from_this<WvTrack> {
 public:
@@ -95,7 +101,7 @@ private:
     Shared part_bytes(Shared& cell, const Part& p) const;
     /// Copied block i (of [b1, b2)) as served, kept briefly: readers often ask for
     /// a few KB at a time, and a block is ~100 KB.
-    Shared block_bytes(size_t i) const;
+    Shared block_bytes(size_t i, std::optional<File>& file) const;
     std::shared_ptr<const std::vector<uint64_t>> vstarts() const;
     void read_copy(uint64_t off, size_t len, Bytes& out) const;
 
