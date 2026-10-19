@@ -85,27 +85,38 @@ Sidecar Sidecar::parse(const std::string& text) {
             for (auto& x : *h)
                 if (x.is_string()) sc.hidden.insert(x.get<std::string>());
     }
-    for (auto [section, target] : {std::pair{"track", &sc.tracks}, std::pair{"file", &sc.files}}) {
-        auto s = doc.find(section);
-        if (s == doc.end() || !s->is_object()) continue;
+    auto str = [](const json& t, const char* k) -> std::optional<std::string> {
+        auto it = t.find(k);
+        if (it == t.end() || !it->is_string() || it->get<std::string>().empty()) return std::nullopt;
+        return it->get<std::string>();
+    };
+    auto target_of = [](const json& t) -> std::optional<std::string> {
+        auto it = t.find("_target");
+        if (it == t.end() || !it->is_string()) return std::nullopt;
+        auto nt = normalize_target(it->get<std::string>());
+        if (!nt) warn("sidecar: ignoring invalid _target '{}'", it->get<std::string>());
+        return nt;
+    };
+    // track tables are stored under their canonical key, so that "05" and "5" (or
+    // "2.5" and "2-05") are one table, as they are one track; later ones win
+    if (auto s = doc.find("track"); s != doc.end() && s->is_object())
         for (auto& [k, v] : s->items()) {
             if (!v.is_object()) continue;
-            (*target)[k] = table_to_tags(v);
-            if (target == &sc.tracks)
-                if (auto n = v.find("_name"); n != v.end() && n->is_string() && !n->get<std::string>().empty()) sc.track_names[k] = n->get<std::string>();
-            if (auto h = v.find("_hide"); h != v.end() && truthy(*h)) (target == &sc.tracks ? sc.hidden_tracks : sc.hidden).insert(k);
-            if (auto c = v.find("_cover"); c != v.end() && c->is_string() && !c->get<std::string>().empty()) {
-                if (target == &sc.files) sc.file_covers[k] = c->get<std::string>();
-                else if (auto ck = canonical_track_key(k)) sc.track_covers[*ck] = c->get<std::string>();
-            }
-            if (auto t = v.find("_target"); t != v.end() && t->is_string()) {
-                auto nt = normalize_target(t->get<std::string>());
-                if (!nt) warn("sidecar: ignoring invalid _target '{}'", t->get<std::string>());
-                else if (target == &sc.files) sc.file_targets[k] = *nt;
-                else if (auto ck = canonical_track_key(k)) sc.track_targets[*ck] = *nt;
-            }
+            std::string ck = canonical_track_key(k).value_or(k);
+            sc.tracks[ck].merge(table_to_tags(v));
+            if (auto n = str(v, "_name")) sc.track_names[ck] = *n;
+            if (auto h = v.find("_hide"); h != v.end() && truthy(*h)) sc.hidden_tracks.insert(ck);
+            if (auto c = str(v, "_cover")) sc.track_covers[ck] = *c;
+            if (auto t = target_of(v)) sc.track_targets[ck] = *t;
         }
-    }
+    if (auto s = doc.find("file"); s != doc.end() && s->is_object())
+        for (auto& [k, v] : s->items()) {
+            if (!v.is_object()) continue;
+            sc.files[k] = table_to_tags(v);
+            if (auto h = v.find("_hide"); h != v.end() && truthy(*h)) sc.hidden.insert(k);
+            if (auto c = str(v, "_cover")) sc.file_covers[k] = *c;
+            if (auto t = target_of(v)) sc.file_targets[k] = *t;
+        }
     return sc;
 }
 
@@ -137,24 +148,13 @@ std::optional<Sidecar> Sidecar::load(const fs::path& src_dir, const std::optiona
 }
 
 const Tags* Sidecar::track(std::optional<uint32_t> disc, uint32_t n) const {
-    std::vector<std::string> keys;
-    if (disc) {
-        keys = {std::format("{}-{}", *disc, n), std::format("{}-{:02}", *disc, n), std::format("{}.{}", *disc, n)};
-    } else {
-        keys = {std::to_string(n), std::format("{:02}", n)};
-    }
-    for (auto& k : keys)
-        if (auto it = tracks.find(k); it != tracks.end()) return &it->second;
-    return nullptr;
+    auto it = tracks.find(track_key(disc, n));
+    return it == tracks.end() ? nullptr : &it->second;
 }
 
 const std::string* Sidecar::track_name(std::optional<uint32_t> disc, uint32_t n) const {
-    std::vector<std::string> keys;
-    if (disc) keys = {std::format("{}-{}", *disc, n), std::format("{}-{:02}", *disc, n), std::format("{}.{}", *disc, n)};
-    else keys = {std::to_string(n), std::format("{:02}", n)};
-    for (auto& k : keys)
-        if (auto it = track_names.find(k); it != track_names.end()) return &it->second;
-    return nullptr;
+    auto it = track_names.find(track_key(disc, n));
+    return it == track_names.end() ? nullptr : &it->second;
 }
 
 const std::string* Sidecar::cover_for(const std::string& name, const std::string* track_key) const {
@@ -164,14 +164,7 @@ const std::string* Sidecar::cover_for(const std::string& name, const std::string
     return cover ? &*cover : nullptr;
 }
 
-bool Sidecar::hides_track(std::optional<uint32_t> disc, uint32_t n) const {
-    std::vector<std::string> keys;
-    if (disc) keys = {std::format("{}-{}", *disc, n), std::format("{}-{:02}", *disc, n), std::format("{}.{}", *disc, n)};
-    else keys = {std::to_string(n), std::format("{:02}", n)};
-    for (auto& k : keys)
-        if (hidden_tracks.contains(k)) return true;
-    return false;
-}
+bool Sidecar::hides_track(std::optional<uint32_t> disc, uint32_t n) const { return hidden_tracks.contains(track_key(disc, n)); }
 
 const Tags* Sidecar::file(const std::string& name) const {
     auto it = files.find(name);

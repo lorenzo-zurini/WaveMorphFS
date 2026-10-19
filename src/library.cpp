@@ -593,13 +593,60 @@ void Library::apply_edit(const fs::path& dir, const std::string& file_name, cons
     fs::path p = *ov / SIDECAR_NAME;
     std::lock_guard g(edit_mu_);
     json doc = json::object();
-    if (auto text = try_read_text(p)) doc = json::parse(*text, nullptr, true, /*ignore_comments=*/true);
+    if (auto text = try_read_text(p)) {
+        doc = json::parse(*text, nullptr, true, /*ignore_comments=*/true);
+        // the JSON library cannot write comments back
+        if (!json::accept(*text)) warn("{}: comments are not kept when edits made through the mount are saved", p.string());
+    }
     WM_ENSURE(doc.is_object(), "{} is not a JSON object", p.string());
+    // the in-source sidecar is only read: source folders stay untouched
+    std::optional<Sidecar> in_source;
+    if (auto text = try_read_text(dir / SIDECAR_NAME)) {
+        try {
+            in_source = Sidecar::parse(*text);
+        } catch (const std::exception& e) {
+            warn("{}: {}", (dir / SIDECAR_NAME).string(), e.what());
+        }
+    }
+    bool track = section == EDIT_TRACK;
+    const Tags* src_entry = nullptr;  // the in-source table of this entry
+    const Tags* src_file = nullptr;   // track edits: the in-source file table of its name
+    if (in_source) {
+        if (track) {
+            if (auto it = in_source->tracks.find(key); it != in_source->tracks.end()) src_entry = &it->second;
+            src_file = in_source->file(file_name);
+        } else {
+            src_entry = in_source->file(key);
+        }
+    }
+
     if (!doc.contains(section) || !doc[section].is_object()) doc[section] = json::object();
-    json& entry = doc[section][key];
-    if (!entry.is_object()) entry = json::object();
+    // a track's table may already exist under another spelling of its key ("05",
+    // "2-5"): edit that one (the last, if several: it wins when they are merged)
+    std::vector<std::string> aliases;
+    if (track)
+        for (auto& [k, v] : doc[section].items())
+            if (v.is_object() && canonical_track_key(k) == key) aliases.push_back(k);
+    std::string table = aliases.empty() ? key : aliases.back();
+    // (re-indexed on every use: inserting into `doc` may move its members)
+    auto entry = [&]() -> json& { return doc[section][table]; };
+    if (!entry().is_object()) entry() = json::object();
     // pin the file name: retitling must not move the file under the editor
-    if (section == EDIT_TRACK && !entry.contains("_name")) entry["_name"] = file_name;
+    bool pinned = std::any_of(aliases.begin(), aliases.end(), [&](auto& a) { return doc[section][a].contains("_name"); });
+    if (track && !pinned && !entry().contains("_name")) entry()["_name"] = file_name;
+
+    auto in_json = [](const json& obj, const std::string& k) -> std::optional<std::string> {
+        if (obj.is_object())
+            for (auto& [ek, ev] : obj.items())
+                if (same_field(ek, k)) return ek;
+        return std::nullopt;
+    };
+    auto in_tags = [](const Tags* t, const std::string& k) -> std::optional<std::string> {
+        if (t)
+            for (auto& [ek, ev] : t->m)
+                if (same_field(ek, k)) return ek;
+        return std::nullopt;
+    };
     auto erase_field = [](json& obj, const std::string& k, const std::string& keep) {
         std::vector<std::string> drop;
         for (auto& [ek, ev] : obj.items())
@@ -607,26 +654,33 @@ void Library::apply_edit(const fs::path& dir, const std::string& file_name, cons
         for (auto& d : drop) obj.erase(d);
     };
     for (auto& [k, vals] : changes.m) {
-        // keep the spelling already used in this entry, else in the album table
-        std::string name = k;
-        bool found = false;
-        for (auto& [ek, ev] : entry.items())
-            if (same_field(ek, k)) {
-                name = ek;
-                found = true;
-                break;
-            }
-        if (!found && doc.contains("album") && doc["album"].is_object())
-            for (auto& [ak, av] : doc["album"].items())
-                if (same_field(ak, k)) {
-                    name = ak;
-                    break;
-                }
-        erase_field(entry, k, name);
-        entry[name] = vals.empty() ? json("") : vals.size() == 1 ? json(vals[0]) : json(vals);
-        // a per-file entry would override the track entry: drop the field there
-        if (section == EDIT_TRACK && doc.contains("file") && doc["file"].contains(file_name) && doc["file"][file_name].is_object())
+        // keep the spelling already used for this entry, else for the album: in
+        // this sidecar, then in the in-source one
+        std::optional<std::string> name = in_json(entry(), k);
+        for (auto& a : aliases)
+            if (!name) name = in_json(doc[section][a], k);
+        if (!name && doc.contains("album")) name = in_json(doc["album"], k);
+        if (!name) name = in_tags(src_entry, k);
+        if (!name && in_source) name = in_tags(&in_source->album, k);
+        json value = vals.empty() ? json("") : vals.size() == 1 ? json(vals[0]) : json(vals);
+        for (auto& a : aliases)
+            if (a != table) erase_field(doc[section][a], k, "");
+        erase_field(entry(), k, name.value_or(k));
+        entry()[name.value_or(k)] = value;
+        if (!track) continue;
+        // the file table of this name is applied after the track table: an
+        // in-source one setting the field would hide the edit, so this sidecar's
+        // file table overrides it (this sidecar is read last); an entry there of
+        // our own is dropped instead
+        if (auto spelled = in_tags(src_file, k)) {
+            if (!doc.contains("file") || !doc["file"].is_object()) doc["file"] = json::object();
+            json& f = doc["file"][file_name];
+            if (!f.is_object()) f = json::object();
+            erase_field(f, k, *spelled);
+            f[*spelled] = value;
+        } else if (doc.contains("file") && doc["file"].contains(file_name) && doc["file"][file_name].is_object()) {
             erase_field(doc["file"][file_name], k, "");
+        }
     }
     fs::create_directories(*ov);
     atomic_write(p, doc.dump(2, ' ', false, json::error_handler_t::replace) + "\n");
@@ -1060,9 +1114,12 @@ std::vector<Entry> Library::sacd_tracks(ListingBuild& b, const std::shared_ptr<c
             auto a = tg.get("ALBUM");
             tg.set("ALBUM", (a ? *a : std::string("SACD")) + " (Multichannel)");
         }
-        // pinned names are the stereo tracks': the multichannel ones keep theirs
+        // the track tables (and their pinned names) are the stereo tracks': edits of
+        // a multichannel track go to the file table of its own name
         auto [name, key, cv] = name_track(b, tg, disc, num, mc ? "MC " : "", "dsf", !mc);
-        out.push_back(Entry::make_tagged(std::move(name), std::make_shared<DsfTrack>(sacd, i, tg, cv), output_mtime(mt, cv), EDIT_TRACK, std::move(key), "dsf"));
+        auto vf = std::make_shared<DsfTrack>(sacd, i, tg, cv);
+        if (mc) out.push_back(Entry::make_tagged(name, std::move(vf), output_mtime(mt, cv), EDIT_FILE, name, "dsf"));
+        else out.push_back(Entry::make_tagged(std::move(name), std::move(vf), output_mtime(mt, cv), EDIT_TRACK, std::move(key), "dsf"));
     }
     return out;
 }
