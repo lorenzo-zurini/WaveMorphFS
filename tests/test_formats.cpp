@@ -243,11 +243,12 @@ TEST(idle_caches_are_trimmed_once) {
     auto busy = std::make_shared<Holder>(), idle = std::make_shared<Holder>();
     busy->use();
     idle->use();
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    // generous margins: a loaded CI runner may pause the test between steps
+    std::this_thread::sleep_for(std::chrono::milliseconds(600));
     busy->use();
-    sweep_idle(std::chrono::milliseconds(30));
+    sweep_idle(std::chrono::milliseconds(300));
     CHECK(idle->dropped == 1 && busy->dropped == 0);
-    sweep_idle(std::chrono::milliseconds(30));
+    sweep_idle(std::chrono::milliseconds(300));
     CHECK_MSG(idle->dropped == 1, "not trimmed again until used again");
     { auto gone = std::make_shared<Holder>(); gone->use(); }
     sweep_idle(std::chrono::milliseconds(0));  // a destroyed object is simply forgotten

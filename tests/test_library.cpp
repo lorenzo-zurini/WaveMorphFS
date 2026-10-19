@@ -36,6 +36,7 @@ struct Scratch {
         cfg.tags_dir = dir / "tags";
         cfg.cache_dir = dir / "cache";
         cfg.workers = 0;
+        cfg.recheck = std::chrono::milliseconds(100);  // listings re-checked quickly
         cfg.sacd_multichannel = mc;
         return Library::create(std::move(cfg));
     }
@@ -157,7 +158,7 @@ std::vector<std::string> names_of(const Listing& l) {
     return v;
 }
 
-void wait_recheck() { std::this_thread::sleep_for(std::chrono::milliseconds(1600)); }  // listings are re-checked after 1.5 s
+void wait_recheck() { std::this_thread::sleep_for(std::chrono::milliseconds(200)); }  // past cfg.recheck
 
 }  // namespace
 
