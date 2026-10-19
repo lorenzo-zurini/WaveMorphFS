@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "cue.hpp"
 
+#include <algorithm>
+
 #include "charset.hpp"
 #include "util.hpp"
 
@@ -41,10 +43,17 @@ CueSheet CueSheet::parse_bytes(std::span<const uint8_t> raw) {
 CueSheet CueSheet::parse(const std::string& text) {
     CueSheet sheet;
     std::optional<CueTrack> cur;
-    for (auto& raw_line : split(text, '\n')) {
-        std::string line = raw_line;
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        line = trim(line);
+    bool cur_audio = false;
+    auto finish_track = [&] {
+        // only audio tracks matter (data tracks on enhanced CDs are skipped)
+        if (cur && cur_audio) sheet.tracks.push_back(std::move(*cur));
+        cur.reset();
+    };
+    // lines end in LF, CR LF or (old Mac editors) CR alone
+    std::string lf = text;
+    std::replace(lf.begin(), lf.end(), '\r', '\n');
+    for (auto& raw_line : split(lf, '\n')) {
+        std::string line = trim(raw_line);
         if (line.empty()) continue;
         auto [cmd0, rest] = split_word(line);
         std::string cmd = upper(cmd0);
@@ -63,14 +72,13 @@ CueSheet CueSheet::parse(const std::string& text) {
             }
             sheet.files.push_back(trim(name));
         } else if (cmd == "TRACK") {
-            if (cur) sheet.tracks.push_back(std::move(*cur));
+            finish_track();
             auto [num, kind] = split_word(rest);
             CueTrack t;
             auto n = parse_u64(num);
             t.number = n && *n <= UINT32_MAX ? uint32_t(*n) : uint32_t(sheet.tracks.size() + 1);
-            // only audio tracks matter (data tracks on enhanced CDs are skipped)
-            if (!iequals(kind, "AUDIO")) t.fields["__NONAUDIO"] = kind;
             cur = std::move(t);
+            cur_audio = iequals(kind, "AUDIO");
         } else if (cmd == "INDEX") {
             auto [idx, pos] = split_word(rest);
             if (!cur) continue;
@@ -91,8 +99,7 @@ CueSheet CueSheet::parse(const std::string& text) {
             (cur ? cur->fields : sheet.fields)[cmd] = v;
         }
     }
-    if (cur) sheet.tracks.push_back(std::move(*cur));
-    std::erase_if(sheet.tracks, [](auto& t) { return t.fields.contains("__NONAUDIO"); });
+    finish_track();
     if (sheet.tracks.empty()) fail("no audio tracks");
     // INDEX positions are relative to each FILE, so ordering only applies to single-file sheets
     if (sheet.files.size() == 1)

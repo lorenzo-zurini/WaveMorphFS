@@ -2,8 +2,9 @@
 // CUE sheet parsing with charset detection.
 //
 // Only what matters for splitting and tagging is kept: disc-level fields
-// (PERFORMER, TITLE, SONGWRITER, CATALOG, REM *), and per track the number,
-// INDEX 00/01 positions (in CD frames of 1/75 s) and track-level fields.
+// (PERFORMER, TITLE, SONGWRITER, CATALOG, the non-standard COMPOSER and
+// ARRANGER, REM *), and per audio track the number, INDEX 00/01 positions (in
+// CD frames of 1/75 s) and track-level fields.
 #pragma once
 
 #include <cstdint>
@@ -21,7 +22,8 @@ struct CueTrack {
     /// INDEX 01 in CD frames (75 per second) relative to the start of the file
     uint64_t index01 = 0;
     std::optional<uint64_t> index00;
-    /// TITLE / PERFORMER / SONGWRITER / ISRC and REM fields, upper-case keys
+    /// TITLE / PERFORMER / SONGWRITER / ISRC / COMPOSER / ARRANGER and REM
+    /// fields, upper-case keys
     std::map<std::string, std::string> fields;
 };
 
