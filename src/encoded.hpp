@@ -8,6 +8,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -56,6 +57,16 @@ private:
     Promises claim(uint64_t a, uint64_t b, std::vector<Frames::Future>* need) const;
     /// Decode and encode claimed frames, fulfilling their promises.
     void produce(const Promises& ps) const;
+    /// Claimed frames produced together, by whichever thread takes the job first.
+    struct Job {
+        explicit Job(Promises p) : ps(std::move(p)) {}
+        Promises ps;
+        std::atomic<bool> taken{false};
+    };
+    /// Produce the job's frames unless another thread has taken it.
+    void run(Job& job) const {
+        if (!job.taken.exchange(true)) produce(job.ps);
+    }
 
     std::shared_ptr<const AvImage> img_;
     uint64_t start_, end_;
