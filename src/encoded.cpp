@@ -181,29 +181,32 @@ Bytes EncodedTrack::read_at(uint64_t off, size_t len) const {
     uint64_t nframes = offsets_.size() - 1;
     uint64_t j0 = uint64_t(std::upper_bound(offsets_.begin(), offsets_.end(), a) - offsets_.begin()) - 1;
     uint64_t j1 = uint64_t(std::lower_bound(offsets_.begin(), offsets_.end(), b) - offsets_.begin());  // exclusive
-    // claim what is needed (first job done here, the rest in parallel), then read-ahead
-    // background work needs a shared owner; without one (tests) everything is done here
+    // claim what is needed, then read-ahead; background work needs a shared owner
+    // (without one, in tests, everything is done here)
     auto self = weak_from_this().lock();
     touch(self);
-    std::vector<Promises> jobs, ahead;
+    std::vector<std::shared_ptr<Job>> jobs, ahead;
     std::vector<Frames::Future> need;  // held: later claims (read-ahead) may evict finished frames
     {
         std::lock_guard g(mu_);
         for (uint64_t s = j0; s < j1; s += JOB_FRAMES)
-            if (auto ps = claim(s, std::min(j1, s + JOB_FRAMES), &need); !ps.empty()) jobs.push_back(std::move(ps));
+            if (auto ps = claim(s, std::min(j1, s + JOB_FRAMES), &need); !ps.empty()) jobs.push_back(std::make_shared<Job>(std::move(ps)));
         // read-ahead only for a reader moving forward
         bool sequential = last_end_ != UINT64_MAX && j0 + 1 >= last_end_ && j0 <= last_end_;
         last_end_ = j1;
         if (self && sequential)
             for (uint64_t s = j1; s < std::min(nframes, j1 + AHEAD_FRAMES); s += JOB_FRAMES)
-                if (auto ps = claim(s, std::min(nframes, s + JOB_FRAMES), nullptr); !ps.empty()) ahead.push_back(std::move(ps));
+                if (auto ps = claim(s, std::min(nframes, s + JOB_FRAMES), nullptr); !ps.empty()) ahead.push_back(std::make_shared<Job>(std::move(ps)));
     }
-    for (size_t i = 1; i < jobs.size(); i++) {
-        if (self) submit([self, ps = std::move(jobs[i])] { self->produce(ps); }, Lane::Encode);
-        else produce(jobs[i]);
+    // The frames this read needs are produced here, in order. Idle pool threads may
+    // take some of those jobs first (a large read is encoded in parallel), but the
+    // reader only ever waits for work already running, never for work still queued
+    // behind other readers' read-ahead.
+    if (self) {
+        for (size_t i = 1; i < jobs.size(); i++) submit([self, job = jobs[i]] { self->run(*job); }, Lane::Encode);
+        for (auto& job : ahead) submit([self, job] { self->run(*job); }, Lane::Encode);
     }
-    for (auto& ps : ahead) submit([self, ps = std::move(ps)] { self->produce(ps); }, Lane::Encode);
-    if (!jobs.empty()) produce(jobs[0]);
+    for (auto& job : jobs) run(*job);
     for (uint64_t j = j0; j < j1; j++) copy_overlap(out, *need[j - j0].get(), h + offsets_[j], off, len);
     WM_ENSURE(out.size() == len, "internal: produced {} of {} bytes at {}", out.size(), len, off);
     return out;
