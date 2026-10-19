@@ -46,9 +46,11 @@ struct Area {
     std::vector<Bytes> frames;
     std::vector<std::pair<uint64_t, uint64_t>> tracks;  // frames [start, end)
     std::vector<std::string> titles;
-    /// replace the area's last audio sector with one that cannot be parsed,
-    /// keeping only the first `keep_last` bytes of the last frame before it
-    std::optional<size_t> broken_end;
+    /// replace the area's last audio sector with one that cannot be parsed (the
+    /// last frame must be spread over more than one sector)
+    bool broken_end = false;
+    /// set by audio_sectors() with `broken_end`: bytes of the last frame before it
+    mutable size_t last_frame_kept = 0;
 };
 
 /// Audio sectors for `a`, packed as authoring tools do: up to 7 packets and 7
@@ -60,8 +62,7 @@ std::vector<Bytes> audio_sectors(const Area& a) {
     };
     std::vector<std::vector<Packet>> layout(1);
     size_t fi_len = a.dst ? 4 : 3, used = 1, infos = 0;
-    auto frames = a.frames;
-    if (a.broken_end) frames.back().resize(*a.broken_end);
+    const auto& frames = a.frames;
     for (size_t f = 0; f < frames.size(); f++) {
         for (size_t pos = 0; pos < frames[f].size();) {
             bool start = pos == 0;
@@ -108,12 +109,17 @@ std::vector<Bytes> audio_sectors(const Area& a) {
         }
         out.push_back(std::move(b));
     }
-    if (a.broken_end) out.push_back(Bytes(SECTOR, 0xFF));  // 7 packets of 2047 bytes: overruns
+    if (a.broken_end) {
+        CHECK(first.back() < layout.size() - 1);
+        a.last_frame_kept = frames.back().size();
+        for (auto& x : layout.back()) a.last_frame_kept -= x.len;
+        out.back().assign(SECTOR, 0xFF);  // 7 packets of 2047 bytes: overruns
+    }
     return out;
 }
 
 /// An ISO with a stereo area and/or a multichannel area.
-Bytes make_iso(const std::optional<Area>& stereo, const std::optional<Area>& mc) {
+Bytes make_iso(const Area* stereo, const Area* mc) {
     std::vector<Bytes> sectors(512, Bytes(SECTOR, 0));
     Bytes& m = sectors[510];
     std::memcpy(m.data(), "SACDMTOC", 8);
@@ -359,7 +365,7 @@ TEST(sacd_plain_dsd_area_as_dsf_tracks) {
     a.tracks = {{0, 13}, {13, 40}};
     a.titles = {"First", "Second \xFC"};
     fs::path iso = d.path / "disc.iso";
-    atomic_write(iso, make_iso(a, std::nullopt));
+    atomic_write(iso, make_iso(&a, nullptr));
     CHECK(is_sacd(iso));
     Cache cache(d.path / "cache");
     for (int pass = 0; pass < 2; pass++) {  // scanned, then from the cached frame table
@@ -385,7 +391,7 @@ TEST(sacd_multichannel_area) {
     mc.frames = dsd_frames(21, 6, 2);
     mc.tracks = {{0, 5}, {5, 21}};
     fs::path iso = d.path / "disc.iso";
-    atomic_write(iso, make_iso(st, mc));
+    atomic_write(iso, make_iso(&st, &mc));
     auto disc = SacdDisc::open(iso, nullptr, true);
     CHECK(disc->channels == 6 && disc->tracks.size() == 2);
     for (size_t t = 0; t < 2; t++) check_dsf(disc, t, mc, expected_dsf_audio(mc.frames, mc.tracks[t].first, mc.tracks[t].second, 6));
@@ -399,12 +405,13 @@ TEST(sacd_short_final_frame_before_a_broken_sector) {
     Area a;
     a.frames = dsd_frames(12, 2, 3);
     a.tracks = {{0, 12}};
-    a.broken_end = 5000;
+    a.broken_end = true;
     fs::path iso = d.path / "disc.iso";
-    atomic_write(iso, make_iso(a, std::nullopt));
+    atomic_write(iso, make_iso(&a, nullptr));
     auto disc = SacdDisc::open(iso, nullptr, false);
     auto frames = a.frames;
-    std::fill(frames.back().begin() + 5000, frames.back().end(), 0x69);
+    CHECK(a.last_frame_kept > 0 && a.last_frame_kept < frames.back().size());
+    std::fill(frames.back().begin() + ptrdiff_t(a.last_frame_kept), frames.back().end(), 0x69);
     check_dsf(disc, 0, a, expected_dsf_audio(frames, 0, 12, 2));
 }
 
@@ -415,7 +422,7 @@ TEST(sacd_track_list_not_ending_with_the_last_track) {
     a.frames = dsd_frames(30, 2, 4);
     a.tracks = {{0, 30}, {10, 20}};
     fs::path iso = d.path / "disc.iso";
-    atomic_write(iso, make_iso(a, std::nullopt));
+    atomic_write(iso, make_iso(&a, nullptr));
     auto disc = SacdDisc::open(iso, nullptr, false);
     for (size_t t = 0; t < 2; t++) check_dsf(disc, t, a, expected_dsf_audio(a.frames, a.tracks[t].first, a.tracks[t].second, 2));
 }
@@ -427,7 +434,7 @@ TEST(sacd_multichannel_only_disc_is_served_once) {
     mc.frames = dsd_frames(9, 6, 5);
     mc.tracks = {{0, 9}};
     fs::path iso = d.path / "disc.iso";
-    atomic_write(iso, make_iso(std::nullopt, mc));
+    atomic_write(iso, make_iso(nullptr, &mc));
     auto disc = SacdDisc::open(iso, nullptr, false);  // the main area
     CHECK(disc->channels == 6);
     check_dsf(disc, 0, mc, expected_dsf_audio(mc.frames, 0, 9, 6));
@@ -461,5 +468,27 @@ TEST(dst_decoder_matches_ffmpeg) {
         };
         std::string want = pcm(dff(channels, coded, false), "dst.dff"), got = pcm(dff(channels, decoded, true), "dsd.dff");
         CHECK_MSG(!want.empty() && want == got, "{} channels: {} vs {} bytes of PCM", channels, want.size(), got.size());
+    }
+}
+
+TEST(sacd_dst_area_and_a_final_frame_cut_short) {
+    for (bool broken : {false, true}) {
+        Dir d;
+        Area a;
+        a.dst = true;
+        uint32_t seed = 9;
+        for (int i = 0; i < 20; i++) a.frames.push_back(dst_frame(2, seed, 1500 + 150 * size_t(i)));  // 1 to 3 sectors each
+        a.tracks = {{0, 7}, {7, 20}};
+        a.broken_end = broken;
+        fs::path iso = d.path / "disc.iso";
+        atomic_write(iso, make_iso(&a, nullptr));
+        auto disc = SacdDisc::open(iso, nullptr, false);
+        CHECK(disc->dst);
+        std::vector<Bytes> dsd;
+        DstDecoder dec(2);
+        for (auto& f : a.frames) dec.decode(f, dsd.emplace_back(SACD_FRAME_BYTES * 2));
+        // a compressed frame cannot be decoded in part: cut short, it is silence
+        if (broken) std::fill(dsd.back().begin(), dsd.back().end(), 0x69);
+        for (size_t t = 0; t < 2; t++) check_dsf(disc, t, a, expected_dsf_audio(dsd, a.tracks[t].first, a.tracks[t].second, 2));
     }
 }

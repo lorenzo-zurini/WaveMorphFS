@@ -35,6 +35,8 @@ public:
     static constexpr size_t SAMPLES_PER_FRAME = 588 * 64;
 
     explicit DstDecoder(size_t channels);
+    /// False for a frame that stores its DSD uncompressed.
+    static bool compressed(std::span<const uint8_t> frame) { return !frame.empty() && frame[0] & 0x80; }
     /// Decode one DST frame into `out` (size SAMPLES_PER_FRAME/8 * channels).
     void decode(std::span<const uint8_t> frame, std::span<uint8_t> out);
 

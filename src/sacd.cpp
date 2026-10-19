@@ -55,11 +55,17 @@ struct Packet {
     bool frame_start;
 };
 
+/// Frame info of a frame starting in a sector.
+struct FrameInfo {
+    uint64_t tc;      // time code (= frame number in the area)
+    size_t sectors;   // DST only: how many sectors the frame is spread over
+};
+
 /// One parsed audio sector.
 struct AudioSector {
     bool dst = false;
     std::vector<Packet> packets;
-    std::vector<uint64_t> frame_tcs;  // time codes of frames starting in this sector
+    std::vector<FrameInfo> frames;  // of the frames starting in this sector, in order
 };
 
 AudioSector parse_sector(const uint8_t* s) {
@@ -80,7 +86,7 @@ AudioSector parse_sector(const uint8_t* s) {
         pk.push_back({bool((w >> 15) & 1), uint8_t((w >> 11) & 7), size_t(w & 0x7FF)});
     }
     for (size_t i = 0; i < nfi; i++) {
-        r.frame_tcs.push_back(tc(s + p));
+        r.frames.push_back({tc(s + p), r.dst ? size_t(s[p + 3] >> 2 & 0x1F) : 0});
         p += r.dst ? 4 : 3;
     }
     for (auto& x : pk) {
@@ -102,8 +108,8 @@ Frames scan_frames(const File& f, uint64_t start, uint64_t end, uint32_t channel
     size_t frame_bytes = SACD_FRAME_BYTES * channels;
     size_t acc = 0;  // audio bytes of the current frame seen so far
     constexpr uint64_t CHUNK = 2048;  // sectors per read (4 MiB)
-    // a final frame cut short by a broken last sector is accepted (and padded with
-    // silence when read): it is well under a millisecond at the very end of the disc
+    // a final frame cut short by a broken last sector is accepted (and completed
+    // with silence when read): it is at most 1/75 s at the very end of the disc
     auto complete = [&] { return frames.size() == needed && (dst || (acc > 0 && acc <= frame_bytes)); };
     Bytes buf;
     for (uint64_t s = start; s <= end;) {
@@ -129,8 +135,8 @@ Frames scan_frames(const File& f, uint64_t start, uint64_t end, uint32_t channel
                 if (pk.frame_start) {
                     WM_ENSURE(dst || frames.empty() || acc == frame_bytes, "frame {} has {} bytes, expected {}", frames.size() - 1, acc, frame_bytes);
                     uint64_t expect = frames.size();
-                    if (tci < p.frame_tcs.size()) {
-                        uint64_t t = p.frame_tcs[tci++];
+                    if (tci < p.frames.size()) {
+                        uint64_t t = p.frames[tci++].tc;
                         WM_ENSURE(t == expect, "sector {}: time code {} where frame {} was expected", sec_no, t, expect);
                     }
                     frames.emplace_back(uint32_t(sec_no), uint16_t(pk.off));
@@ -350,7 +356,7 @@ Tags SacdDisc::track_tags(size_t i) const {
     return tg;
 }
 
-std::vector<Bytes> SacdDisc::coded_frames(uint64_t f0, uint64_t f1) const {
+SacdDisc::Coded SacdDisc::coded_frames(uint64_t f0, uint64_t f1) const {
     auto start = frames_[size_t(f0)];
     auto end = frames_[size_t(f1)];  // always present: the list ends with an end marker
     uint64_t s0 = start.first, s1 = end.first;
@@ -359,8 +365,12 @@ std::vector<Bytes> SacdDisc::coded_frames(uint64_t f0, uint64_t f1) const {
     Bytes buf(size_t(count * SECTOR));
     size_t n = file.read_at(buf.data(), buf.size(), s0 * SECTOR);
     buf.resize(n - n % SECTOR);
-    std::vector<Bytes> out;
-    out.reserve(size_t(f1 - f0));
+    Coded out;
+    auto& fr = out.frames;
+    fr.reserve(size_t(f1 - f0));
+    // where the latest frame starts, ends so far, and (DST) should end
+    uint64_t first_sector = 0, last_sector = 0;
+    size_t sectors = 0;
     for (uint64_t i = 0; i < buf.size() / SECTOR; i++) {
         uint64_t sec_no = s0 + i;
         // the end marker's own sector is only part of the range if the next frame
@@ -368,46 +378,61 @@ std::vector<Bytes> SacdDisc::coded_frames(uint64_t f0, uint64_t f1) const {
         if (sec_no > end.first || (sec_no == end.first && end.second == 0)) break;
         const uint8_t* sb = &buf[size_t(i * SECTOR)];
         auto parsed = parse_sector(sb);
+        size_t starts = 0;  // frames started in this sector so far: they index its frame infos
         bool done = false;
         for (auto& pk : parsed.packets) {
+            bool audio = pk.data_type == DATA_AUDIO, frame_start = audio && pk.frame_start;
+            size_t info = frame_start ? starts++ : 0;
             std::pair<uint32_t, uint16_t> pos{uint32_t(sec_no), uint16_t(pk.off)};
             if (pos < start) continue;
             if (pos >= end) {
                 done = true;
                 break;
             }
-            if (pk.data_type != DATA_AUDIO) continue;
-            if (pk.frame_start || out.empty()) {
-                out.emplace_back();
-                out.back().reserve(SACD_FRAME_BYTES * channels);
+            if (!audio) continue;
+            if (frame_start || fr.empty()) {
+                fr.emplace_back().reserve(SACD_FRAME_BYTES * channels);
+                first_sector = sec_no;
+                sectors = frame_start && info < parsed.frames.size() ? parsed.frames[info].sectors : 0;
             }
-            out.back().insert(out.back().end(), sb + pk.off, sb + pk.off + pk.len);
+            fr.back().insert(fr.back().end(), sb + pk.off, sb + pk.off + pk.len);
+            last_sector = sec_no;
         }
         if (done) break;
     }
-    WM_ENSURE(out.size() == f1 - f0, "expected {} frames, found {}", f1 - f0, out.size());
+    WM_ENSURE(fr.size() == f1 - f0, "expected {} frames, found {}", f1 - f0, fr.size());
+    // The area's last frame can be cut short by an unreadable final sector (see
+    // scan_frames). A plain DSD frame then lacks bytes; a DST frame has no fixed
+    // size, but its frame info says over how many sectors it is spread.
+    if (f1 + 1 == frames_.size() && !fr.empty())
+        out.cut_short = dst ? sectors > 0 && last_sector - first_sector + 1 < sectors : fr.back().size() < SACD_FRAME_BYTES * channels;
     return out;
 }
 
 std::vector<Bytes> SacdDisc::read_frames(uint64_t f0, uint64_t f1) const {
     size_t ch = channels, per_frame = SACD_FRAME_BYTES * ch;
-    auto coded = coded_frames(f0, f1);
+    auto [coded, cut_short] = coded_frames(f0, f1);
     std::vector<Bytes> out(ch, Bytes(size_t(SACD_FRAME_BYTES) * coded.size()));
     std::unique_ptr<DstDecoder> dec;
     if (dst) dec = std::make_unique<DstDecoder>(ch);
     Bytes raw(per_frame);
     for (size_t i = 0; i < coded.size(); i++) {
         const Bytes* inter = &coded[i];
-        if (dec) {
+        bool cut = cut_short && i + 1 == coded.size();
+        if (dec && cut && DstDecoder::compressed(coded[i])) {
+            // the arithmetic code cannot be decoded in part (missing bits would be
+            // read as zeros, giving arbitrary samples): the frame is silence
+            std::fill(raw.begin(), raw.end(), 0x69);
+            inter = &raw;
+        } else if (dec) {
             try {
-                dec->decode(coded[i], raw);
+                dec->decode(coded[i], raw);  // an uncompressed frame cut short is completed with silence
             } catch (const std::exception& e) {
                 fail("frame {}: {}", f0 + i, e.what());
             }
             inter = &raw;
         } else if (coded[i].size() != per_frame) {
-            bool last = f0 + i + 2 == frames_.size();  // frames_ ends with the end marker
-            WM_ENSURE(last && coded[i].size() < per_frame, "frame {} has {} bytes", f0 + i, coded[i].size());
+            WM_ENSURE(cut, "frame {} has {} bytes", f0 + i, coded[i].size());
             raw.assign(coded[i].begin(), coded[i].end());
             raw.resize(per_frame, 0x69);  // DSD silence
             inter = &raw;
