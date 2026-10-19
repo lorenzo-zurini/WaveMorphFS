@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <cstring>
 
+#include "apetag.hpp"
 #include "flac.hpp"
 #include "id3.hpp"
 #include "mp4.hpp"
@@ -47,6 +48,10 @@ Tags read_file_tags(const std::string& ext, const ByteReader& read, uint64_t siz
     }
     if (ext == "mp3") return id3_at(0);
     if (ext == "m4a") return mp4::read_tags(read, size);
+    if (ext == "wv") {
+        auto a = ape::read(read, size);
+        return a ? a->tags : t;
+    }
     return t;
 }
 

@@ -5,6 +5,8 @@
 //   flacidx/<key>.sacdidx  audio frame table of an SACD area
 //   flacidx/<key>.avidx    packet index of a non-FLAC image (APE, WV, ...)
 //   flacidx/<key>.encidx   frame sizes + MD5s of its tracks as encoded FLAC
+//   flacidx/<key>.wvidx    block index of a floating-point WavPack image
+//   flacidx/<key>.wvlayout sizes of the re-encoded ends of its tracks
 //   md5/<key>.txt          per-track audio MD5s of a FLAC image
 // Only positions and sizes: audio is always read from the source.
 #pragma once
@@ -45,6 +47,7 @@ public:
     fs::path idx_path(const fs::path& src, const SrcKey& key) const;
     fs::path md5_path(const fs::path& flac, const SrcKey& key) const;
     fs::path av_index_path(const fs::path& src, const SrcKey& key) const;
+    fs::path wv_index_path(const fs::path& src, const SrcKey& key) const;
 
 private:
     fs::path dir_;

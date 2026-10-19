@@ -17,9 +17,9 @@
 
 namespace wm {
 
-/// Tags of a FLAC / DSF / MP3 / M4A file (lower-case extension), read through
-/// `read`. Vorbis comments keep their names; ID3 and MP4 fields are mapped back
-/// to Vorbis-style names.
+/// Tags of a FLAC / DSF / MP3 / M4A / WavPack file (lower-case extension), read
+/// through `read`. Vorbis comments and APEv2 items keep their names; ID3 and MP4
+/// fields (and APEv2 Track/Disc/Year) are mapped back to Vorbis-style names.
 Tags read_file_tags(const std::string& ext, const ByteReader& read, uint64_t size);
 
 /// What changed from `before` to `after`, field by field (synonyms are the same

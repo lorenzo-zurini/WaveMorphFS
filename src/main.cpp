@@ -240,8 +240,11 @@ int cmd_verify(const Cli& cli) {
     for (auto& e : l->entries) {
         if (e.is_dir) continue;
         std::string d = e.file->describe();
-        bool retag_other = starts_with(d, "retagged-mp3:") || starts_with(d, "retagged-m4a:");
-        if (!(starts_with(d, "flac-image:") || starts_with(d, "flac-encoded:") || starts_with(d, "sacd:") || starts_with(d, "retagged-flac:") || retag_other)) continue;
+        bool retag_other = starts_with(d, "retagged-mp3:") || starts_with(d, "retagged-m4a:") || starts_with(d, "retagged-wv:");
+        bool wavpack = starts_with(d, "wavpack-image:");
+        if (!(starts_with(d, "flac-image:") || starts_with(d, "flac-encoded:") || starts_with(d, "sacd:") || starts_with(d, "retagged-flac:") || retag_other ||
+              wavpack))
+            continue;
         n++;
         fs::path out = tmp / e.name;
         dump(*e.file, out);
@@ -251,6 +254,9 @@ int cmd_verify(const Cli& cli) {
             auto a = stream_md5(out);
             good = a && a == stream_md5(d.substr(d.find(':') + 1)) &&
                    run_ok({"ffmpeg", "-v", "error", "-xerror", "-i", out.string(), "-f", "null", "-"}, false);
+        } else if (wavpack) {
+            // decodes with every block's audio CRC checked
+            good = run_ok({"ffmpeg", "-v", "error", "-xerror", "-err_detect", "crccheck", "-i", out.string(), "-f", "null", "-"}, true);
         } else if (starts_with(d, "sacd:")) {
             good = run_ok({"ffmpeg", "-v", "error", "-xerror", "-i", out.string(), "-f", "null", "-"}, true);
         } else {
