@@ -86,6 +86,10 @@ private:
     mutable std::vector<std::unique_ptr<Decoder>> idle_;  // decoders not in use
     mutable Packets cache_{CACHE_SAMPLES};  // decoded (or decoding) packets, cost = samples
     mutable size_t last_packet_ = SIZE_MAX;  // most recent packet a reader asked for (mu_)
+    /// Byte position of each packet, found by one pass over the file (no decoding)
+    /// the first time seeking by timestamp fails. (mu_)
+    mutable std::shared_ptr<const std::vector<int64_t>> positions_;
+    std::shared_ptr<const std::vector<int64_t>> positions() const;
 };
 
 }  // namespace wm

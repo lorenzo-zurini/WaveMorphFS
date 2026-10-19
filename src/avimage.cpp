@@ -301,6 +301,9 @@ AvImage::Samples AvImage::decode_packet(size_t k) const {
     auto d = take_decoder();
     const auto& want = packets_[k];
     int r = av_seek_frame(d->fmt.get(), d->stream, want.pts, AVSEEK_FLAG_BACKWARD);
+    // some demuxers cannot seek some streams by time (FFmpeg 7's FLAC demuxer:
+    // variable block sizes without a seek table): then by byte position
+    if (r < 0) r = av_seek_frame(d->fmt.get(), d->stream, (*positions())[k], AVSEEK_FLAG_BYTE);
     if (r < 0) fail("{}: seek to packet {} failed: {}", path.string(), k, av_err(r));
     avcodec_flush_buffers(d->codec.get());  // also what lets a drained decoder decode again
     auto out = std::make_shared<PerChannel>(channels);
@@ -328,6 +331,25 @@ AvImage::Samples AvImage::decode_packet(size_t k) const {
     if ((*out)[0].size() != want.count) index_mismatch(k, std::format("decoded to {} samples, the index says {}", (*out)[0].size(), want.count));
     give_decoder(std::move(d));
     return out;
+}
+
+std::shared_ptr<const std::vector<int64_t>> AvImage::positions() const {
+    {
+        std::lock_guard g(mu_);
+        if (positions_) return positions_;
+    }
+    Decoder d(path);
+    std::vector<int64_t> v;
+    v.reserve(packets_.size());
+    while (av_read_frame(d.fmt.get(), d.pkt.get()) >= 0) {
+        if (d.pkt->stream_index == d.stream) v.push_back(d.pkt->pos);
+        av_packet_unref(d.pkt.get());
+    }
+    WM_ENSURE(v.size() == packets_.size() && std::none_of(v.begin(), v.end(), [](int64_t p) { return p < 0; }),
+              "{}: cannot seek (no timestamps or byte positions to seek to)", path.string());
+    std::lock_guard g(mu_);
+    if (!positions_) positions_ = std::make_shared<const std::vector<int64_t>>(std::move(v));
+    return positions_;
 }
 
 AvImage::Packets::Future AvImage::start(size_t k, Packets::Promise* claimed) const {
