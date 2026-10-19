@@ -394,6 +394,7 @@ TEST(sacd_multichannel_area) {
     mc.tracks = {{0, 5}, {5, 21}};
     fs::path iso = d.path / "disc.iso";
     atomic_write(iso, make_iso(&st, &mc));
+    CHECK(sacd_has_area(iso, false) && sacd_has_area(iso, true));
     auto disc = SacdDisc::open(iso, nullptr, true);
     CHECK(disc->channels == 6 && disc->tracks.size() == 2);
     for (size_t t = 0; t < 2; t++) check_dsf(disc, t, mc, expected_dsf_audio(mc.frames, mc.tracks[t].first, mc.tracks[t].second, 6));
@@ -437,6 +438,7 @@ TEST(sacd_multichannel_only_disc_is_served_once) {
     mc.tracks = {{0, 9}};
     fs::path iso = d.path / "disc.iso";
     atomic_write(iso, make_iso(nullptr, &mc));
+    CHECK(sacd_has_area(iso, false) && !sacd_has_area(iso, true));
     auto disc = SacdDisc::open(iso, nullptr, false);  // the main area
     CHECK(disc->channels == 6);
     check_dsf(disc, 0, mc, expected_dsf_audio(mc.frames, 0, 9, 6));
