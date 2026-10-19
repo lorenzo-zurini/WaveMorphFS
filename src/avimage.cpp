@@ -20,11 +20,6 @@ namespace wm {
 namespace {
 
 const char INDEX_MAGIC[8] = {'W', 'M', 'A', 'V', 'I', 'X', '0', '1'};
-/// decode this many samples beyond the one being read, in parallel (~30 s at 44.1 kHz)
-constexpr uint64_t READ_AHEAD_SAMPLES = 1'500'000;
-/// decoded samples (per channel) kept per image while it is read: the read-ahead
-/// plus as much again behind it (APE packets are up to 294912 samples each)
-constexpr uint64_t CACHE_SAMPLES = 2 * READ_AHEAD_SAMPLES;
 constexpr size_t MAX_DECODERS = 8;
 
 std::string av_err(int e) {
@@ -256,29 +251,11 @@ AvImage::Samples AvImage::decode_packet(size_t k) const {
     return out;
 }
 
-std::shared_future<AvImage::Samples> AvImage::start(size_t k, std::shared_ptr<std::promise<Samples>>* claimed) const {
-    if (auto it = cache_.find(k); it != cache_.end()) {
-        it->second.used = ++clock_;
-        return it->second.samples;
-    }
-    auto promise = std::make_shared<std::promise<Samples>>();
-    std::shared_future<Samples> f = promise->get_future().share();
-    cache_[k] = {f, ++clock_};
-    // bounded: drop the least recently used finished entries
-    auto cached_samples = [&] {
-        uint64_t n = 0;
-        for (auto& [j, c] : cache_) n += packets_[j].count;
-        return n;
-    };
-    while (cache_.size() > 1 && cached_samples() > CACHE_SAMPLES) {
-        auto victim = cache_.end();
-        for (auto it = cache_.begin(); it != cache_.end(); ++it)
-            if (it->first != k && it->second.samples.wait_for(std::chrono::seconds(0)) == std::future_status::ready &&
-                (victim == cache_.end() || it->second.used < victim->second.used))
-                victim = it;
-        if (victim == cache_.end()) break;
-        cache_.erase(victim);
-    }
+AvImage::Packets::Future AvImage::start(size_t k, Packets::Promise* claimed) const {
+    Packets::Promise promise;
+    auto f = cache_.get(k, packets_[k].count, &promise);
+    if (!promise) return f;  // cached or in flight
+    cache_.trim([k](size_t j) { return j == k; });
     if (claimed) {
         *claimed = promise;  // the caller decodes it itself
         return f;
@@ -290,7 +267,7 @@ std::shared_future<AvImage::Samples> AvImage::start(size_t k, std::shared_ptr<st
 void AvImage::drop_cached() const {
     std::vector<std::unique_ptr<Decoder>> drop;  // closed outside the lock
     std::lock_guard g(mu_);
-    std::erase_if(cache_, [](auto& kv) { return kv.second.samples.wait_for(std::chrono::seconds(0)) == std::future_status::ready; });
+    cache_.drop_ready();
     drop.swap(idle_);
     last_packet_ = SIZE_MAX;
 }
@@ -301,7 +278,7 @@ void AvImage::fulfil(size_t k, std::promise<Samples>& promise) const {
     } catch (...) {
         promise.set_exception(std::current_exception());
         std::lock_guard g(mu_);
-        cache_.erase(k);  // let a later read retry
+        cache_.forget(k, &promise);  // let a later read retry
     }
 }
 
@@ -318,8 +295,8 @@ void AvImage::prefetch_after(size_t k) const {
 AvImage::Samples AvImage::packet_samples(size_t k) const {
     // the packet being read is decoded right here if nobody has started it (pool
     // threads only ever do read-ahead, so they never wait on each other)
-    std::shared_future<Samples> f;
-    std::shared_ptr<std::promise<Samples>> mine;
+    Packets::Future f;
+    Packets::Promise mine;
     bool sequential;
     touch(weak_from_this().lock());
     {

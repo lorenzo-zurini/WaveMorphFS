@@ -8,14 +8,13 @@
 #pragma once
 
 #include <array>
-#include <future>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 
 #include "avimage.hpp"
 #include "flac.hpp"
+#include "futurelru.hpp"
 #include "vfile.hpp"
 
 namespace wm {
@@ -50,9 +49,11 @@ public:
 
 private:
     using Frame = std::shared_ptr<const Bytes>;
-    using Promises = std::vector<std::pair<uint64_t, std::shared_ptr<std::promise<Frame>>>>;
-    /// Claim the frames of [a, b) nobody is producing yet (mu_ held).
-    Promises claim(uint64_t a, uint64_t b) const;
+    using Frames = FutureLru<uint64_t, Frame>;
+    using Promises = std::vector<std::pair<uint64_t, Frames::Promise>>;
+    /// Claim the frames of [a, b) nobody is producing yet; the futures of all of
+    /// them are appended to `need` if given (mu_ held).
+    Promises claim(uint64_t a, uint64_t b, std::vector<Frames::Future>* need) const;
     /// Decode and encode claimed frames, fulfilling their promises.
     void produce(const Promises& ps) const;
 
@@ -62,12 +63,8 @@ private:
     std::vector<uint32_t> offsets_;  // frame start offsets relative to the audio, + end
     uint64_t size_;
     mutable std::mutex mu_;
-    struct Cached {
-        std::shared_future<Frame> frame;
-        uint64_t used;
-    };
-    mutable std::map<uint64_t, Cached> frames_;  // encoded (or encoding) frames
-    mutable uint64_t clock_ = 0;
+    static constexpr size_t CACHE_FRAMES = 512;
+    mutable Frames frames_{CACHE_FRAMES};  // encoded (or encoding) frames
     mutable uint64_t last_end_ = UINT64_MAX;  // frame after the previous read (mu_)
 };
 
