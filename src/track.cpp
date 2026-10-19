@@ -16,8 +16,6 @@ std::shared_ptr<FlacImage> FlacImage::open(fs::path p, flac::FlacMeta meta, flac
     f.read_exact_at(h, 16, index.offsets[0]);
     auto hdr = flac::FrameHeader::parse(h);
     WM_ENSURE(hdr.has_value(), "first frame header");
-    size_t ex = 4 + hdr->number_len;
-    size_t bs_extra = hdr->bs_code == 6 ? 1 : hdr->bs_code == 7 ? 2 : 0;
     // Indexes built before the last frame's end was searched from the front may
     // have taken a trailing tag whose own CRC-16 is 0 for audio. Checking that end
     // again is cheap (the last frame and what follows it), unlike re-indexing.
@@ -38,7 +36,8 @@ std::shared_ptr<FlacImage> FlacImage::open(fs::path p, flac::FlacMeta meta, flac
     img->meta.blocks = {};
     img->index = std::move(index);
     img->sr_code = hdr->sr_code;
-    img->sr_extra.assign(h + ex + bs_extra, h + ex + hdr->extra_len);
+    auto sr = hdr->fields(h).sr_bytes;
+    img->sr_extra.assign(sr.begin(), sr.end());
     return img;
 }
 
@@ -215,10 +214,18 @@ void FlacTrack::read_copy(uint64_t off, size_t len, Bytes& out) const {
         std::span<const uint8_t> orig(raw.data() + fa, fb - fa);
         auto h = flac::FrameHeader::parse(orig);
         WM_ENSURE(h.has_value(), "frame {} header", k);
-        Bytes frame = flac::rewrite_header(orig, *h, k * bs - start_, std::nullopt);
-        frame.insert(frame.end(), orig.begin() + ptrdiff_t(h->len), orig.end() - 2);
-        put_be16(frame, flac::crc16(frame));
-        copy_overlap(out, frame, vs[i0 + j], off, len);
+        auto hdr = flac::rewrite_header(orig, *h, k * bs - start_);
+        auto body = orig.subspan(h->len, orig.size() - h->len - 2);
+        // The new CRC-16 follows from the stored one and the header change alone:
+        // the body is copied without being read again, and a source frame damaged
+        // since it was indexed keeps a CRC that does not match, as it should.
+        uint16_t stored = be16(&orig[orig.size() - 2]);
+        uint16_t crc = stored ^ flac::crc16_shift(flac::crc16(orig.first(h->len)) ^ flac::crc16(hdr.span()), body.size());
+        uint8_t crc_bytes[2] = {uint8_t(crc >> 8), uint8_t(crc)};
+        uint64_t v = vs[i0 + j];
+        copy_overlap(out, hdr.span(), v, off, len);
+        copy_overlap(out, body, v + hdr.len, off, len);
+        copy_overlap(out, crc_bytes, v + hdr.len + body.size(), off, len);
     }
 }
 
