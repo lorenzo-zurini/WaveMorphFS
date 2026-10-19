@@ -34,11 +34,8 @@ Tags read_file_tags(const std::string& ext, const ByteReader& read, uint64_t siz
         return t;
     }
     auto id3_at = [&](uint64_t pos) {
-        Bytes h = read(pos, 10);
-        if (h.size() < 10 || std::memcmp(h.data(), "ID3", 3) != 0) return Tags{};
-        uint64_t sz = 0;
-        for (int i = 6; i < 10; i++) sz = sz << 7 | (h[size_t(i)] & 0x7F);
-        return id3::read_tags(read(pos, size_t(10 + sz)));
+        auto len = id3::tag_length(read(pos, 10));
+        return len ? id3::read_tags(read(pos, size_t(*len))) : Tags{};
     };
     if (ext == "dsf") {
         Bytes h = read(0, 28);
