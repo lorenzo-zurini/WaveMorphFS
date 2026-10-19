@@ -1,48 +1,77 @@
 # WaveMorphFS
 
-WaveMorphFS mounts a music archive as the library a music server expects:
-one file per track, properly tagged, in the folders you want. The files on
-disk are never written to. A CUE sheet with a FLAC image stays exactly as you
-ripped it, with its log and checksums still matching, while your server sees
-twelve ordinary tracks.
+*Ordo ab chao.*
 
-It is a FUSE filesystem for Linux, written in C++. Nothing is converted ahead
-of time and no audio is copied. Every track is assembled from the source file
-at the moment it is read.
+WaveMorphFS takes a music collection as it really is (scattered folders, whole-disc
+images with CUE sheets, APE and WavPack files, SACD ISOs, tracks with missing or
+half-filled tags) and mounts it, wherever you like, as the library it should be:
+every album split into tracks, every track completely tagged, every folder where
+it belongs. Point Navidrome or any other music server at the mount and the whole
+collection is ready to stream.
+
+Nothing on disk changes. Files are not moved, renamed, converted or rewritten, so
+rip logs and checksums keep matching. The tags, track names and folder layout live
+in small JSON sidecar files, written by you, by Picard or by beets, and every track
+is assembled from the original file at the moment it is read.
 
 ```
-On disk                                     In the mount
-───────                                     ────────────
-Sawallisch - Bruckner 5 (1991)/             Sawallisch - Bruckner 5 (1991)/
-  Bruckner 5.cue                              01 - I. Introduktion. Adagio - Allegro.flac
-  Bruckner 5.flac        (one 300 MB image)   02 - II. Adagio. Sehr langsam.flac
-  Bruckner 5.log                              03 - III. Scherzo. Molto vivace.flac
-                                              04 - IV. Finale. Adagio - Allegro moderato.flac
-                                              Bruckner 5.log
-
-Karajan - Planets [SACD]/                   Karajan - Planets [SACD]/
-  Planets.iso            (DST-compressed)     01 - Mars, the Bringer of War.dsf
-                                              02 - Venus, the Bringer of Peace.dsf
-                                              ...
+On disk, as it came                          Mounted at /srv/library
+───────────────────                          ───────────────────────
+incoming/                                    Classical Music/
+  BRUCKNER5_SAWALLISCH/                        Anton Bruckner/
+    CDImage.cue                                  Symphony No. 5 (Sawallisch, 1991)/
+    CDImage.ape         (one image, no tags)       01 - I. Introduktion. Adagio - Allegro.flac
+    EAC.log                                        02 - II. Adagio. Sehr langsam.flac
+  planets sacd/                                    03 - III. Scherzo. Molto vivace.flac
+    disc.iso            (DST-compressed)           04 - IV. Finale. Adagio - Allegro moderato.flac
+  old laptop/rip 7/                            Gustav Holst/
+    image.flac          (one image, no tags)     The Planets (Karajan)/
+    image.cue                                      01 - Mars, the Bringer of War.dsf
+                                                   02 - Venus, the Bringer of Peace.dsf
+                                             Music/
+                                               Radiohead/
+                                                 OK Computer (1997)/
+                                                   01 - Airbag.flac
+                                                   02 - Paranoid Android.flac
 ```
 
-## Who it is for
+Each of those tracks carries complete tags (title, artists, album, album artist,
+track and disc numbers, composer, MusicBrainz IDs, cover art), however little the
+source files had.
 
-- **People who rip to image + CUE.** EAC and XLD rips are best kept whole, but
-  Navidrome and most players want separate tracks. WaveMorphFS splits them on
-  the fly, sample-exact, without re-encoding a FLAC image.
-- **Anyone keeping an archive bit-for-bit.** If you verify rips with
-  AccurateRip logs, keep checksums for backups, or share files that must stay
-  identical, you can still tag everything with Picard or beets. The tags land in
-  small JSON sidecar files instead of the audio files.
-- **SACD collectors.** ISO images, including DST-compressed ones, appear as DSF
-  tracks a player can stream. No extraction step, no second copy of the disc.
-- **Collections in awkward formats.** APE, WavPack, TTA and TAK files are
-  served as FLAC, encoded as they are read. 32-bit float WavPack, which FLAC
-  cannot hold, is split into WavPack tracks.
-- **Classical libraries.** Recordings can be regrouped into folders by work,
-  given a cover per work, and retagged freely, all without moving or renaming a
-  single source file.
+## From chaos to a library
+
+The main use is turning a messy collection into a clean one without touching it:
+
+1. **Mount it.** Give WaveMorphFS one or more folders (`--root`) and a mountpoint
+   anywhere you like: a local folder, a folder your music server's container
+   sees, or one you share over the network. CUE images are split into
+   tracks, APE-style files are served as FLAC, SACD ISOs as DSF, and files that are
+   still being copied or are damaged are kept out.
+2. **Tag it.** Run beets or Picard against the mount (with moving and renaming
+   files turned off: the mount decides names and places), or write sidecars by
+   hand. Tag editors save to the mount as they would to any file; WaveMorphFS stores
+   their changes in sidecars and serves them straight back. Tags already in the
+   files, the CUE sheet and the SACD text are used as a starting point.
+3. **Organize it.** A sidecar can place a folder, a disc or a single track anywhere
+   in the mount, so the tree follows artist, composer or work rather than whatever
+   the folders on disk are called. Junk can be hidden, and a front cover set per
+   album or per work.
+4. **Stream it.** The music server sees an ordinary, tidy folder of tagged tracks,
+   and rescans it like any other.
+
+Because the sources are only ever read, it also suits:
+
+- **Image + CUE rips.** EAC and XLD rips stay whole and verifiable. FLAC images are
+  split sample-exact without re-encoding.
+- **Archives kept bit-for-bit.** AccurateRip logs, backup checksums and files you
+  share with others keep matching, however much you retag.
+- **SACD collections.** ISO images, DST-compressed ones included, play as DSF
+  tracks with no extraction and no second copy.
+- **Awkward formats.** APE, WavPack, TTA and TAK become FLAC as they are read;
+  32-bit float WavPack, which FLAC can't hold, is split into WavPack tracks.
+- **Classical libraries.** Recordings grouped by work, a cover per work, composers
+  and performers tagged properly, while the files stay as the label released them.
 
 ## What it does
 
@@ -59,15 +88,17 @@ Karajan - Planets [SACD]/                   Karajan - Planets [SACD]/
 
 Beyond splitting and converting:
 
-- **Tags from three places.** The image's own tags, the CUE sheet or SACD text,
-  and your sidecars, in that order. Tag names are kept exactly as you write
-  them, so Picard's `MusicBrainz Album Id`, ffprobe's `album_artist` and plain
-  Vorbis names all work and are never renamed.
+- **A tree of your choosing.** Several source folders can be combined into one
+  mount, and any folder, disc or track can be placed anywhere in it. Folders
+  emptied by moves disappear, and new ones are created as needed.
+- **Complete tags.** Tags come from the file itself, the CUE sheet or SACD text,
+  and your sidecars, in that order, and every track is served with all of them.
+  Tag names are kept exactly as you write them, so Picard's
+  `MusicBrainz Album Id`, ffprobe's `album_artist` and plain Vorbis names all work
+  and are never renamed.
 - **Edit tags on the mount.** Open a track in Picard, Kid3, beets or any other
   tag editor and save. The change is stored in the folder's sidecar and shows up
   at once; the source file is not touched.
-- **Reorganize without moving anything.** A sidecar can place a folder, or a
-  single track, anywhere in the mount.
 - **Per-work cover art.** A sidecar can name the front cover for a folder, a
   track or a file. Large images are scaled to 1024 px once and cached.
 - **Several discs in one folder.** Two images in one folder become discs 1 and
