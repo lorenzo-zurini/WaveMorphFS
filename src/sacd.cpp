@@ -219,7 +219,7 @@ std::shared_ptr<SacdDisc> SacdDisc::open(const fs::path& path, const Cache* cach
     Bytes m = sec(MASTER_TOC, 1);
     WM_ENSURE(std::memcmp(m.data(), "SACDMTOC", 8) == 0, "no SACD master TOC");
     uint64_t area1 = be32(&m[64]), area2 = be32(&m[72]);
-    std::string catalog = trim(lossy_utf8(std::span(m).subspan(24, 16)));
+    auto catalog = cstr_at(std::span(m).first(40), 24, 0);  // 16 bytes, NUL- or space-padded
     uint16_t set_size = be16(&m[16]), set_seq = be16(&m[18]), year = be16(&m[120]);
     const char* genre = nullptr;
     if (m[104] == 1) {
@@ -309,7 +309,7 @@ std::shared_ptr<SacdDisc> SacdDisc::open(const fs::path& path, const Cache* cach
         if (auto v = pick(2, 10)) album.set("LABEL", *v);
         if (auto v = pick(3, 11)) album.set("COPYRIGHT", *v);
     }
-    if (!catalog.empty()) album.set("CATALOGNUMBER", catalog);
+    if (catalog) album.set("CATALOGNUMBER", *catalog);
     if (year >= 1900 && year < 2200) album.set("DATE", std::to_string(year));
     if (genre) album.set("GENRE", genre);
     if (set_size > 1 && set_seq >= 1) {
