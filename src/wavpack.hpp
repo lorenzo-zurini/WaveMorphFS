@@ -101,7 +101,8 @@ private:
         uint64_t s, e, size;
     };
     using Shared = std::shared_ptr<const Bytes>;
-    Shared part_bytes(Shared& cell, const Part& p) const;
+    /// The re-encoded blocks of `p`, checked against their measured size.
+    Bytes encode_part(const Part& p) const;
     /// Copied block i (of [b1, b2)) as served, kept briefly: readers often ask for
     /// a few KB at a time, and a block is ~100 KB.
     Shared block_bytes(size_t i, std::optional<File>& file) const;
@@ -116,7 +117,7 @@ private:
     Segments tag_;  // pictures are not held
     uint64_t size_ = 0;
     mutable std::mutex mu_;
-    mutable Shared head_bytes_, tail_bytes_;
+    LazyBytes head_bytes_, tail_bytes_;
     mutable std::map<size_t, std::pair<Shared, uint64_t>> blocks_;  // recently served copied blocks, last use
     mutable uint64_t clock_ = 0;
     /// start offset (relative to the copy region) of each copied block, + end
