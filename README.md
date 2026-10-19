@@ -298,7 +298,10 @@ wavemorphfs $R tags-init /srv/music/Album       # write a sidecar pre-filled wit
 ```
 
 `wavemorphfs --help` lists every option (worker and FUSE thread counts, the
-prescan interval, SACD multichannel areas). `--allow-other` needs
+prescan interval — `--prescan 0` turns the periodic re-walk off — and SACD
+multichannel areas). `tags-init` reads the current tags of every taggable file
+(FLAC, DSF, MP3, M4A, WavPack); with `--force` it replaces an existing sidecar,
+but refuses one that holds `_` directives. `--allow-other` needs
 `user_allow_other` in `/etc/fuse.conf`. Containers that read the mount should bind
 the **parent** of the mountpoint with `bind-propagation=rslave` so they survive
 filesystem restarts. `WAVEMORPH_LOG=debug` for more logging.
@@ -394,7 +397,8 @@ file:
 ```
 
 * At the top level it moves the folder's files; its subfolders (`CD1`, `CD2`, ...)
-  move along beneath it unless they have a `"_target"` of their own.
+  move along beneath it unless they have a `"_target"` of their own. A root's own
+  folder cannot be moved (its `"_target"` is ignored with a warning).
 * In a `track` or `file` entry it moves that one file (its name stays the same).
 * Paths are directories relative to the mount root; their first component is
   normally a root name. Directories are created as needed, folders emptied by
