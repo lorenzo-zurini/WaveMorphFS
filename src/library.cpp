@@ -192,7 +192,7 @@ struct ListingBuild {
     std::optional<Clock::time_point> retry_at;
 
     ListingBuild(fs::path d, const Config& cfg) : dir(std::move(d)), covers{cfg.covers_dir, cfg.cache_dir, {}, {}} {}
-    /// `n` is still being downloaded (a file still being downloaded is written as "<n>.!qB")
+    /// `n` is still being written: download clients keep a partial file as "<n>.!qB"
     bool incomplete(const std::string& n) const { return name_set.contains(n + ".!qB") || name_set.contains(n + ".!qb"); }
     void settle_until(Clock::time_point until) { retry_at = retry_at ? std::min(*retry_at, until) : until; }
 };
