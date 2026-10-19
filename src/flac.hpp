@@ -120,6 +120,11 @@ struct FrameIndex {
     uint64_t nframes() const { return offsets.size() - 1; }
 };
 
+/// End of the last frame of a file, which starts at `start`: the first position
+/// where the frame's CRC-16 checks out and only EOF or a recognisable trailing tag
+/// follows. nullopt if there is none (an incomplete file).
+std::optional<uint64_t> last_frame_end(const File& f, uint64_t start);
+
 /// Size in bytes of a VERBATIM frame produced by `encode_verbatim`.
 uint64_t verbatim_size(uint32_t samples, uint32_t channels, uint32_t bps, uint64_t sample_number, size_t sr_extra);
 

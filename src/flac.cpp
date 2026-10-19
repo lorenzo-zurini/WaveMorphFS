@@ -193,7 +193,8 @@ FlacMeta FlacMeta::read(const fs::path& p) {
             f.read_exact_at(rest, 6, 4);
             uint64_t sz = 0;
             for (int i = 2; i < 6; i++) sz = sz << 7 | (rest[i] & 0x7F);
-            pos = 10 + sz;
+            bool footer = rest[1] & 0x10;  // ID3v2.4: a 10-byte footer follows the tag
+            pos = 10 + sz + (footer ? 10 : 0);
             f.read_exact_at(magic, 4, pos);
             pos += 4;
         }
@@ -348,24 +349,49 @@ struct Window {
     }
 };
 
-/// True if the bytes from `end` to EOF are empty or a recognisable trailing tag.
-bool trailing_is_tag(const File& f, uint64_t end, uint64_t flen) {
-    uint64_t tail = flen - end;
-    if (tail == 0) return true;
-    if (tail > (1 << 20)) return false;
-    uint8_t head[8] = {};
-    size_t n = size_t(std::min<uint64_t>(tail, 8));
-    try {
-        f.read_exact_at(head, n, end);
-    } catch (...) {
-        return false;
+/// Trailing tags longer than this are not recognised (an unfinished file is more likely).
+constexpr uint64_t TAIL_TAG_MAX = 1 << 20;
+/// Upper bound on a frame's size: 65535 samples x 8 channels x 32 bits, plus headers.
+constexpr uint64_t FRAME_MAX = 65535ull * 8 * 4 + 1024;
+
+/// True if `tail` (the bytes after the last frame, up to EOF) is empty or a
+/// recognisable trailing tag. No allowance for zero padding on purpose: an
+/// unfinished file also ends in zeros.
+bool is_trailing_tag(std::span<const uint8_t> tail) {
+    if (tail.empty()) return true;
+    if (tail.size() > TAIL_TAG_MAX) return false;
+    auto at = [&](size_t pos, std::string_view magic) { return pos + magic.size() <= tail.size() && std::memcmp(&tail[pos], magic.data(), magic.size()) == 0; };
+    if ((tail.size() == 128 && at(0, "TAG")) || at(0, "APETAGEX") || at(0, "ID3")) return true;
+    // an APEv2 tag without a header: its footer ends the file (or precedes an ID3v1
+    // tag), and its size field covers the items and the footer
+    for (size_t v1 : {size_t(0), size_t(128)}) {
+        if (tail.size() < v1 + 32 || (v1 && !at(tail.size() - 128, "TAG"))) continue;
+        size_t footer = tail.size() - v1 - 32;
+        if (at(footer, "APETAGEX") && le32(&tail[footer + 12]) == tail.size() - v1) return true;
     }
-    // No allowance for zero padding on purpose: an unfinished file also ends in zeros.
-    return (tail == 128 && std::memcmp(head, "TAG", 3) == 0) || (n >= 8 && std::memcmp(head, "APETAGEX", 8) == 0) ||
-           (n >= 3 && std::memcmp(head, "ID3", 3) == 0);
+    return false;
 }
 
 }  // namespace
+
+std::optional<uint64_t> last_frame_end(const File& f, uint64_t start) {
+    uint64_t flen = f.size();
+    if (start >= flen || flen - start > FRAME_MAX + TAIL_TAG_MAX) return std::nullopt;
+    Bytes b(size_t(flen - start));
+    f.read_exact_at(b.data(), b.size(), start);
+    auto hdr = FrameHeader::parse(b);
+    if (!hdr) return std::nullopt;
+    // CRC-16 alone false-matches about once per 65536 bytes, also inside a trailing
+    // tag (and a tag whose own CRC-16 is 0 makes EOF match): the first position
+    // where the frame checks out and only EOF or a tag follows is the end
+    uint16_t crc = crc16(std::span(b).subspan(0, hdr->len));
+    for (size_t p = hdr->len; p < b.size();) {
+        crc = uint16_t(crc << 8) ^ CRC16[uint8_t(crc >> 8) ^ b[p]];
+        p++;
+        if (crc == 0 && p >= hdr->len + 2 && is_trailing_tag(std::span(b).subspan(p))) return start + p;
+    }
+    return std::nullopt;
+}
 
 FrameIndex FrameIndex::build(const fs::path& path, const FlacMeta& meta) {
     const auto& si = meta.streaminfo;
@@ -382,6 +408,7 @@ FrameIndex FrameIndex::build(const fs::path& path, const FlacMeta& meta) {
     uint32_t bs = h0.block_size;
     WM_ENSURE(si.min_block == si.max_block || si.max_block == bs, "inconsistent block size");
     uint64_t nframes = (si.total_samples + bs - 1) / bs;
+    uint64_t last_bs = si.total_samples - (nframes - 1) * bs;
 
     FrameIndex idx;
     idx.block_size = bs;
@@ -399,9 +426,18 @@ FrameIndex FrameIndex::build(const fs::path& path, const FlacMeta& meta) {
         WM_ENSURE(hdr.has_value(), "frame {} header invalid at byte {}", k, w.off + cur);
         WM_ENSURE(hdr->number == k, "frame {}: header says frame {}", k, hdr->number);
         bool is_last = k + 1 == nframes;
+        // track sizes are computed from these: the number must be coded in the
+        // shortest form, and every frame must hold the samples STREAMINFO implies
+        WM_ENSURE(hdr->number_len == coded_len(k), "frame {}: frame number coded in {} bytes", k, hdr->number_len);
+        WM_ENSURE(hdr->block_size == (is_last ? last_bs : bs), "frame {}: {} samples, expected {}", k, hdr->block_size, is_last ? last_bs : bs);
+        if (is_last) {
+            auto end = last_frame_end(f, w.off + cur);
+            WM_ENSURE(end.has_value(), "last frame: no valid end followed by EOF or a tag (incomplete file?)");
+            offs->push_back(*end);
+            break;
+        }
         uint16_t crc = crc16_update(0, std::span(w.buf).subspan(cur, hdr->len));
         size_t p = cur + hdr->len;
-        std::vector<uint64_t> last_candidates;
         std::optional<uint64_t> end;
         while (true) {
             if (p >= w.buf.size()) {
@@ -413,12 +449,6 @@ FrameIndex FrameIndex::build(const fs::path& path, const FlacMeta& meta) {
             p++;
             // p - cur is invariant under compaction; need at least header + CRC-16
             if (crc != 0 || p - cur < hdr->len + 2) continue;
-            if (is_last) {
-                // CRC-16 alone false-matches ~1/65536 bytes: collect every candidate
-                // up to EOF and pick the one followed only by a recognisable tag.
-                last_candidates.push_back(w.off + p);
-                continue;
-            }
             if (p + 32 > w.buf.size() && !w.eof) w.compact(cur, &p);
             if (auto nh = FrameHeader::parse(std::span(w.buf).subspan(p))) {
                 // the final frame usually carries an explicit (smaller) block size
@@ -430,16 +460,7 @@ FrameIndex FrameIndex::build(const fs::path& path, const FlacMeta& meta) {
                 }
             }
         }
-        if (is_last) {
-            for (auto it = last_candidates.rbegin(); it != last_candidates.rend(); ++it)
-                if (trailing_is_tag(f, *it, flen)) {
-                    end = *it;
-                    break;
-                }
-            WM_ENSURE(end.has_value(), "last frame: no valid end followed by EOF or a tag (incomplete file?)");
-        } else {
-            WM_ENSURE(end.has_value(), "frame {}: no valid end found (incomplete file?)", k);
-        }
+        WM_ENSURE(end.has_value(), "frame {}: no valid end found (incomplete file?)", k);
         offs->push_back(*end);
         cur = size_t(*end - w.off);
     }
