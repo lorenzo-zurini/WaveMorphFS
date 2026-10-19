@@ -15,23 +15,18 @@ namespace {
 
 constexpr uint64_t SECTOR = 2048;
 constexpr uint64_t MASTER_TOC = 510;
-constexpr uint64_t DSF_BLOCK = 4096;
+constexpr uint64_t DSF_BLOCK = 4096;  // bytes per channel per block
+// DSF chunks before the audio: "DSD " (28 bytes), "fmt " (52), "data" header (12)
+constexpr uint64_t DSF_DSD_CHUNK = 28, DSF_FMT_CHUNK = 52, DSF_DATA_HEADER = 12;
+constexpr uint64_t DSF_AUDIO_START = DSF_DSD_CHUNK + DSF_FMT_CHUNK + DSF_DATA_HEADER;
+static_assert(DstDecoder::SAMPLES_PER_FRAME == SACD_FRAME_BYTES * 8);
 constexpr uint8_t DATA_AUDIO = 2;
-/// decoded chunks kept per disc, and decoded ahead of the reader
+/// decoded chunks kept per disc (~17 s of audio)
 constexpr size_t CACHE_CHUNKS = 160;
-constexpr uint64_t AHEAD_CHUNKS = 48;  // ~5 s of audio, decoded in parallel
+/// chunks decoded ahead of a reader moving forward, in parallel (~5 s of audio)
+constexpr uint64_t AHEAD_CHUNKS = 48;
 const char IDX_MAGIC_V1[8] = {'W', 'M', 'S', 'A', 'C', 'D', '0', '1'};  // frame starts only
 const char IDX_MAGIC[8] = {'W', 'M', 'S', 'A', 'C', 'D', '0', '2'};     // frame starts + end marker
-
-const auto BITREV = [] {
-    std::array<uint8_t, 256> t{};
-    for (int i = 0; i < 256; i++) {
-        uint8_t b = uint8_t(i), r = 0;
-        for (int k = 0; k < 8; k++) r = uint8_t(r << 1 | ((b >> k) & 1));
-        t[size_t(i)] = r;
-    }
-    return t;
-}();
 
 uint64_t tc(const uint8_t* b) { return (uint64_t(b[0]) * 60 + b[1]) * 75 + b[2]; }
 
@@ -60,11 +55,17 @@ struct Packet {
     bool frame_start;
 };
 
+/// Frame info of a frame starting in a sector.
+struct FrameInfo {
+    uint64_t tc;      // time code (= frame number in the area)
+    size_t sectors;   // DST only: how many sectors the frame is spread over
+};
+
 /// One parsed audio sector.
 struct AudioSector {
     bool dst = false;
     std::vector<Packet> packets;
-    std::vector<uint64_t> frame_tcs;  // time codes of frames starting in this sector
+    std::vector<FrameInfo> frames;  // of the frames starting in this sector, in order
 };
 
 AudioSector parse_sector(const uint8_t* s) {
@@ -85,7 +86,7 @@ AudioSector parse_sector(const uint8_t* s) {
         pk.push_back({bool((w >> 15) & 1), uint8_t((w >> 11) & 7), size_t(w & 0x7FF)});
     }
     for (size_t i = 0; i < nfi; i++) {
-        r.frame_tcs.push_back(tc(s + p));
+        r.frames.push_back({tc(s + p), r.dst ? size_t(s[p + 3] >> 2 & 0x1F) : 0});
         p += r.dst ? 4 : 3;
     }
     for (auto& x : pk) {
@@ -107,8 +108,8 @@ Frames scan_frames(const File& f, uint64_t start, uint64_t end, uint32_t channel
     size_t frame_bytes = SACD_FRAME_BYTES * channels;
     size_t acc = 0;  // audio bytes of the current frame seen so far
     constexpr uint64_t CHUNK = 2048;  // sectors per read (4 MiB)
-    // a final frame cut short by a broken last sector is accepted (and padded with
-    // silence when read): it is well under a millisecond at the very end of the disc
+    // a final frame cut short by a broken last sector is accepted (and completed
+    // with silence when read): it is at most 1/75 s at the very end of the disc
     auto complete = [&] { return frames.size() == needed && (dst || (acc > 0 && acc <= frame_bytes)); };
     Bytes buf;
     for (uint64_t s = start; s <= end;) {
@@ -119,11 +120,12 @@ Frames scan_frames(const File& f, uint64_t start, uint64_t end, uint32_t channel
             uint64_t sec_no = s + i;
             AudioSector p;
             try {
-                p = with_context(std::format("sector {}", sec_no), [&] { return parse_sector(&buf[size_t(i * SECTOR)]); });
-                WM_ENSURE(p.dst == dst, "sector {}: DST flag {} in a {} area", sec_no, p.dst, dst ? "DST" : "plain DSD");
+                p = parse_sector(&buf[size_t(i * SECTOR)]);
+                WM_ENSURE(p.dst == dst, "DST flag {} in a {} area", p.dst, dst ? "DST" : "plain DSD");
             } catch (const Error& e) {
-                if (!complete()) throw;
-                info("{}: ignored, all {} frames already found", e.what(), needed);
+                // (the sector number is only formatted here: this runs for every sector of the disc)
+                if (!complete()) fail("sector {}: {}", sec_no, e.what());
+                info("sector {}: {}: ignored, all {} frames already found", sec_no, e.what(), needed);
                 frames.emplace_back(uint32_t(sec_no), 0);
                 return frames;
             }
@@ -133,8 +135,8 @@ Frames scan_frames(const File& f, uint64_t start, uint64_t end, uint32_t channel
                 if (pk.frame_start) {
                     WM_ENSURE(dst || frames.empty() || acc == frame_bytes, "frame {} has {} bytes, expected {}", frames.size() - 1, acc, frame_bytes);
                     uint64_t expect = frames.size();
-                    if (tci < p.frame_tcs.size()) {
-                        uint64_t t = p.frame_tcs[tci++];
+                    if (tci < p.frames.size()) {
+                        uint64_t t = p.frames[tci++].tc;
                         WM_ENSURE(t == expect, "sector {}: time code {} where frame {} was expected", sec_no, t, expect);
                     }
                     frames.emplace_back(uint32_t(sec_no), uint16_t(pk.off));
@@ -160,15 +162,12 @@ std::optional<SacdFrames> load_frames(const fs::path& p, uint64_t area_end) {
     bool v1 = std::memcmp(b, IDX_MAGIC_V1, 8) == 0;
     if (!v1 && std::memcmp(b, IDX_MAGIC, 8) != 0) return std::nullopt;
     uint64_t n = le64(b + 8);
-    if (m->bytes.size() != 16 + n * 6) return std::nullopt;
+    if (m->bytes.size() != 16 + n * SacdFrames::RECORD) return std::nullopt;
     if (!v1) return SacdFrames(std::move(*m), 16, size_t(n));
     // v1 caches were only written for discs whose area ends cleanly; they lack the end marker
     Frames fr;
     fr.reserve(size_t(n) + 1);
-    for (size_t i = 0; i < n; i++) {
-        const uint8_t* c = b + 16 + 6 * i;
-        fr.emplace_back(le32(c), uint16_t(c[4] | c[5] << 8));
-    }
+    for (size_t i = 0; i < n; i++) fr.push_back(SacdFrames::record(b + 16 + SacdFrames::RECORD * i));
     fr.emplace_back(uint32_t(area_end + 1), 0);
     // upgrade the cache file to the current format, which can be used in place
     try {
@@ -190,7 +189,24 @@ void store_frames(const fs::path& p, const Frames& fr) {
     atomic_write(p, b);
 }
 
+/// Sector of the area TOC to serve from a master TOC, 0 if there is none: the
+/// stereo area, falling back to multichannel if it is the only one. That one is
+/// then not offered again as the multichannel area: it is the disc's main area
+/// already, and would be listed (and scanned) twice.
+uint64_t area_toc(std::span<const uint8_t> master, bool multichannel) {
+    uint64_t stereo = be32(&master[64]), mc = be32(&master[72]);
+    return multichannel ? (stereo ? mc : 0) : stereo ? stereo : mc;
+}
+
 }  // namespace
+
+bool sacd_has_area(const fs::path& p, bool multichannel) {
+    File f(p);
+    Bytes m(SECTOR);
+    f.read_exact_at(m.data(), m.size(), MASTER_TOC * SECTOR);
+    WM_ENSURE(std::memcmp(m.data(), "SACDMTOC", 8) == 0, "{}: no SACD master TOC", p.string());
+    return area_toc(m, multichannel) != 0;
+}
 
 bool is_sacd(const fs::path& p) {
     try {
@@ -218,8 +234,7 @@ std::shared_ptr<SacdDisc> SacdDisc::open(const fs::path& path, const Cache* cach
     };
     Bytes m = sec(MASTER_TOC, 1);
     WM_ENSURE(std::memcmp(m.data(), "SACDMTOC", 8) == 0, "no SACD master TOC");
-    uint64_t area1 = be32(&m[64]), area2 = be32(&m[72]);
-    std::string catalog = trim(lossy_utf8(std::span(m).subspan(24, 16)));
+    auto catalog = cstr_at(std::span(m).first(40), 24, 0);  // 16 bytes, NUL- or space-padded
     uint16_t set_size = be16(&m[16]), set_seq = be16(&m[18]), year = be16(&m[120]);
     const char* genre = nullptr;
     if (m[104] == 1) {
@@ -228,8 +243,7 @@ std::shared_ptr<SacdDisc> SacdDisc::open(const fs::path& path, const Cache* cach
     }
     uint8_t master_charset = m[138];  // first locale: [lang, lang, charset, reserved] at 136
 
-    // the stereo area, falling back to multichannel if it is the only one
-    uint64_t area_start = multichannel ? area2 : area1 ? area1 : area2;
+    uint64_t area_start = area_toc(m, multichannel);
     WM_ENSURE(area_start != 0, "{}", multichannel ? "no multichannel area" : "no audio area");
     Bytes at = sec(area_start, 1);
     WM_ENSURE(std::memcmp(at.data(), "TWOCHTOC", 8) == 0 || std::memcmp(at.data(), "MULCHTOC", 8) == 0, "bad area TOC signature");
@@ -309,7 +323,7 @@ std::shared_ptr<SacdDisc> SacdDisc::open(const fs::path& path, const Cache* cach
         if (auto v = pick(2, 10)) album.set("LABEL", *v);
         if (auto v = pick(3, 11)) album.set("COPYRIGHT", *v);
     }
-    if (!catalog.empty()) album.set("CATALOGNUMBER", catalog);
+    if (catalog) album.set("CATALOGNUMBER", *catalog);
     if (year >= 1900 && year < 2200) album.set("DATE", std::to_string(year));
     if (genre) album.set("GENRE", genre);
     if (set_size > 1 && set_seq >= 1) {
@@ -318,7 +332,10 @@ std::shared_ptr<SacdDisc> SacdDisc::open(const fs::path& path, const Cache* cach
     }
     album.set("MEDIA", "SACD");
 
-    uint64_t needed = disc->tracks.back().end;
+    // frames up to the end of the track ending last (the TOC does not promise
+    // that this is the last track)
+    uint64_t needed = 0;
+    for (auto& t : disc->tracks) needed = std::max(needed, t.end);
     auto key = SrcKey::of(path);
     std::optional<SacdFrames> frames;
     fs::path cp;
@@ -352,7 +369,7 @@ Tags SacdDisc::track_tags(size_t i) const {
     return tg;
 }
 
-std::vector<Bytes> SacdDisc::coded_frames(uint64_t f0, uint64_t f1) const {
+SacdDisc::Coded SacdDisc::coded_frames(uint64_t f0, uint64_t f1) const {
     auto start = frames_[size_t(f0)];
     auto end = frames_[size_t(f1)];  // always present: the list ends with an end marker
     uint64_t s0 = start.first, s1 = end.first;
@@ -361,8 +378,12 @@ std::vector<Bytes> SacdDisc::coded_frames(uint64_t f0, uint64_t f1) const {
     Bytes buf(size_t(count * SECTOR));
     size_t n = file.read_at(buf.data(), buf.size(), s0 * SECTOR);
     buf.resize(n - n % SECTOR);
-    std::vector<Bytes> out;
-    out.reserve(size_t(f1 - f0));
+    Coded out;
+    auto& fr = out.frames;
+    fr.reserve(size_t(f1 - f0));
+    // where the latest frame starts, ends so far, and (DST) should end
+    uint64_t first_sector = 0, last_sector = 0;
+    size_t sectors = 0;
     for (uint64_t i = 0; i < buf.size() / SECTOR; i++) {
         uint64_t sec_no = s0 + i;
         // the end marker's own sector is only part of the range if the next frame
@@ -370,62 +391,104 @@ std::vector<Bytes> SacdDisc::coded_frames(uint64_t f0, uint64_t f1) const {
         if (sec_no > end.first || (sec_no == end.first && end.second == 0)) break;
         const uint8_t* sb = &buf[size_t(i * SECTOR)];
         auto parsed = parse_sector(sb);
+        size_t starts = 0;  // frames started in this sector so far: they index its frame infos
         bool done = false;
         for (auto& pk : parsed.packets) {
+            bool audio = pk.data_type == DATA_AUDIO, frame_start = audio && pk.frame_start;
+            size_t info = frame_start ? starts++ : 0;
             std::pair<uint32_t, uint16_t> pos{uint32_t(sec_no), uint16_t(pk.off)};
             if (pos < start) continue;
             if (pos >= end) {
                 done = true;
                 break;
             }
-            if (pk.data_type != DATA_AUDIO) continue;
-            if (pk.frame_start || out.empty()) {
-                out.emplace_back();
-                out.back().reserve(SACD_FRAME_BYTES * channels);
+            if (!audio) continue;
+            if (frame_start || fr.empty()) {
+                fr.emplace_back().reserve(SACD_FRAME_BYTES * channels);
+                first_sector = sec_no;
+                sectors = frame_start && info < parsed.frames.size() ? parsed.frames[info].sectors : 0;
             }
-            out.back().insert(out.back().end(), sb + pk.off, sb + pk.off + pk.len);
+            fr.back().insert(fr.back().end(), sb + pk.off, sb + pk.off + pk.len);
+            last_sector = sec_no;
         }
         if (done) break;
     }
-    WM_ENSURE(out.size() == f1 - f0, "expected {} frames, found {}", f1 - f0, out.size());
+    WM_ENSURE(fr.size() == f1 - f0, "expected {} frames, found {}", f1 - f0, fr.size());
+    // The area's last frame can be cut short by an unreadable final sector (see
+    // scan_frames). A plain DSD frame then lacks bytes; a DST frame has no fixed
+    // size, but its frame info says over how many sectors it is spread.
+    if (f1 + 1 == frames_.size() && !fr.empty())
+        out.cut_short = dst ? sectors > 0 && last_sector - first_sector + 1 < sectors : fr.back().size() < SACD_FRAME_BYTES * channels;
     return out;
 }
 
 std::vector<Bytes> SacdDisc::read_frames(uint64_t f0, uint64_t f1) const {
     size_t ch = channels, per_frame = SACD_FRAME_BYTES * ch;
-    auto coded = coded_frames(f0, f1);
-    std::vector<Bytes> out(ch);
-    for (auto& o : out) o.reserve(SACD_FRAME_BYTES * coded.size());
+    auto [coded, cut_short] = coded_frames(f0, f1);
+    std::vector<Bytes> out(ch, Bytes(size_t(SACD_FRAME_BYTES) * coded.size()));
     std::unique_ptr<DstDecoder> dec;
     if (dst) dec = std::make_unique<DstDecoder>(ch);
     Bytes raw(per_frame);
     for (size_t i = 0; i < coded.size(); i++) {
         const Bytes* inter = &coded[i];
-        if (dec) {
-            raw.resize(per_frame);
-            with_context(std::format("frame {}", f0 + i), [&] { dec->decode(coded[i], raw); });
+        bool cut = cut_short && i + 1 == coded.size();
+        if (dec && cut && DstDecoder::compressed(coded[i])) {
+            // the arithmetic code cannot be decoded in part (missing bits would be
+            // read as zeros, giving arbitrary samples): the frame is silence
+            std::fill(raw.begin(), raw.end(), 0x69);
+            inter = &raw;
+        } else if (dec) {
+            try {
+                dec->decode(coded[i], raw);  // an uncompressed frame cut short is completed with silence
+            } catch (const std::exception& e) {
+                fail("frame {}: {}", f0 + i, e.what());
+            }
             inter = &raw;
         } else if (coded[i].size() != per_frame) {
-            bool last = f0 + i + 2 == frames_.size();  // frames_ ends with the end marker
-            WM_ENSURE(last && coded[i].size() < per_frame, "frame {} has {} bytes", f0 + i, coded[i].size());
+            WM_ENSURE(cut, "frame {} has {} bytes", f0 + i, coded[i].size());
             raw.assign(coded[i].begin(), coded[i].end());
             raw.resize(per_frame, 0x69);  // DSD silence
             inter = &raw;
         }
-        // de-interleave (byte-interleaved channels)
-        for (size_t j = 0; j < inter->size(); j++) out[j % ch].push_back((*inter)[j]);
+        // de-interleave the byte-interleaved channels, in DSF's bit order
+        const uint8_t* in = inter->data();
+        for (size_t c = 0; c < ch; c++) {
+            uint8_t* o = out[c].data() + i * SACD_FRAME_BYTES;
+            for (size_t j = 0; j < SACD_FRAME_BYTES; j++) o[j] = BIT_REVERSE[in[j * ch + c]];
+        }
     }
     return out;
+}
+
+bool SacdDisc::note_reader(uint64_t c) const {
+    Reader* oldest = &readers_[0];
+    for (auto& r : readers_) {
+        if (r.used && c + AHEAD_CHUNKS >= r.pos && c <= r.pos + AHEAD_CHUNKS) {
+            r.pos = std::max(r.pos, c);
+            r.used = ++clock_;
+            return true;
+        }
+        if (r.used < oldest->used) oldest = &r;
+    }
+    *oldest = {c, ++clock_};
+    return false;
+}
+
+bool SacdDisc::near_reader(uint64_t c) const {
+    return std::any_of(readers_.begin(), readers_.end(), [&](const Reader& r) { return r.used && c + AHEAD_CHUNKS >= r.pos && c <= r.pos + AHEAD_CHUNKS + 1; });
 }
 
 std::shared_future<SacdDisc::Chunk> SacdDisc::start(uint64_t c, std::shared_ptr<std::promise<Chunk>>* claimed) const {
     if (auto it = chunks_.find(c); it != chunks_.end()) {
         it->second.used = ++clock_;
+        // read-ahead the pool has not got to yet: the reader decodes it now
+        // instead of waiting for its turn
+        if (claimed && it->second.todo) *claimed = std::move(it->second.todo);
         return it->second.data;
     }
     auto p = std::make_shared<std::promise<Chunk>>();
     std::shared_future<Chunk> f = p->get_future().share();
-    chunks_[c] = {f, ++clock_};
+    chunks_[c] = {f, claimed ? nullptr : p, ++clock_};
     while (chunks_.size() > CACHE_CHUNKS) {
         auto victim = chunks_.end();
         for (auto it = chunks_.begin(); it != chunks_.end(); ++it)
@@ -435,66 +498,68 @@ std::shared_future<SacdDisc::Chunk> SacdDisc::start(uint64_t c, std::shared_ptr<
         if (victim == chunks_.end()) break;
         chunks_.erase(victim);
     }
-    if (claimed) {
-        *claimed = p;
-    } else {
-        submit([self = shared_from_this(), c, p] {
-            {
-                // read-ahead nobody is near any more (the reader seeked away): skip it
-                std::lock_guard g(self->mu_);
-                if (c + 1 < self->last_wanted_ || c > self->last_wanted_ + AHEAD_CHUNKS + 1) {
-                    self->chunks_.erase(c);
-                    p->set_exception(std::make_exception_ptr(Error("cancelled read-ahead")));
-                    return;
-                }
-            }
-            self->fulfil(c, *p);
-        }, Lane::Decode);
-    }
+    if (claimed) *claimed = p;
+    else submit([self = shared_from_this(), c] { self->decode_ahead(c); }, Lane::Decode);
     return f;
+}
+
+void SacdDisc::decode_ahead(uint64_t c) const {
+    std::shared_ptr<std::promise<Chunk>> p;
+    {
+        std::lock_guard g(mu_);
+        auto it = chunks_.find(c);
+        if (it == chunks_.end() || !it->second.todo) return;  // a reader took it on (or it was dropped)
+        // No reader is near it any more (one seeked away or stopped): skip it.
+        // Nobody waits for it either: a reader wanting it would have taken it on.
+        if (!near_reader(c)) {
+            chunks_.erase(it);
+            return;
+        }
+        p = std::move(it->second.todo);
+    }
+    fulfil(c, *p);
 }
 
 void SacdDisc::fulfil(uint64_t c, std::promise<Chunk>& p) const {
     try {
         uint64_t f0 = c * CHUNK_FRAMES, f1 = std::min<uint64_t>((c + 1) * CHUNK_FRAMES, frames_.size() - 1);
+        WM_ENSURE(f0 < f1, "internal: chunk {} is past the area's {} frames", c, frames_.size() - 1);
         p.set_value(std::make_shared<const std::vector<Bytes>>(read_frames(f0, f1)));
     } catch (...) {
+        {
+            // so that a later read tries again; the entry is still this one: one
+            // being decoded is neither evicted nor replaced
+            std::lock_guard g(mu_);
+            chunks_.erase(c);
+        }
         p.set_exception(std::current_exception());
-        std::lock_guard g(mu_);
-        chunks_.erase(c);
     }
 }
 
 void SacdDisc::drop_cached() const {
     std::lock_guard g(mu_);
-    std::erase_if(chunks_, [](auto& kv) { return kv.second.data.wait_for(std::chrono::seconds(0)) == std::future_status::ready; });
+    // decoded chunks, and read-ahead not started (its jobs find nothing to do)
+    std::erase_if(chunks_, [](auto& kv) { return kv.second.todo || kv.second.data.wait_for(std::chrono::seconds(0)) == std::future_status::ready; });
+    readers_ = {};
 }
 
 SacdDisc::Chunk SacdDisc::chunk(uint64_t c) const {
-    touch(weak_from_this().lock());
-  for (int attempt = 0;; attempt++) {
+    auto self = weak_from_this().lock();  // background work needs a shared owner
+    touch(self);
     std::shared_future<Chunk> f;
     std::shared_ptr<std::promise<Chunk>> mine;
-    bool shared = !weak_from_this().expired();
     {
         std::lock_guard g(mu_);
-        // read-ahead only for a reader moving forward (not for one-off reads such as
-        // a music server's tag scan, or random seeks)
-        bool sequential = c == last_wanted_ + 1 || (c == last_wanted_ && c > 0);
-        last_wanted_ = c;
+        // read-ahead only for a reader moving forward (not for one-off reads such
+        // as a music server's tag scan, or the first read after a seek)
+        bool forward = note_reader(c);
         f = start(c, &mine);
-        // read-ahead: DST decoding is the slow part, and chunks decode in parallel
-        if (shared && sequential)
+        // DST decoding is the slow part, and chunks decode in parallel
+        if (self && forward)
             for (uint64_t k = c + 1; k < std::min(nchunks(), c + 1 + AHEAD_CHUNKS); k++) start(k, nullptr);
     }
     if (mine) fulfil(c, *mine);
-    try {
-        return f.get();
-    } catch (const Error& e) {
-        // a read-ahead job for this chunk was cancelled before the reader came back to it
-        if (attempt > 2 || std::string(e.what()) != "cancelled read-ahead") throw;
-    }
-  }
+    return f.get();
 }
 
 DsfTrack::DsfTrack(std::shared_ptr<const SacdDisc> disc, size_t track, const Tags& tags, const Cover* cover) : disc_(std::move(disc)) {
@@ -504,26 +569,26 @@ DsfTrack::DsfTrack(std::shared_ptr<const SacdDisc> disc, size_t track, const Tag
     bytes_per_ch_ = (t.end - t.start) * SACD_FRAME_BYTES;
     data_len_ = (bytes_per_ch_ + DSF_BLOCK - 1) / DSF_BLOCK * DSF_BLOCK * ch;
     id3_ = Segments(id3::build_segments(tags, cover));
-    uint64_t total = 28 + 52 + 12 + data_len_ + id3_.size();
     Bytes& h = header_;
     append(h, std::string_view("DSD "));
-    put_le64(h, 28);
-    put_le64(h, total);
-    put_le64(h, 28 + 52 + 12 + data_len_);  // metadata pointer
+    put_le64(h, DSF_DSD_CHUNK);
+    put_le64(h, DSF_AUDIO_START + data_len_ + id3_.size());
+    put_le64(h, DSF_AUDIO_START + data_len_);  // metadata pointer
     append(h, std::string_view("fmt "));
-    put_le64(h, 52);
+    put_le64(h, DSF_FMT_CHUNK);
     put_le32(h, 1);  // format version
     put_le32(h, 0);  // DSD raw
     uint32_t ch_type = ch <= 4 ? uint32_t(ch) : ch == 5 ? 6 : 7;
     put_le32(h, ch_type);
     put_le32(h, uint32_t(ch));
-    put_le32(h, 2'822'400);
+    put_le32(h, DSD64_RATE);
     put_le32(h, 1);                    // bits per sample: 1 = LSB first
     put_le64(h, bytes_per_ch_ * 8);    // sample count per channel
     put_le32(h, uint32_t(DSF_BLOCK));
     put_le32(h, 0);
     append(h, std::string_view("data"));
-    put_le64(h, 12 + data_len_);
+    put_le64(h, DSF_DATA_HEADER + data_len_);
+    WM_ENSURE(h.size() == DSF_AUDIO_START, "internal: DSF header of {} bytes", h.size());
 }
 
 void DsfTrack::read_data(uint64_t a, uint64_t b, Bytes& out) const {
@@ -551,9 +616,9 @@ void DsfTrack::read_data(uint64_t a, uint64_t b, Bytes& out) const {
                 have_chunk = k;
             }
             const Bytes& src = (*data)[size_t(c)];
+            WM_ENSURE(off < src.size(), "internal: byte {} of a {}-byte chunk", off, src.size());
             uint64_t n = std::min({run, uint64_t(src.size()) - off, bytes_per_ch_ - jj});
-            const uint8_t* s = src.data() + off;
-            for (uint64_t x = 0; x < n; x++) dst[x] = BITREV[s[x]];
+            std::memcpy(dst, src.data() + off, size_t(n));
             dst += n, pos += n, jj += n, run -= n;
         }
     }

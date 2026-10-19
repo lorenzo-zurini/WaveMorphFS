@@ -4,6 +4,7 @@
 #include <wavpack/wavpack.h>
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
 
 #include "apetag.hpp"
@@ -16,9 +17,17 @@ namespace {
 
 const char INDEX_MAGIC[8] = {'W', 'M', 'W', 'V', 'I', 'X', '0', '1'};
 const char LAYOUT_MAGIC[8] = {'W', 'M', 'W', 'V', 'L', 'Y', '0', '1'};
+// Block header (WavpackHeader in wavpack.h), little-endian: byte offsets of the
+// fields read or rewritten here. Sample numbers are 40 bits: a low 32-bit word
+// plus a high byte.
 constexpr size_t HEADER = 32;
+constexpr size_t H_SIZE = 4, H_VERSION = 8, H_INDEX_HI = 10, H_TOTAL_HI = 11, H_TOTAL = 12, H_INDEX = 16, H_COUNT = 20, H_FLAGS = 24;
+// the stream versions libwavpack decodes (its MIN_STREAM_VERS..MAX_STREAM_VERS)
+constexpr uint16_t MIN_VERSION = 0x402, MAX_VERSION = 0x410;
 /// samples decoded per call while verifying
 constexpr uint32_t CHUNK = 1 << 16;
+/// bump when plan() or encode() change what a track's head and tail are
+constexpr int LAYOUT_VERSION = 1;
 /// copied blocks kept per track while it is read (~1 MB of 192 kHz stereo float)
 constexpr size_t CACHE_BLOCKS = 8;
 
@@ -58,18 +67,20 @@ void sub_blocks(std::span<const uint8_t> b, F&& f) {
 
 struct Header {
     uint32_t size;  // whole block
-    uint64_t index, total;
+    uint64_t index;
     uint32_t count, flags;
 };
 
 std::optional<Header> parse_header(std::span<const uint8_t> h) {
     if (h.size() < HEADER || std::memcmp(h.data(), "wvpk", 4) != 0) return std::nullopt;
+    // the version check keeps a stray "wvpk" (e.g. in an ID3v2 tag before the audio) from passing as a block
+    uint16_t version = uint16_t(h[H_VERSION] | h[H_VERSION + 1] << 8);
+    if (version < MIN_VERSION || version > MAX_VERSION) return std::nullopt;
     Header r;
-    r.size = le32(&h[4]) + 8;
-    r.total = uint64_t(h[11]) << 32 | le32(&h[12]);
-    r.index = uint64_t(h[10]) << 32 | le32(&h[16]);
-    r.count = le32(&h[20]);
-    r.flags = le32(&h[24]);
+    r.size = le32(&h[H_SIZE]) + 8;  // wraps to < HEADER for a corrupt size
+    r.index = uint64_t(h[H_INDEX_HI]) << 32 | le32(&h[H_INDEX]);
+    r.count = le32(&h[H_COUNT]);
+    r.flags = le32(&h[H_FLAGS]);
     if (r.size < HEADER) return std::nullopt;
     return r;
 }
@@ -114,20 +125,30 @@ void WvImage::read_settings() {
     mode_ = WavpackGetMode(c.w);
     WM_ENSURE(!(mode_ & MODE_HYBRID), "{}: hybrid (lossy) WavPack", path.string());
     WM_ENSURE(!(qmode & QMODE_DSD_AUDIO), "{}: DSD WavPack", path.string());
+    // integer WavPack fits FLAC and is served as FLAC (AvImage)
+    WM_ENSURE(mode_ & MODE_FLOAT, "{}: not floating-point WavPack", path.string());
     sample_rate = WavpackGetSampleRate(c.w);
     channels = uint32_t(WavpackGetNumChannels(c.w));
     bits_ = WavpackGetBitsPerSample(c.w);
     bytes_ = WavpackGetBytesPerSample(c.w);
-    float_ = mode_ & MODE_FLOAT;
     norm_exp_ = WavpackGetFloatNormExp(c.w);
     channel_mask_ = WavpackGetChannelMask(c.w);
     qmode_ = qmode & 0xFF;  // the bits stored in the file
+    // Identities of the channels the mask does not cover (it covers the first
+    // ones). libwavpack stores them in the first block only, so re-encoded track
+    // heads must be given them again; 0xFF (unassigned) is what it assumes anyway.
+    std::string ids(channels + 1, '\0');
+    WavpackGetChannelIdentities(c.w, reinterpret_cast<unsigned char*>(ids.data()));
+    ids.resize(std::strlen(ids.c_str()));
+    ids.erase(0, std::min<size_t>(ids.size(), size_t(std::popcount(uint32_t(channel_mask_)))));
+    if (ids.find_first_not_of('\xFF') != std::string::npos) chan_ids_ = ids;
 }
 
 std::shared_ptr<WvImage> WvImage::open(const fs::path& p, const Cache* cache) {
     auto key = SrcKey::of(p);
     auto img = std::make_shared<WvImage>();
     img->path = p;
+    img->key = key;
     img->read_settings();
     File f(p);
     uint64_t fsize = f.size();
@@ -191,13 +212,13 @@ std::shared_ptr<WvImage> WvImage::open(const fs::path& p, const Cache* cache) {
         std::vector<int32_t> buf(size_t(CHUNK) * img->channels);
         uint64_t got = 0;
         while (uint32_t n = WavpackUnpackSamples(c.w, buf.data(), CHUNK)) {
-            if (img->float_) md5.update({reinterpret_cast<const uint8_t*>(buf.data()), size_t(n) * img->channels * 4});
+            md5.update({reinterpret_cast<const uint8_t*>(buf.data()), size_t(n) * img->channels * 4});
             got += n;
         }
         WM_ENSURE(WavpackGetNumErrors(c.w) == 0, "{} damaged blocks", WavpackGetNumErrors(c.w));
         WM_ENSURE(got == img->total, "decoded {} of {} samples", got, img->total);
         uint8_t want_md5[16];
-        if (img->float_ && WavpackGetMD5Sum(c.w, want_md5)) WM_ENSURE(md5.finish() == std::to_array(want_md5), "audio MD5 mismatch");
+        if (WavpackGetMD5Sum(c.w, want_md5)) WM_ENSURE(md5.finish() == std::to_array(want_md5), "audio MD5 mismatch");
     });
     WM_ENSURE(SrcKey::of(p) == key, "{} changed while indexing", p.string());
     if (cache) {
@@ -243,6 +264,7 @@ Bytes WvImage::encode(uint64_t s, uint64_t e, uint64_t out_first, uint64_t out_t
         return 1;
     };
     Context c(WavpackOpenFileOutput(sink, &out, nullptr));
+    WM_ENSURE(c.w, "libwavpack: cannot create an encoder");
     WavpackConfig cfg;
     std::memset(&cfg, 0, sizeof cfg);
     cfg.bits_per_sample = bits_;
@@ -250,7 +272,7 @@ Bytes WvImage::encode(uint64_t s, uint64_t e, uint64_t out_first, uint64_t out_t
     cfg.num_channels = int(channels);
     cfg.channel_mask = channel_mask_;
     cfg.sample_rate = int32_t(sample_rate);
-    cfg.float_norm_exp = float_ ? norm_exp_ : 0;
+    cfg.float_norm_exp = norm_exp_;
     cfg.qmode = qmode_;
     // the source's mode; one thread, so the output is the same every time
     if (mode_ & MODE_FAST) cfg.flags |= CONFIG_FAST_FLAG;
@@ -261,8 +283,9 @@ Bytes WvImage::encode(uint64_t s, uint64_t e, uint64_t out_first, uint64_t out_t
         cfg.xmode = (mode_ & MODE_XMODE) >> 12;
     }
     cfg.worker_threads = 0;
+    auto ids = chan_ids_.empty() ? nullptr : reinterpret_cast<const unsigned char*>(chan_ids_.c_str());
     uint64_t n = e - s;
-    WM_ENSURE(WavpackSetConfiguration64(c.w, &cfg, int64_t(n), nullptr) && WavpackPackInit(c.w) &&
+    WM_ENSURE(WavpackSetConfiguration64(c.w, &cfg, int64_t(n), ids) && WavpackPackInit(c.w) &&
                   WavpackPackSamples(c.w, pcm.data(), uint32_t(n)) && WavpackFlushSamples(c.w),
               "{}: encoding samples {}..{}: {}", path.string(), s, e, WavpackGetErrorMessage(c.w));
     // number the blocks for the track; without the WAV header libwavpack makes
@@ -284,15 +307,18 @@ Bytes rebuild_block(std::span<const uint8_t> block, uint64_t index, uint64_t tot
     sub_blocks(block, [&](size_t p, size_t len, uint8_t id) {
         if (!(strip && file_level(id))) append(out, block.subspan(p, len));
     });
-    Bytes size;
-    put_le32(size, uint32_t(out.size() - 8));
-    std::copy(size.begin(), size.end(), out.begin() + 4);
-    out[10] = uint8_t(index >> 32);
-    out[11] = uint8_t(total >> 32);
-    for (int i = 0; i < 4; i++) {
-        out[size_t(12 + i)] = uint8_t(total >> (8 * i));
-        out[size_t(16 + i)] = uint8_t(index >> (8 * i));
-    }
+    auto put32 = [&](size_t at, uint32_t v) {
+        for (size_t i = 0; i < 4; i++) out[at + i] = uint8_t(v >> (8 * i));
+    };
+    put32(H_SIZE, uint32_t(out.size() - 8));
+    out[H_INDEX_HI] = uint8_t(index >> 32);
+    put32(H_INDEX, uint32_t(index));
+    // as libwavpack's SET_TOTAL_SAMPLES: all ones in the low word means "unknown
+    // length", so from 2^32 - 1 samples on the value is stored shifted up by one
+    // per 2^32 - 1 (GET_TOTAL_SAMPLES subtracts the high byte again)
+    uint64_t stored_total = total + total / 0xFFFFFFFF;
+    out[H_TOTAL_HI] = uint8_t(stored_total >> 32);
+    put32(H_TOTAL, uint32_t(stored_total));
     // the block checksum covers everything before it, header included
     sub_blocks(out, [&](size_t p, size_t len, uint8_t id) {
         if ((id & ID_UNIQUE) != ID_BLOCK_CHECKSUM || (id & ID_LARGE)) return;
@@ -340,22 +366,24 @@ Plan plan(const WvImage& img, uint64_t s, uint64_t e) {
 
 }  // namespace
 
-fs::path wv_layout_path(const WvImage& img, const std::vector<std::pair<uint64_t, uint64_t>>& ranges, const Cache& cache) {
-    // sizes depend on the encoder, so its version is part of the name
-    std::string extra = std::format("wavpack-tracks {}", WavpackGetLibraryVersionString());
+fs::path wv_layout_path(const WvImage& img, const Ranges& ranges, const Cache& cache) {
+    // sizes depend on the encoder, so its version is part of the name, and so is
+    // LAYOUT_VERSION, for changes to how tracks are planned or encoded here
+    std::string extra = std::format("wavpack-tracks v{} {}", LAYOUT_VERSION, WavpackGetLibraryVersionString());
     for (auto& [s, e] : ranges) extra += std::format(" {}-{}", s, e);
-    return cache.dir() / "flacidx" / (Cache::name_for(img.path, SrcKey::of(img.path), extra) + ".wvlayout");
+    return cache.dir() / "flacidx" / (Cache::name_for(img.path, img.key, extra) + ".wvlayout");
 }
 
-std::vector<WvLayout> wv_layouts(const WvImage& img, const std::vector<std::pair<uint64_t, uint64_t>>& ranges, const Cache* cache) {
-    fs::path p = cache ? wv_layout_path(img, ranges, *cache) : fs::path();
+std::optional<std::vector<WvLayout>> load_wv_layout(const WvImage& img, const Ranges& ranges, const Cache& cache) {
+    auto b = try_read_file(wv_layout_path(img, ranges, cache));
+    if (!b || b->size() != 16 + 8 * ranges.size() || std::memcmp(b->data(), LAYOUT_MAGIC, 8) != 0 || le64(&(*b)[8]) != ranges.size()) return std::nullopt;
     std::vector<WvLayout> out;
-    if (cache)
-        if (auto b = try_read_file(p); b && b->size() == 16 + 8 * ranges.size() && std::memcmp(b->data(), LAYOUT_MAGIC, 8) == 0 &&
-                                       le64(&(*b)[8]) == ranges.size()) {
-            for (size_t i = 0; i < ranges.size(); i++) out.push_back({le32(&(*b)[16 + 8 * i]), le32(&(*b)[20 + 8 * i])});
-            return out;
-        }
+    for (size_t i = 0; i < ranges.size(); i++) out.push_back({le32(&(*b)[16 + 8 * i]), le32(&(*b)[20 + 8 * i])});
+    return out;
+}
+
+std::vector<WvLayout> build_wv_layout(const WvImage& img, const Ranges& ranges, const Cache* cache) {
+    std::vector<WvLayout> out;
     for (auto [s, e] : ranges) {
         auto pl = plan(img, s, e);
         WvLayout l;
@@ -370,9 +398,15 @@ std::vector<WvLayout> wv_layouts(const WvImage& img, const std::vector<std::pair
             put_le32(b, l.head);
             put_le32(b, l.tail);
         }
-        atomic_write(p, b);
+        atomic_write(wv_layout_path(img, ranges, *cache), b);
     }
     return out;
+}
+
+std::vector<WvLayout> wv_layouts(const WvImage& img, const Ranges& ranges, const Cache* cache) {
+    if (cache)
+        if (auto l = load_wv_layout(img, ranges, *cache)) return std::move(*l);
+    return build_wv_layout(img, ranges, cache);
 }
 
 WvTrack::WvTrack(std::shared_ptr<const WvImage> img, uint64_t start, uint64_t end, const Tags& tags, const WvLayout& layout, const Cover* cover)
@@ -408,7 +442,7 @@ void WvTrack::drop_cached() const {
     vstarts_.reset();
 }
 
-WvTrack::Shared WvTrack::block_bytes(size_t i) const {
+WvTrack::Shared WvTrack::block_bytes(size_t i, std::optional<File>& file) const {
     {
         std::lock_guard g(mu_);
         if (auto it = blocks_.find(i); it != blocks_.end()) {
@@ -418,7 +452,8 @@ WvTrack::Shared WvTrack::block_bytes(size_t i) const {
     }
     auto& k = img_->blocks[b1_ + i];
     Bytes raw(k.size);
-    File(img_->path).read_exact_at(raw.data(), raw.size(), k.off);
+    if (!file) file.emplace(img_->path);
+    file->read_exact_at(raw.data(), raw.size(), k.off);
     auto b = std::make_shared<const Bytes>(rebuild_block(raw, k.first - start_, end_ - start_, true));
     WM_ENSURE(b->size() == k.kept, "{}: block at {} changed", img_->path.string(), k.off);
     std::lock_guard g(mu_);
@@ -451,7 +486,8 @@ void WvTrack::read_copy(uint64_t off, size_t len, Bytes& out) const {
     size_t i0 = size_t(std::upper_bound(vs.begin(), vs.end(), off) - vs.begin()) - 1;
     size_t i1 = i0;
     while (i1 + 1 < vs.size() && vs[i1] < end) i1++;
-    for (size_t i = i0; i < i1; i++) copy_overlap(out, *block_bytes(i), vs[i], off, len);
+    std::optional<File> file;  // opened once per request, if a block is not at hand
+    for (size_t i = i0; i < i1; i++) copy_overlap(out, *block_bytes(i, file), vs[i], off, len);
 }
 
 Bytes WvTrack::read_at(uint64_t off, size_t len) const {

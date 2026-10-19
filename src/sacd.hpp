@@ -9,6 +9,7 @@
 // MSB-first, DSF LSB-first). Audio bits are untouched.
 #pragma once
 
+#include <array>
 #include <future>
 #include <map>
 #include <memory>
@@ -23,10 +24,16 @@ namespace wm {
 
 class Cache;
 
-/// bytes per channel per 1/75 s frame at 64 x 44.1 kHz
-constexpr uint64_t SACD_FRAME_BYTES = 2'822'400 / 8 / 75;  // 4704
+/// 64 x 44.1 kHz, the only rate on SACDs
+constexpr uint32_t DSD64_RATE = 2'822'400;
+/// bytes per channel per 1/75 s frame
+constexpr uint64_t SACD_FRAME_BYTES = DSD64_RATE / 8 / 75;  // 4704
 
 bool is_sacd(const fs::path& p);
+/// True if the ISO has an area to serve: its main one (stereo, or multichannel if
+/// that is the only one), or with `multichannel` a separate multichannel one.
+/// SacdDisc::open fails for an area this says is missing.
+bool sacd_has_area(const fs::path& p, bool multichannel);
 /// True if the frame table of this ISO area is cached (opening is then cheap).
 bool sacd_is_cached(const Cache& c, const fs::path& src, bool multichannel);
 
@@ -42,14 +49,14 @@ class SacdFrames {
 public:
     using Frame = std::pair<uint32_t, uint16_t>;
     SacdFrames() = default;
+    /// a frame in the cache file: sector (LE32), offset (LE16)
+    static constexpr size_t RECORD = 6;
+    static Frame record(const uint8_t* r) { return {le32(r), uint16_t(r[4] | r[5] << 8)}; }
+
     explicit SacdFrames(std::vector<Frame> v) : vec_(std::make_shared<const std::vector<Frame>>(std::move(v))), n_(vec_->size()) {}
     SacdFrames(MappedFile m, size_t first, size_t n) : map_(std::move(m)), recs_(map_.bytes.data() + first), n_(n) {}
     size_t size() const { return n_; }
-    Frame operator[](size_t i) const {
-        if (vec_) return (*vec_)[i];
-        const uint8_t* c = recs_ + 6 * i;
-        return {le32(c), uint16_t(c[4] | c[5] << 8)};
-    }
+    Frame operator[](size_t i) const { return vec_ ? (*vec_)[i] : record(recs_ + RECORD * i); }
 
 private:
     std::shared_ptr<const std::vector<Frame>> vec_;
@@ -73,7 +80,7 @@ public:
 
     /// audio frames per decoded chunk
     static constexpr uint64_t CHUNK_FRAMES = 8;
-    using Chunk = std::shared_ptr<const std::vector<Bytes>>;  // per-channel DSD bytes (MSB-first)
+    using Chunk = std::shared_ptr<const std::vector<Bytes>>;  // per-channel DSD bytes, LSB first as in DSF
     /// Chunk c (frames [c*CHUNK_FRAMES, ...)), decoded here if nobody has started
     /// it; the following chunks are decoded ahead in the background.
     Chunk chunk(uint64_t c) const;
@@ -81,20 +88,39 @@ public:
     void drop_cached() const override;
 
 private:
-    std::vector<Bytes> coded_frames(uint64_t f0, uint64_t f1) const;
+    struct Coded {
+        std::vector<Bytes> frames;
+        /// the last of them is the area's last frame, cut short by an unreadable final sector
+        bool cut_short = false;
+    };
+    Coded coded_frames(uint64_t f0, uint64_t f1) const;
     std::vector<Bytes> read_frames(uint64_t f0, uint64_t f1) const;
+    // Decoded chunks are shared by the disc's readers. A chunk a reader needs is
+    // decoded in its own thread unless a pool thread already is decoding it, so
+    // pool threads only ever do read-ahead and never wait on each other.
     std::shared_future<Chunk> start(uint64_t c, std::shared_ptr<std::promise<Chunk>>* claimed) const;  // mu_ held
+    void decode_ahead(uint64_t c) const;  // a read-ahead job
     void fulfil(uint64_t c, std::promise<Chunk>& p) const;
+    /// Note that a reader wants chunk c; true if it is one moving forward through the disc.
+    bool note_reader(uint64_t c) const;  // mu_ held
+    bool near_reader(uint64_t c) const;  // mu_ held
     uint64_t nchunks() const { return (frames_.size() - 1 + CHUNK_FRAMES - 1) / CHUNK_FRAMES; }
     SacdFrames frames_;
     mutable std::mutex mu_;
     struct Cached {
         std::shared_future<Chunk> data;
+        std::shared_ptr<std::promise<Chunk>> todo;  // read-ahead nobody has started yet
         uint64_t used;
     };
     mutable std::map<uint64_t, Cached> chunks_;
     mutable uint64_t clock_ = 0;
-    mutable uint64_t last_wanted_ = 0;  // most recent chunk a reader asked for (mu_)
+    /// Where the disc is being read: the furthest chunk wanted by each of a few
+    /// readers (separate tracks, or one track's concurrent requests share one).
+    /// Read-ahead nobody is near any more is skipped.
+    struct Reader {
+        uint64_t pos = 0, used = 0;  // used == 0: free
+    };
+    mutable std::array<Reader, 4> readers_{};
 };
 
 /// One SACD track as a DSF file.

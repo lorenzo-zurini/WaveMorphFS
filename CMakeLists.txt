@@ -79,6 +79,7 @@ if(WAVEMORPH_TESTS)
     tests/test_formats.cpp
     tests/test_fs.cpp
     tests/test_library.cpp
+    tests/test_sacd.cpp
     tests/test_tagformats.cpp
     tests/test_tags.cpp
     tests/test_wavpack.cpp
