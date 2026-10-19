@@ -76,18 +76,21 @@ bool ends_with(std::string_view s, std::string_view p);
 bool iends_with(std::string_view s, std::string_view p);
 /// Trim Unicode white space (UTF-8) at both ends.
 std::string trim(std::string_view s);
-std::string trim_end(std::string_view s);
+/// Decode the UTF-8 sequence at s[i] and set `len` to its byte length. Anything
+/// that is not well-formed UTF-8 (stray or missing continuation bytes, overlong
+/// forms, surrogates, beyond U+10FFFF) gives U+FFFD with `len` 1.
+char32_t utf8_at(std::string_view s, size_t i, size_t& len);
 /// True if the UTF-8 sequence at s[i] is white space; sets `len` to its byte length.
 bool ws_at(std::string_view s, size_t i, size_t& len);
 std::vector<std::string> split(std::string_view s, char sep);
 std::string hex(std::span<const uint8_t> b);
 std::optional<uint64_t> parse_u64(std::string_view s);
+/// `b` as well-formed UTF-8: every ill-formed byte becomes U+FFFD.
 std::string lossy_utf8(std::span<const uint8_t> b);
 /// Append the UTF-8 encoding of code point `c`.
 void put_utf8(std::string& out, char32_t c);
 /// Lower-case extension without the dot ("" if none).
 std::string ext_lower(const fs::path& p);
-std::string path_str(const fs::path& p);
 
 // ---- files
 class File {
@@ -110,14 +113,15 @@ private:
 Bytes read_file(const fs::path& p);
 std::optional<Bytes> try_read_file(const fs::path& p);
 std::optional<std::string> try_read_text(const fs::path& p);
-/// A temp path next to `p` unique to this process and thread.
-fs::path unique_tmp(const fs::path& p);
+/// Replace `p` with `data` so that readers and a crash see either the old or the
+/// new file, never a partial one: written to a temp file, synced, renamed over
+/// `p`, and the directory synced. An existing file's permissions are kept.
 void atomic_write(const fs::path& p, std::span<const uint8_t> data);
 inline void atomic_write(const fs::path& p, std::string_view s) { atomic_write(p, bytes_of(s)); }
 
-/// Modification time in ns since the epoch, if the path exists.
 /// st_mtim (or any timespec) as nanoseconds since the epoch.
 inline int64_t ns_of(const struct timespec& t) { return int64_t(t.tv_sec) * 1'000'000'000 + t.tv_nsec; }
+/// Modification time in ns since the epoch, if the path exists.
 std::optional<int64_t> mtime_ns(const fs::path& p);
 int64_t now_ns();
 
@@ -136,7 +140,6 @@ struct SrcKey {
 enum class Lane { Decode, Encode };
 /// Run `task` on a worker pool (each lane has as many threads as the CPU).
 void submit(std::function<void()> task, Lane lane = Lane::Decode);
-size_t pool_size();
 
 /// Something that keeps decoded or encoded audio around for the readers of the
 /// moment (read-ahead, frames shared by neighbouring reads). Once registered, by
@@ -174,6 +177,8 @@ void trim_heap();
 size_t sweep_idle(std::chrono::nanoseconds idle);
 
 // ---- logging (level from WAVEMORPH_LOG: debug, info, warn, error)
+// Errors are thrown (wm::Error) and reported by whoever catches them, so there
+// is no error() helper; WAVEMORPH_LOG=error just silences the warnings.
 enum class Level { Debug, Info, Warn, Error };
 void log_init();
 bool log_enabled(Level l);
@@ -190,7 +195,5 @@ struct ProcResult {
 };
 /// Run argv[0] (looked up in PATH) capturing stdout and stderr.
 ProcResult run(const std::vector<std::string>& argv);
-/// Run with inherited stdio; returns the exit code (-1 on failure to run).
-int run_inherit(const std::vector<std::string>& argv);
 
 }  // namespace wm
