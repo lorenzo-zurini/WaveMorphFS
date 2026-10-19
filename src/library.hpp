@@ -91,6 +91,9 @@ struct Listing {
 struct VEntry {
     Entry e;           // directories: e.dir = the source folder behind it (empty if purely virtual)
     fs::path src_dir;  // files: the source folder they belong to (tag edits are stored there)
+    /// files: the name in the source folder's listing, which the sidecar knows it
+    /// by; e.name differs when a clash in the mount directory numbered it
+    std::string src_name;
 };
 
 /// A directory of the mount: the source folders placed at its path (by default
@@ -158,6 +161,10 @@ public:
     std::optional<VEntry> lookup(const std::string& vpath, std::string_view name);
     /// Re-read "_target"s from the tags tree (rate-limited unless forced).
     void refresh_placements(bool force = false);
+    /// Make the next lookups re-check source folder `dir` and rebuild mount
+    /// directories now, instead of trusting listings checked moments ago (after
+    /// a tag edit, so the editor reads back what it wrote).
+    void invalidate(const fs::path& dir);
     /// Root this source path belongs to and the path relative to it.
     std::optional<std::pair<const Root*, fs::path>> root_of(const fs::path& p) const;
     std::optional<fs::path> overlay_dir(const fs::path& dir) const;

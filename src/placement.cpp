@@ -171,6 +171,21 @@ std::shared_ptr<const VListing> Library::list_vdir(const std::string& vpath) {
     return l;
 }
 
+void Library::invalidate(const fs::path& dir) {
+    std::shared_ptr<Listing> l;
+    {
+        std::lock_guard g(mu_);
+        if (auto it = listings_.find(dir); it != listings_.end()) l = it->second;
+    }
+    if (l) {
+        std::lock_guard g(l->mu);
+        l->checked = {};  // list_dir compares its signature again (an edit changed it)
+    }
+    // which mount directories show the folder is not recorded; they are cheap to rebuild
+    std::lock_guard g(place_mu_);
+    vlistings_.clear();
+}
+
 std::optional<VEntry> Library::lookup(const std::string& vpath, std::string_view name) {
     auto l = list_vdir(vpath);
     auto* ve = l->find(name);
@@ -188,6 +203,7 @@ std::shared_ptr<VListing> Library::build_vlisting(const std::string& vpath, cons
     }
     std::set<std::string> taken;
     auto add = [&](VEntry ve) {
+        if (!ve.e.is_dir) ve.src_name = ve.e.name;
         if (taken.contains(ve.e.name)) {
             if (ve.e.is_dir) return;  // the same directory reached two ways
             std::string base = ve.e.name, stem = base, ext;
