@@ -161,8 +161,17 @@ services:
     container_name: wavemorphfs
     devices:
       - /dev/fuse
+    # only what it needs: the FUSE mount (SYS_ADMIN), switching to PUID/PGID,
+    # and handing its own folders to that user on the first start
+    cap_drop:
+      - ALL
     cap_add:
       - SYS_ADMIN
+      - SETUID
+      - SETGID
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
     security_opt:
       - apparmor:unconfined       # AppArmor blocks FUSE mounts in containers
     environment:
