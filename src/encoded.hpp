@@ -64,6 +64,8 @@ private:
     /// Claim the frames of [a, b) nobody is producing yet; the futures of all of
     /// them are appended to `need` if given (mu_ held).
     Promises claim(uint64_t a, uint64_t b, std::vector<Frames::Future>* need) const;
+    /// Append bytes [a, a+len) of the audio (the frames after the header).
+    void read_frames(uint64_t a, size_t len, Bytes& out) const;
     /// Decode and encode claimed frames, fulfilling their promises.
     void produce(const Promises& ps) const;
     /// Frame j encoded to `got` bytes, not the measured size: drop the layout, fail.

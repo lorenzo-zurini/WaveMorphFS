@@ -234,10 +234,14 @@ Bytes EncodedTrack::read_at(uint64_t off, size_t len) const {
     if (off >= size_) return out;
     len = size_t(std::min<uint64_t>(len, size_ - off));
     out.reserve(len);
-    header_.read(img_->path, off, len, out);
-    uint64_t h = header_.size(), end = off + len;
-    if (end <= h) return out;
-    uint64_t a = std::max(off, h) - h, b = end - h;  // audio-relative
+    stitch(out, off, len, Piece{header_.size(), [&](uint64_t a, size_t n, Bytes& o) { header_.read(img_->path, a, n, o); }},
+           Piece{offsets_.back(), [&](uint64_t a, size_t n, Bytes& o) { read_frames(a, n, o); }});
+    WM_ENSURE(out.size() == len, "internal: produced {} of {} bytes at {}", out.size(), len, off);
+    return out;
+}
+
+void EncodedTrack::read_frames(uint64_t a, size_t len, Bytes& out) const {
+    uint64_t b = a + len;
     uint64_t nframes = offsets_.size() - 1;
     uint64_t j0 = uint64_t(std::upper_bound(offsets_.begin(), offsets_.end(), a) - offsets_.begin()) - 1;
     uint64_t j1 = uint64_t(std::lower_bound(offsets_.begin(), offsets_.end(), b) - offsets_.begin());  // exclusive
@@ -267,9 +271,7 @@ Bytes EncodedTrack::read_at(uint64_t off, size_t len) const {
         for (auto& job : ahead) submit([self, job] { self->run(*job); }, Lane::Encode);
     }
     for (auto& job : jobs) run(*job);
-    for (uint64_t j = j0; j < j1; j++) copy_overlap(out, *need[j - j0].get(), h + offsets_[j], off, len);
-    WM_ENSURE(out.size() == len, "internal: produced {} of {} bytes at {}", out.size(), len, off);
-    return out;
+    for (uint64_t j = j0; j < j1; j++) copy_overlap(out, *need[j - j0].get(), offsets_[j], a, len);
 }
 
 std::string EncodedTrack::describe() const { return std::format("flac-encoded:{}#samples={}..{}", img_->path.string(), start_, end_); }

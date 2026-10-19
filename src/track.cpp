@@ -7,8 +7,45 @@
 
 namespace wm {
 
+namespace {
+
 /// Blocks shorter than this are only legal as the last frame of a stream.
 constexpr uint64_t MIN_BLOCK = 16;
+
+/// How a track is made: the partial source frames at its ends become VERBATIM
+/// head and tail blocks, source frames [k1, k2) are copied.
+struct Plan {
+    std::optional<std::pair<uint64_t, uint64_t>> head, tail;
+    uint64_t k1 = 0, k2 = 0;
+};
+
+Plan plan(const FlacImage& img, uint64_t start, uint64_t end) {
+    uint64_t total = img.total(), bs = img.bs();
+    Plan r;
+    r.k1 = (start + bs - 1) / bs;
+    r.k2 = end == total ? img.index.nframes() : end / bs;
+    if (r.k1 > r.k2) {
+        // start and end inside the same source frame
+        r.head = {start, end};
+        r.k1 = r.k2;
+        return r;
+    }
+    if (start % bs) r.head = {start, std::min(r.k1 * bs, end)};
+    if (end != total && end % bs) r.tail = {r.k2 * bs, end};
+    // avoid tiny non-final blocks: merge them with the neighbouring full frame
+    auto len = [](const auto& p) { return p->second - p->first; };
+    if (r.head && len(r.head) < MIN_BLOCK && r.k1 < r.k2) {
+        r.head = {r.head->first, img.frame_end(r.k1)};
+        r.k1++;
+    }
+    if (r.tail && len(r.tail) < MIN_BLOCK && r.k1 < r.k2) {
+        r.tail = {(r.k2 - 1) * bs, r.tail->second};
+        r.k2--;
+    }
+    return r;
+}
+
+}  // namespace
 
 std::shared_ptr<FlacImage> FlacImage::open(fs::path p, flac::FlacMeta meta, flac::FrameIndex index) {
     File f(p);
@@ -89,48 +126,24 @@ std::vector<std::array<uint8_t, 16>> track_md5s(const FlacImage& img, const std:
 FlacTrack::FlacTrack(std::shared_ptr<const FlacImage> img, uint64_t start, uint64_t end, const Tags& tags,
                      const std::vector<flac::HeaderBlock>& pictures, std::optional<std::array<uint8_t, 16>> md5)
     : img_(std::move(img)), start_(start), end_(end) {
-    uint64_t total = img_->total(), bs = img_->bs(), nf = img_->index.nframes();
-    WM_ENSURE(start < end && end <= total, "bad track range {}..{} (total {})", start, end, total);
-
-    uint64_t k1 = (start + bs - 1) / bs;
-    uint64_t k2 = end == total ? nf : end / bs;
-    std::optional<std::pair<uint64_t, uint64_t>> head, tail;
-    if (k1 > k2) {
-        // start and end inside the same source frame
-        head = {start, end};
-        k1 = k2;
-    } else {
-        if (start % bs) head = {start, std::min(k1 * bs, end)};
-        if (end != total && end % bs) tail = {k2 * bs, end};
-        // avoid tiny non-final blocks: merge them with the neighbouring full frame
-        if (head && head->second - head->first < MIN_BLOCK && k1 < k2) {
-            head = {head->first, img_->frame_end(k1)};
-            k1++;
-        }
-        if (tail && tail->second - tail->first < MIN_BLOCK && k1 < k2) {
-            tail = {(k2 - 1) * bs, tail->second};
-            k2--;
-        }
-    }
+    WM_ENSURE(start < end && end <= img_->total(), "bad track range {}..{} (total {})", start, end, img_->total());
+    auto pl = plan(*img_, start, end);
     const auto& si = img_->si();
     auto mkseg = [&](std::pair<uint64_t, uint64_t> r) {
         uint64_t out_sample = r.first - start;
         return VSeg{r.first, r.second, out_sample, flac::verbatim_size(uint32_t(r.second - r.first), si.channels, si.bps, out_sample, img_->sr_extra.size())};
     };
-    if (head) head_ = mkseg(*head);
-    if (tail) tail_ = mkseg(*tail);
-    k1_ = k1;
-    k2_ = k2;
-    if (k1 < k2) {
-        int64_t cs = int64_t(img_->index.offsets[k2] - img_->index.offsets[k1]);
-        for (uint64_t k = k1; k < k2; k++) cs += int64_t(flac::coded_len(k * bs - start)) - int64_t(flac::coded_len(k));
-        copy_size_ = uint64_t(cs);
-    }
+    if (pl.head) head_ = mkseg(*pl.head);
+    if (pl.tail) tail_ = mkseg(*pl.tail);
+    k1_ = pl.k1;
+    k2_ = pl.k2;
+    for (uint64_t k = k1_; k < k2_; k++) copy_size_ += copied_size(k);
 
     // STREAMINFO for the track
+    uint64_t bs = img_->bs();
     std::vector<uint64_t> blocks;
     if (head_) blocks.push_back(head_->e - head_->s);
-    for (uint64_t k = k1; k < k2; k++) blocks.push_back(img_->frame_end(k) - k * bs);
+    for (uint64_t k = k1_; k < k2_; k++) blocks.push_back(img_->frame_end(k) - k * bs);
     if (tail_) blocks.push_back(tail_->e - tail_->s);
     size_t nonlast = blocks.size() == 1 ? 1 : blocks.size() - 1;
     uint64_t min_b = *std::min_element(blocks.begin(), blocks.begin() + ptrdiff_t(nonlast));
@@ -158,37 +171,29 @@ Bytes FlacTrack::verbatim(const VSeg& seg) const {
     return fr;
 }
 
-FlacTrack::Shared FlacTrack::seg_bytes(Shared& cell, const VSeg& seg) const {
-    {
-        std::lock_guard g(mu_);
-        if (cell) return cell;
-    }
-    auto v = std::make_shared<const Bytes>(verbatim(seg));
-    std::lock_guard g(mu_);
-    if (!cell) cell = std::move(v);
-    return cell;
+uint64_t FlacTrack::copied_size(uint64_t k) const {
+    auto& offs = img_->index.offsets;
+    return offs[k + 1] - offs[k] + flac::coded_len(k * img_->bs() - start_) - flac::coded_len(k);
 }
 
 void FlacTrack::drop_cached() const {
-    std::lock_guard g(mu_);
     head_bytes_.reset();
     tail_bytes_.reset();
+    std::lock_guard g(mu_);
     vstarts_.reset();
 }
 
 std::shared_ptr<const std::vector<uint64_t>> FlacTrack::vstarts() const {
     std::lock_guard g(mu_);
     if (!vstarts_) {
-        auto& offs = img_->index.offsets;
-        uint64_t bs = img_->bs();
         std::vector<uint64_t> v;
         v.reserve(size_t(k2_ - k1_ + 1));
-        int64_t pos = 0;
+        uint64_t pos = 0;
         for (uint64_t k = k1_; k < k2_; k++) {
-            v.push_back(uint64_t(pos));
-            pos += int64_t(offs[k + 1] - offs[k]) + int64_t(flac::coded_len(k * bs - start_)) - int64_t(flac::coded_len(k));
+            v.push_back(pos);
+            pos += copied_size(k);
         }
-        v.push_back(uint64_t(pos));
+        v.push_back(pos);
         vstarts_ = std::make_shared<const std::vector<uint64_t>>(std::move(v));
     }
     return vstarts_;
@@ -197,11 +202,9 @@ std::shared_ptr<const std::vector<uint64_t>> FlacTrack::vstarts() const {
 void FlacTrack::read_copy(uint64_t off, size_t len, Bytes& out) const {
     auto keep = vstarts();
     const auto& vs = *keep;
-    uint64_t end = off + len;
-    // first frame i0 with vs[i0] <= off < vs[i0+1]
+    // frames [i0, i1) cover [off, off+len): vs[i0] <= off < vs[i0+1], vs[i1] >= off+len
     size_t i0 = size_t(std::upper_bound(vs.begin(), vs.end(), off) - vs.begin()) - 1;
-    size_t i1 = i0;
-    while (i1 + 1 < vs.size() && vs[i1] < end) i1++;
+    size_t i1 = std::min(size_t(std::lower_bound(vs.begin() + ptrdiff_t(i0), vs.end(), off + len) - vs.begin()), vs.size() - 1);
     auto& offs = img_->index.offsets;
     uint64_t kf = k1_ + i0, kl = k1_ + i1;
     uint64_t a = offs[kf], b = offs[kl];
@@ -235,21 +238,13 @@ Bytes FlacTrack::read_at(uint64_t off, size_t len) const {
     len = size_t(std::min<uint64_t>(len, size_ - off));
     out.reserve(len);
     touch(weak_from_this().lock());
-    uint64_t end = off + len, pos = 0;
-    header_.read(img_->path, off, len, out);
-    pos += header_.size();
-    if (head_) {
-        if (off < pos + head_->size && end > pos) copy_overlap(out, *seg_bytes(head_bytes_, *head_), pos, off, len);
-        pos += head_->size;
-    }
-    if (copy_size_ > 0) {
-        if (off < pos + copy_size_ && end > pos) {
-            uint64_t a = std::max(off, pos) - pos, b = std::min(end, pos + copy_size_) - pos;
-            read_copy(a, size_t(b - a), out);
-        }
-        pos += copy_size_;
-    }
-    if (tail_ && off < pos + tail_->size && end > pos) copy_overlap(out, *seg_bytes(tail_bytes_, *tail_), pos, off, len);
+    auto boundary = [&](const std::optional<VSeg>& seg, const LazyBytes& bytes) {
+        return Piece{seg ? seg->size : 0, [this, s = &seg, b = &bytes](uint64_t a, size_t n, Bytes& o) {
+                         copy_overlap(o, *b->get([&] { return verbatim(**s); }), 0, a, n);
+                     }};
+    };
+    stitch(out, off, len, Piece{header_.size(), [&](uint64_t a, size_t n, Bytes& o) { header_.read(img_->path, a, n, o); }}, boundary(head_, head_bytes_),
+           Piece{copy_size_, [&](uint64_t a, size_t n, Bytes& o) { read_copy(a, n, o); }}, boundary(tail_, tail_bytes_));
     WM_ENSURE(out.size() == len, "internal: produced {} of {} bytes at {}", out.size(), len, off);
     return out;
 }

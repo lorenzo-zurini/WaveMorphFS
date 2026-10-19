@@ -351,3 +351,29 @@ TEST(av_image_index_is_checked_and_dropped_when_stale) {
     CHECK_THROWS(stale->decode_range(0, 100));
     CHECK(!fs::exists(idx));
 }
+
+TEST(stitch_reads_only_what_each_piece_covers) {
+    Bytes a = {1, 2, 3}, c = {7, 8, 9, 10};
+    int empty_reads = 0;
+    auto bytes = [](const Bytes& b) { return [&b](uint64_t off, size_t n, Bytes& o) { copy_overlap(o, b, 0, off, n); }; };
+    auto get = [&](uint64_t off, size_t len) {
+        Bytes out;
+        stitch(out, off, len, Piece{a.size(), bytes(a)}, Piece{0, [&](uint64_t, size_t, Bytes&) { empty_reads++; }}, Piece{c.size(), bytes(c)});
+        return out;
+    };
+    CHECK(get(0, 7) == (Bytes{1, 2, 3, 7, 8, 9, 10}));
+    CHECK(get(2, 3) == (Bytes{3, 7, 8}));
+    CHECK(get(3, 1) == (Bytes{7}));
+    CHECK(get(6, 9) == (Bytes{10}));
+    CHECK(empty_reads == 0);
+    LazyBytes lazy;
+    int made = 0;
+    auto make = [&] {
+        made++;
+        return Bytes{42};
+    };
+    CHECK(*lazy.get(make) == Bytes{42} && *lazy.get(make) == Bytes{42} && made == 1);
+    lazy.reset();
+    lazy.get(make);
+    CHECK(made == 2);
+}
