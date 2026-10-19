@@ -588,6 +588,12 @@ on every change.
   standalone WAV or AIFF files are passed through as they are.
 - FUSE can't notify music servers of changes, so they need to rescan on a timer.
 
+## Support
+
+WaveMorphFS is a one-person project, developed in spare time. If it brought order
+to your collection and you'd like to say thanks, you can
+[buy me a coffee on Ko-fi](https://ko-fi.com/lorenzo_zurini).
+
 ## Contributing, security, license
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for building, testing and the rules the
