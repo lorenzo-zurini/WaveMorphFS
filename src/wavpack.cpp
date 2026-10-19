@@ -148,6 +148,7 @@ std::shared_ptr<WvImage> WvImage::open(const fs::path& p, const Cache* cache) {
     auto key = SrcKey::of(p);
     auto img = std::make_shared<WvImage>();
     img->path = p;
+    img->key = key;
     img->read_settings();
     File f(p);
     uint64_t fsize = f.size();
@@ -370,7 +371,7 @@ fs::path wv_layout_path(const WvImage& img, const Ranges& ranges, const Cache& c
     // LAYOUT_VERSION, for changes to how tracks are planned or encoded here
     std::string extra = std::format("wavpack-tracks v{} {}", LAYOUT_VERSION, WavpackGetLibraryVersionString());
     for (auto& [s, e] : ranges) extra += std::format(" {}-{}", s, e);
-    return cache.dir() / "flacidx" / (Cache::name_for(img.path, SrcKey::of(img.path), extra) + ".wvlayout");
+    return cache.dir() / "flacidx" / (Cache::name_for(img.path, img.key, extra) + ".wvlayout");
 }
 
 std::optional<std::vector<WvLayout>> load_wv_layout(const WvImage& img, const Ranges& ranges, const Cache& cache) {

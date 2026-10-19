@@ -44,6 +44,9 @@ public:
         uint32_t count;  // samples
     };
     fs::path path;
+    /// the source version indexed (cache names derive from it, not from the file
+    /// as it is when they are written)
+    SrcKey key;
     uint32_t sample_rate = 0, channels = 0;
     uint64_t total = 0;
     uint64_t audio_end = 0;  // end of the last block (tags follow)
