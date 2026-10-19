@@ -33,7 +33,7 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends g++ cmake ninja-build pkg-config libfuse3-dev libflac-dev libwavpack-dev \
             nlohmann-json3-dev libavformat-dev libavcodec-dev libavutil-dev libswscale-dev flac ffmpeg ca-certificates
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Build (Debug, ASan + UBSan, warnings as errors)
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DWAVEMORPH_WERROR=ON -DWAVEMORPH_SANITIZE=address,undefined
@@ -47,7 +47,7 @@ jobs:
     outputs:
       version: ${{ steps.v.outputs.version }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - id: v
         name: Version (a release tag must match project(VERSION) in CMakeLists.txt)
         run: |
@@ -77,7 +77,7 @@ jobs:
     steps:
       - name: Image name   # registry names must be lower case
         run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/wavemorphfs" >> "$GITHUB_ENV"
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3
         if: github.event_name != 'pull_request'
@@ -156,7 +156,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: GitHub release with the changelog section of this version
         env:
           GH_TOKEN: ${{ github.token }}
