@@ -83,7 +83,12 @@ public:
     void drop_cached() const override;
 
 private:
-    std::vector<Bytes> coded_frames(uint64_t f0, uint64_t f1) const;
+    struct Coded {
+        std::vector<Bytes> frames;
+        /// the last of them is the area's last frame, cut short by an unreadable final sector
+        bool cut_short = false;
+    };
+    Coded coded_frames(uint64_t f0, uint64_t f1) const;
     std::vector<Bytes> read_frames(uint64_t f0, uint64_t f1) const;
     std::shared_future<Chunk> start(uint64_t c, std::shared_ptr<std::promise<Chunk>>* claimed) const;  // mu_ held
     void fulfil(uint64_t c, std::promise<Chunk>& p) const;
