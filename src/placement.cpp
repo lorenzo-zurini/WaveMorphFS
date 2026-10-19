@@ -58,6 +58,12 @@ std::optional<std::string> Library::entry_target(const Placements& p, const fs::
 }
 
 void Library::refresh_placements(bool force) {
+    // one scan at a time: concurrent scans could publish out of order under one
+    // version number. Lookups that merely pass by keep the current placements
+    // rather than queue behind a scan.
+    std::unique_lock scan(placement_scan_mu_, std::defer_lock);
+    if (force) scan.lock();
+    else if (!scan.try_lock()) return;
     std::unique_lock g(place_mu_);
     if (!force && placements_checked_ && Clock::now() - *placements_checked_ < PLACEMENT_RECHECK) return;
     placements_checked_ = Clock::now();
@@ -70,37 +76,61 @@ void Library::refresh_placements(bool force) {
     for (auto& r : cfg.roots) {
         fs::path base = cfg.tags_dir / r.name;
         std::error_code ec;
-        for (auto it = fs::recursive_directory_iterator(base, fs::directory_options::skip_permission_denied, ec);
-             !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+        fs::recursive_directory_iterator it(base, fs::directory_options::skip_permission_denied, ec), end;
+        if (ec == std::errc::no_such_file_or_directory) continue;  // no sidecars for this root
+        for (; !ec && it != end; it.increment(ec)) {
             if (it->path().filename() != SIDECAR_NAME) continue;
             auto m = mtime_ns(it->path());
-            if (!m) continue;
-            fs::path src = r.path / it->path().parent_path().lexically_relative(base);
-            src = src.lexically_normal();
-            if (src.has_filename() == false) src = src.parent_path();
-            if (auto o = old_files.find(src); o != old_files.end() && o->second.first == *m) {
+            if (!m) continue;  // removed just now
+            fs::path rel = it->path().parent_path().lexically_relative(base);
+            fs::path src = (r.path / rel).lexically_normal();
+            if (!src.has_filename()) src = src.parent_path();
+            auto o = old_files.find(src);
+            if (o != old_files.end() && o->second.first == *m) {
                 files[src] = o->second;
+                continue;
+            }
+            auto text = try_read_text(it->path());
+            if (!text) {
+                // keep what was known and read it again next time: remembering the
+                // failure under this mtime would drop its targets until the file changes
+                warn("placements: cannot read {}", it->path().string());
+                if (o != old_files.end()) files[src] = o->second;
                 continue;
             }
             // keep only the targets: most sidecars have none, and their tags are large
             std::shared_ptr<const SidecarTargets> st;
-            if (auto text = try_read_text(it->path()); text && text->find("_target") != std::string::npos) {
+            if (text->find("_target") != std::string::npos) {
                 try {
                     Sidecar sc = Sidecar::parse(*text);
+                    if (sc.target && rel == ".") {
+                        // a root is a top-level directory of the mount by definition
+                        warn("{}: ignoring \"_target\" of the root folder {}", it->path().string(), r.name);
+                        sc.target.reset();
+                    }
                     if (sc.target || !sc.track_targets.empty() || !sc.file_targets.empty())
                         st = std::make_shared<const SidecarTargets>(SidecarTargets{sc.target, sc.track_targets, sc.file_targets});
-                } catch (const std::exception& e) {
+                } catch (const std::exception&) {
                     // the folder's listing reports the parse error
                 }
             }
             files[src] = {*m, st};
         }
+        if (ec) {
+            // a partial scan would move every folder it missed back to its source
+            // path (and bump their directories): keep the placements we have
+            warn("placements: scanning {}: {}; keeping the previous placements", base.string(), ec.message());
+            return;
+        }
     }
 
     auto p = std::make_shared<Placements>();
+    p->loaded = true;
+    int64_t newest = 0;  // newest sidecar that places anything
     for (auto& [src, ms] : files) {
         auto& st = ms.second;
         if (!st) continue;
+        newest = std::max(newest, ms.first);
         if (st->folder) {
             p->folder[src] = *st->folder;
             p->folder_by_target.emplace(*st->folder, src);
@@ -124,7 +154,10 @@ void Library::refresh_placements(bool force) {
 
     g.lock();
     placement_files_ = std::move(files);
-    if (!changed) return;
+    if (!changed) {
+        if (!old->loaded) placements_ = std::move(p);
+        return;
+    }
     // mount directories whose contents change: targets, and where moved folders
     // were or are (and every directory above them), so music servers rescan them
     std::set<std::string> touched;
@@ -136,10 +169,14 @@ void Library::refresh_placements(bool force) {
                 for (auto& d : {fs::path(s), fs::path(s).parent_path()})
                     if (auto v = vpath_of(*r, d)) touched.insert(*v);
     }
-    int64_t now = now_ns();
+    // the first scan finds the tree as the sidecars shaped it when they were
+    // written: stamping it with the start time would make music servers rescan
+    // every moved folder after each restart
+    int64_t stamp = old->loaded ? now_ns() : newest;
     for (auto v : touched)
         for (;; v = parent_of(v)) {
-            vbumps_[v] = now;
+            auto& b = vbumps_[v];
+            b = std::max(b, stamp);
             if (v.empty()) break;
         }
     placements_ = std::move(p);
@@ -171,6 +208,21 @@ std::shared_ptr<const VListing> Library::list_vdir(const std::string& vpath) {
     return l;
 }
 
+void Library::invalidate(const fs::path& dir) {
+    std::shared_ptr<Listing> l;
+    {
+        std::lock_guard g(mu_);
+        if (auto it = listings_.find(dir); it != listings_.end()) l = it->second;
+    }
+    if (l) {
+        std::lock_guard g(l->mu);
+        l->checked = {};  // list_dir compares its signature again (an edit changed it)
+    }
+    // which mount directories show the folder is not recorded; they are cheap to rebuild
+    std::lock_guard g(place_mu_);
+    vlistings_.clear();
+}
+
 std::optional<VEntry> Library::lookup(const std::string& vpath, std::string_view name) {
     auto l = list_vdir(vpath);
     auto* ve = l->find(name);
@@ -188,6 +240,7 @@ std::shared_ptr<VListing> Library::build_vlisting(const std::string& vpath, cons
     }
     std::set<std::string> taken;
     auto add = [&](VEntry ve) {
+        if (!ve.e.is_dir) ve.src_name = ve.e.name;
         if (taken.contains(ve.e.name)) {
             if (ve.e.is_dir) return;  // the same directory reached two ways
             std::string base = ve.e.name, stem = base, ext;
@@ -201,9 +254,26 @@ std::shared_ptr<VListing> Library::build_vlisting(const std::string& vpath, cons
         if (!taken.contains(name)) add({Entry{name, true, {}, nullptr, 0}, {}});
     };
 
-    if (vpath.empty()) {  // the roots, plus top-level directories that only targets create
+    // hide directories that moves have emptied, and targets that place nothing
+    auto hide_empty = [&] {
+        std::erase_if(out->entries, [&](const VEntry& ve) {
+            if (!ve.e.is_dir) return false;
+            if (!ve.e.dir.empty()) {
+                if (vpath.empty()) return false;  // a root stays even when everything moved out
+                std::string s = ve.e.dir.string();
+                // (not lower_bound(s): "s B" or "s (2)" sort between "s" and "s/...")
+                auto it = p.sources.lower_bound(s + "/");
+                bool moves_below = p.sources.contains(s) || (it != p.sources.end() && is_under(*it, s));
+                if (!moves_below) return false;
+            }
+            return list_vdir(join(vpath, ve.e.name))->entries.empty();
+        });
+    };
+
+    if (vpath.empty()) {  // the roots in their configured order, then top-level directories that only targets create
         for (auto& r : cfg.roots) add({Entry{r.name, true, r.path, nullptr, 0}, {}});
         for (auto& t : p.targets) add_virtual_dir(t.substr(0, t.find('/')));
+        hide_empty();
         return out;
     }
 
@@ -222,21 +292,18 @@ std::shared_ptr<VListing> Library::build_vlisting(const std::string& vpath, cons
             for (size_t i = 1; i < comps.size(); i++) d /= comps[i];
             consider(d);
         }
-    for (std::string a = vpath;; a = parent_of(a)) {
+    for (std::string a = vpath; !a.empty(); a = parent_of(a)) {  // (targets are never "")
         auto [lo, hi] = p.folder_by_target.equal_range(a);
         for (auto it = lo; it != hi; ++it) consider(a == vpath ? it->second : it->second / fs::path(vpath.substr(a.size() + 1)));
-        if (a.empty()) break;
     }
     std::sort(mapped.begin(), mapped.end());
 
-    std::vector<std::pair<std::string, fs::path>> dirs;  // name, source folder (for the emptiness check)
     for (auto& d : mapped) {
         auto l = list_dir(d);
         out->mtime = std::max(out->mtime, l->mtime);
         for (auto& e : l->entries) {
             if (e.is_dir) {
                 if (vpath_of(p, e.dir) != join(vpath, e.name)) continue;  // moved elsewhere
-                dirs.emplace_back(e.name, e.dir);
                 add({e, {}});
             } else if (auto t = entry_target(p, d, e); !t || *t == vpath) {
                 add({e, d});
@@ -259,17 +326,7 @@ std::shared_ptr<VListing> Library::build_vlisting(const std::string& vpath, cons
         std::string rest = it->substr(vpath.size() + 1);
         add_virtual_dir(rest.substr(0, rest.find('/')));
     }
-    // hide directories that moves have emptied (or targets that place nothing)
-    std::erase_if(out->entries, [&](const VEntry& ve) {
-        if (!ve.e.is_dir) return false;
-        if (!ve.e.dir.empty()) {
-            std::string s = ve.e.dir.string();
-            auto it = p.sources.lower_bound(s);
-            bool moves_below = it != p.sources.end() && (*it == s || is_under(*it, s));
-            if (!moves_below) return false;
-        }
-        return list_vdir(join(vpath, ve.e.name))->entries.empty();
-    });
+    hide_empty();
     std::sort(out->entries.begin(), out->entries.end(), [](auto& a, auto& b) { return a.e.name < b.e.name; });
     return out;
 }
