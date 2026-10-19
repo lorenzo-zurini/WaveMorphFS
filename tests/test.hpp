@@ -8,6 +8,10 @@
 #include <string>
 #include <vector>
 
+#include <stdlib.h>
+
+#include <filesystem>
+
 namespace wmtest {
 
 struct Failure : std::runtime_error {
@@ -26,6 +30,29 @@ inline std::vector<Case>& registry() {
 
 struct Reg {
     Reg(const char* n, std::function<void()> f) { registry().push_back({n, std::move(f)}); }
+};
+
+/// A fresh directory under the system temp dir, removed with everything in it
+/// when the test ends, whether it passes or not.
+class TempDir {
+public:
+    explicit TempDir(const char* prefix = "wm-test") {
+        std::string tmpl = (std::filesystem::temp_directory_path() / (std::string(prefix) + "-XXXXXX")).string();
+        if (!::mkdtemp(tmpl.data())) throw std::runtime_error("mkdtemp " + tmpl);
+        path_ = tmpl;
+    }
+    ~TempDir() {
+        std::error_code ec;
+        std::filesystem::remove_all(path_, ec);
+    }
+    TempDir(const TempDir&) = delete;
+    TempDir& operator=(const TempDir&) = delete;
+    const std::filesystem::path& path() const { return path_; }
+    operator const std::filesystem::path&() const { return path_; }
+    std::filesystem::path operator/(const std::string& name) const { return path_ / name; }
+
+private:
+    std::filesystem::path path_;
 };
 
 }  // namespace wmtest

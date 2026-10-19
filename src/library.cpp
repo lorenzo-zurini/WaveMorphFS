@@ -29,7 +29,6 @@ const std::vector<std::string_view> AUDIO_IMAGE_EXT = {"flac", "ape", "wv", "tta
 /// A file modified more recently than this is assumed to still be written.
 constexpr auto SETTLE = std::chrono::seconds(60);
 /// How long a listing is served without checking whether anything changed.
-constexpr auto RECHECK = std::chrono::milliseconds(1500);
 /// FLAC/ID3 picture type of the front cover
 constexpr uint32_t PICTURE_FRONT_COVER = 3;
 
@@ -863,7 +862,7 @@ std::shared_ptr<const Listing> Library::list_dir(const fs::path& dir) {
     }
     if (cached) {
         std::lock_guard g(cached->mu);
-        if (Clock::now() - cached->checked < RECHECK) return cached;
+        if (Clock::now() - cached->checked < cfg.recheck) return cached;
     }
     std::lock_guard dg(*lock);
     Sig sig = signature(dir);

@@ -53,6 +53,9 @@ struct Config {
     size_t workers = 2;
     /// also expose SACD multichannel areas ("MC NN - Title.dsf", album "... (Multichannel)")
     bool sacd_multichannel = false;
+    /// how long a folder listing is trusted before its sources are checked again
+    /// (tags-tree placements: a third longer)
+    std::chrono::milliseconds recheck{1500};
 };
 
 /// Sidecar sections that tag edits made on the mount are stored in.

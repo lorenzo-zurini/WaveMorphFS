@@ -130,6 +130,7 @@ TEST(sidecar_removes_tags_of_regular_files) {
     cfg.tags_dir = dir / "tags";
     cfg.cache_dir = dir / "cache";
     cfg.workers = 0;
+    cfg.recheck = std::chrono::milliseconds(100);  // listings re-checked quickly
     auto lib = Library::create(std::move(cfg));
     auto listing = lib->list_dir(src);
     auto e = listing->find("01 - a.flac");
@@ -175,6 +176,7 @@ TEST(sidecar_retags_regular_dsf) {
     cfg.tags_dir = dir / "tags";
     cfg.cache_dir = dir / "cache";
     cfg.workers = 0;
+    cfg.recheck = std::chrono::milliseconds(100);  // listings re-checked quickly
     auto lib = Library::create(std::move(cfg));
     auto e = lib->list_dir(src)->find("t.dsf");
     CHECK(e && e->file && e->tag_section == "file" && e->tag_ext == "dsf");
@@ -219,6 +221,7 @@ TEST(duplicate_cues_and_hidden_files) {
     cfg.tags_dir = dir / "tags";
     cfg.cache_dir = dir / "cache";
     cfg.workers = 0;
+    cfg.recheck = std::chrono::milliseconds(100);  // listings re-checked quickly
     auto lib = Library::create(std::move(cfg));
     auto names = [&] {
         std::vector<std::string> v;
@@ -230,7 +233,7 @@ TEST(duplicate_cues_and_hidden_files) {
     CHECK(e && e->tag_key == "2");
     auto set_sidecar = [&](const char* text) {
         atomic_write(dir / "tags" / "Lib" / "Album" / SIDECAR_NAME, text);
-        std::this_thread::sleep_for(std::chrono::milliseconds(1600));  // listings are re-checked after 1.5 s
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));  // past cfg.recheck
     };
     // a hidden track, and a hidden mount entry
     set_sidecar(R"({"track": {"1": {"_hide": true}}, "_hide": ["03 - Three.flac"]})");
@@ -264,6 +267,7 @@ TEST(targets_place_folders_and_files) {
     cfg.tags_dir = dir / "tags";
     cfg.cache_dir = dir / "cache";
     cfg.workers = 0;
+    cfg.recheck = std::chrono::milliseconds(100);  // listings re-checked quickly
     auto lib = Library::create(std::move(cfg));
     lib->refresh_placements(true);
     auto names = [&](const std::string& v) {
@@ -283,7 +287,7 @@ TEST(targets_place_folders_and_files) {
     // a file placed next to one with the same name
     atomic_write(lib_root / "Misc/b.txt", std::string_view("y"));
     atomic_write(tags / "Misc" / SIDECAR_NAME, R"({"file": {"b.txt": {"_target": "Lib/Artist/Other"}}})");
-    std::this_thread::sleep_for(std::chrono::milliseconds(1600));  // source listings are re-checked after 1.5 s
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));  // past cfg.recheck
     lib->refresh_placements(true);
     CHECK_MSG((names("Lib/Artist/Other") == std::vector<std::string>{"b (2).txt", "b.txt"}), "name clash numbered");
     // the whole Artist folder emptied by moves is hidden
@@ -309,6 +313,7 @@ TEST(lookups_survive_listing_rebuilds) {
     cfg.tags_dir = dir / "tags";
     cfg.cache_dir = dir / "cache";
     cfg.workers = 0;
+    cfg.recheck = std::chrono::milliseconds(100);  // listings re-checked quickly
     auto lib = Library::create(std::move(cfg));
     std::atomic<size_t> bad = 0, done = 0;
     auto stop = Clock::now() + std::chrono::milliseconds(2500);
@@ -344,6 +349,7 @@ TEST(standalone_wavpack_served_as_flac) {
     cfg.tags_dir = dir / "tags";
     cfg.cache_dir = dir / "cache";
     cfg.workers = 0;
+    cfg.recheck = std::chrono::milliseconds(100);  // listings re-checked quickly
     auto lib = Library::create(std::move(cfg));
     auto l = lib->list_dir(src);
     CHECK_MSG(l->entries.size() == 1 && l->entries[0].name == "1-01 Sonata - Allegro.flac", "served as FLAC, source hidden");
@@ -410,6 +416,7 @@ TEST(sidecar_cover_embedded_by_reference) {
     cfg.cache_dir = dir / "cache";
     cfg.covers_dir = covers;
     cfg.workers = 0;
+    cfg.recheck = std::chrono::milliseconds(100);  // listings re-checked quickly
     auto lib = Library::create(std::move(cfg));
     Bytes jpg = *try_read_file(covers / "work.jpg");
     auto l = lib->list_dir(src);

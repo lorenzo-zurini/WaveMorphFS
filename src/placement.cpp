@@ -14,8 +14,6 @@ namespace {
 
 /// how often the tags tree is checked for changed targets, and how long a mount
 /// directory listing is reused
-constexpr auto PLACEMENT_RECHECK = std::chrono::seconds(2);
-constexpr auto VLIST_RECHECK = std::chrono::milliseconds(1500);
 
 std::string join(const std::string& dir, const std::string& name) { return dir.empty() ? name : dir + "/" + name; }
 
@@ -65,7 +63,7 @@ void Library::refresh_placements(bool force) {
     if (force) scan.lock();
     else if (!scan.try_lock()) return;
     std::unique_lock g(place_mu_);
-    if (!force && placements_checked_ && Clock::now() - *placements_checked_ < PLACEMENT_RECHECK) return;
+    if (!force && placements_checked_ && Clock::now() - *placements_checked_ < cfg.recheck + cfg.recheck / 3) return;
     placements_checked_ = Clock::now();
     auto old = placements_;
     auto old_files = placement_files_;
@@ -194,7 +192,7 @@ std::shared_ptr<const VListing> Library::list_vdir(const std::string& vpath) {
         std::lock_guard g(place_mu_);
         p = placements_;
         if (auto it = vlistings_.find(vpath); it != vlistings_.end() && it->second->version == p->version &&
-                                               Clock::now() - it->second->built < VLIST_RECHECK)
+                                               Clock::now() - it->second->built < cfg.recheck)
             return it->second;
     }
     auto l = build_vlisting(vpath, p);
@@ -203,7 +201,7 @@ std::shared_ptr<const VListing> Library::list_vdir(const std::string& vpath) {
     // listings are reused briefly (lookups of one directory come in bursts), not kept
     if (++vlist_inserts_ % 256 == 0) {
         auto now = Clock::now();
-        std::erase_if(vlistings_, [&](auto& kv) { return now - kv.second->built > 4 * VLIST_RECHECK; });
+        std::erase_if(vlistings_, [&](auto& kv) { return now - kv.second->built > 4 * cfg.recheck; });
     }
     return l;
 }
