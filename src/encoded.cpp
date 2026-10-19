@@ -2,7 +2,10 @@
 #include "encoded.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
+#include <numbers>
+#include <tuple>
 
 #include "cache.hpp"
 #include "md5.hpp"
@@ -17,7 +20,11 @@ fs::path layout_path(const AvImage& img, const Ranges& ranges, const Cache& cach
 
 namespace {
 
-const char LAYOUT_MAGIC[8] = {'W', 'M', 'E', 'N', 'C', '0', '0', '1'};
+/// 001: no encoder fingerprint (still read: production layouts were measured by
+/// the encoder that serves them, and re-measuring every image takes hours);
+/// 002: the fingerprint of the encoder that measured follows the magic
+const char LAYOUT_MAGIC_V1[8] = {'W', 'M', 'E', 'N', 'C', '0', '0', '1'};
+const char LAYOUT_MAGIC[8] = {'W', 'M', 'E', 'N', 'C', '0', '0', '2'};
 /// frames encoded per job, frames encoded ahead of the reader (frames kept per
 /// track: EncodedTrack::CACHE_FRAMES)
 constexpr uint64_t JOB_FRAMES = 32;
@@ -35,12 +42,49 @@ std::vector<std::span<const int32_t>> slice(const std::vector<std::vector<int32_
 
 }  // namespace
 
+const std::array<uint8_t, 16>& encoder_fingerprint() {
+    static const auto fp = [] {
+        // a few frames per common shape, from a signal that exercises LPC and
+        // stereo decisions; the ranges cover what layouts are measured for
+        Md5 md5;
+        for (auto [ch, bps, rate] : {std::tuple{2u, 16u, 44100u}, {2u, 24u, 96000u}, {1u, 24u, 48000u}, {6u, 16u, 48000u}, {2u, 8u, 22050u}}) {
+            size_t n = 3 * ENCODED_BLOCK + 123;
+            std::vector<std::vector<int32_t>> pcm(ch, std::vector<int32_t>(n));
+            double amp = double((1 << (bps - 1)) - 1) * 0.7;
+            uint32_t seed = 1;
+            for (size_t c = 0; c < ch; c++)
+                for (size_t i = 0; i < n; i++) {
+                    seed = seed * 1664525u + 1013904223u;
+                    double t = double(i) / rate;
+                    double v = 0.6 * std::sin(t * 2 * std::numbers::pi * 440 * double(c + 1)) + 0.3 * std::sin(t * 2 * std::numbers::pi * 97) + 0.1 * (double(seed >> 8) / double(1 << 24) - 0.5);
+                    pcm[c][i] = int32_t(std::lround(amp * v));
+                }
+            for (auto& fr : flac::encode_frames(slice(pcm, 0, n), bps, rate, ENCODED_BLOCK, 0)) md5.update(fr);
+        }
+        return md5.finish();
+    }();
+    return fp;
+}
+
 std::optional<std::vector<TrackLayout>> load_layout(const AvImage& img, const Ranges& ranges, const Cache& cache) {
-    auto b = try_read_file(layout_path(img, ranges, cache));
-    if (!b || b->size() < 16 || std::memcmp(b->data(), LAYOUT_MAGIC, 8) != 0 || le64(&(*b)[8]) != ranges.size()) return std::nullopt;
+    auto path = std::make_shared<const fs::path>(layout_path(img, ranges, cache));
+    auto b = try_read_file(*path);
+    if (!b || b->size() < 8) return std::nullopt;
+    size_t p = 0;
+    if (std::memcmp(b->data(), LAYOUT_MAGIC, 8) == 0) {
+        // measured by an encoder that encodes differently: measure again
+        if (b->size() < 24 || !std::equal(encoder_fingerprint().begin(), encoder_fingerprint().end(), b->begin() + 8)) return std::nullopt;
+        p = 24;
+    } else if (std::memcmp(b->data(), LAYOUT_MAGIC_V1, 8) == 0) {
+        p = 8;
+    } else {
+        return std::nullopt;
+    }
+    if (p + 8 > b->size() || le64(&(*b)[p]) != ranges.size()) return std::nullopt;
+    p += 8;
     std::vector<TrackLayout> out(ranges.size());
-    size_t p = 16;
     for (size_t t = 0; t < ranges.size(); t++) {
+        out[t].file = path;
         if (p + 20 > b->size()) return std::nullopt;
         std::memcpy(out[t].md5.data(), &(*b)[p], 16);
         uint32_t n = le32(&(*b)[p + 16]);
@@ -80,31 +124,33 @@ std::vector<TrackLayout> build_layout(const AvImage& img, const Ranges& ranges, 
         out.push_back(std::move(tl));
     }
     if (cache) {
+        auto path = std::make_shared<const fs::path>(layout_path(img, ranges, *cache));
         Bytes b(LAYOUT_MAGIC, LAYOUT_MAGIC + 8);
+        append(b, encoder_fingerprint());
         put_le64(b, out.size());
         for (auto& tl : out) {
             append(b, tl.md5);
             put_le32(b, uint32_t(tl.frame_sizes.size()));
             for (auto sz : tl.frame_sizes) put_le32(b, sz);
+            tl.file = path;
         }
-        atomic_write(layout_path(img, ranges, *cache), b);
+        atomic_write(*path, b);
     }
     return out;
 }
 
 EncodedTrack::EncodedTrack(std::shared_ptr<const AvImage> img, uint64_t start, uint64_t end, const Tags& tags, const TrackLayout& layout,
                            const std::vector<flac::HeaderBlock>& pictures)
-    : img_(std::move(img)), start_(start), end_(end) {
+    : img_(std::move(img)), start_(start), end_(end), layout_file_(layout.file) {
     WM_ENSURE(start < end && end <= img_->total, "bad track range {}..{}", start, end);
     WM_ENSURE(layout.frame_sizes.size() == frames_of(end - start), "layout does not match the track");
     offsets_.reserve(layout.frame_sizes.size() + 1);
     uint64_t pos = 0;
     for (auto sz : layout.frame_sizes) {
-        offsets_.push_back(uint32_t(pos));
+        offsets_.push_back(pos);
         pos += sz;
     }
-    WM_ENSURE(pos <= UINT32_MAX, "track too large");
-    offsets_.push_back(uint32_t(pos));
+    offsets_.push_back(pos);
     flac::StreamInfo si;
     uint64_t len = end - start;
     si.min_block = si.max_block = uint16_t(len < ENCODED_BLOCK ? len : ENCODED_BLOCK);
@@ -140,6 +186,18 @@ EncodedTrack::Promises EncodedTrack::claim(uint64_t a, uint64_t b, std::vector<F
     return ps;
 }
 
+void EncodedTrack::layout_mismatch(uint64_t j, size_t got) const {
+    // The sizes were measured by an encoder that encodes this frame differently
+    // (fingerprints only sample the encoder). Every read of this frame would fail
+    // the same way, so the stored layout goes and the tracks are measured again.
+    std::string what = std::format("{} frame {} encoded to {} bytes, but its measured layout says {}", describe(), j, got, offsets_[j + 1] - offsets_[j]);
+    if (!layout_file_) fail("{}", what);
+    std::error_code ec;
+    fs::remove(*layout_file_, ec);
+    fail("{}: removed the layout {}; the tracks are measured again when their folder is listed anew (after a restart at the latest)", what,
+         layout_file_->string());
+}
+
 void EncodedTrack::produce(const Promises& ps) const {
     if (ps.empty()) return;
     uint64_t fa = ps.front().first, fb = ps.back().first + 1;
@@ -155,8 +213,7 @@ void EncodedTrack::produce(const Promises& ps) const {
             for (size_t i = r; i < r2; i++) {
                 auto& [j, p] = ps[i];
                 auto fr = std::make_shared<const Bytes>(std::move(frames[i - r]));
-                if (fr->size() != offsets_[j + 1] - offsets_[j])
-                    fail("frame {} encoded to {} bytes, layout says {}", j, fr->size(), offsets_[j + 1] - offsets_[j]);
+                if (fr->size() != offsets_[j + 1] - offsets_[j]) layout_mismatch(j, fr->size());
                 p->set_value(std::move(fr));
             }
         }

@@ -27,12 +27,21 @@ constexpr uint32_t ENCODED_BLOCK = 4096;
 struct TrackLayout {
     std::vector<uint32_t> frame_sizes;
     std::array<uint8_t, 16> md5{};
+    /// the cache file it is stored in (if any): dropped when frames stop matching it
+    std::shared_ptr<const fs::path> file;
 };
 
 using Ranges = std::vector<std::pair<uint64_t, uint64_t>>;
 
+/// MD5 of what this process's FLAC encoder makes of a fixed synthetic signal.
+/// Frame sizes measured by an encoder that encodes differently (another libFLAC
+/// version, or another CPU's SIMD code paths) are useless, so stored layouts
+/// carry the fingerprint of the encoder that measured them.
+const std::array<uint8_t, 16>& encoder_fingerprint();
+
 fs::path layout_path(const AvImage& img, const Ranges& ranges, const Cache& cache);
-/// The cached layout of these tracks, if present.
+/// The cached layout of these tracks, if present and measured by an encoder with
+/// this process's fingerprint (layouts stored before fingerprints are trusted).
 std::optional<std::vector<TrackLayout>> load_layout(const AvImage& img, const Ranges& ranges, const Cache& cache);
 /// Encode every track once to measure it; stores the result in the cache.
 std::vector<TrackLayout> build_layout(const AvImage& img, const Ranges& ranges, const Cache* cache);
@@ -57,6 +66,8 @@ private:
     Promises claim(uint64_t a, uint64_t b, std::vector<Frames::Future>* need) const;
     /// Decode and encode claimed frames, fulfilling their promises.
     void produce(const Promises& ps) const;
+    /// Frame j encoded to `got` bytes, not the measured size: drop the layout, fail.
+    [[noreturn]] void layout_mismatch(uint64_t j, size_t got) const;
     /// Claimed frames produced together, by whichever thread takes the job first.
     struct Job {
         explicit Job(Promises p) : ps(std::move(p)) {}
@@ -71,7 +82,8 @@ private:
     std::shared_ptr<const AvImage> img_;
     uint64_t start_, end_;
     Segments header_;  // padding is not held
-    std::vector<uint32_t> offsets_;  // frame start offsets relative to the audio, + end
+    std::vector<uint64_t> offsets_;  // frame start offsets relative to the audio, + end
+    std::shared_ptr<const fs::path> layout_file_;
     uint64_t size_;
     mutable std::mutex mu_;
     static constexpr size_t CACHE_FRAMES = 512;
