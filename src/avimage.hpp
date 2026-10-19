@@ -5,7 +5,8 @@
 // The first open decodes the whole file once with checksum verification (so an
 // incomplete or corrupt file never appears) and records a packet index:
 // where each packet's samples start. Reads then decode only the packets that
-// cover the requested samples. The index (a few KB) is cached on disk.
+// cover the requested samples. The index (20 bytes per packet: a few KB for APE,
+// under 1 MB per hour for WAV/AIFF's 4096-sample packets) is cached on disk.
 #pragma once
 
 #include <array>
@@ -64,10 +65,13 @@ private:
     void fulfil(size_t k, std::promise<Samples>& promise) const;
     void prefetch_after(size_t k) const;
     Samples decode_packet(size_t k) const;
+    /// Packet k is not what the index says: drop the stored index, fail.
+    [[noreturn]] void index_mismatch(size_t k, const std::string& what) const;
     std::unique_ptr<Decoder> take_decoder() const;
     void give_decoder(std::unique_ptr<Decoder> d) const;
 
     std::vector<Packet> packets_;
+    fs::path index_file_;  // where the index is cached ("" if it is not)
     mutable std::mutex mu_;
     mutable std::vector<std::unique_ptr<Decoder>> idle_;  // decoders not in use
     mutable Packets cache_{CACHE_SAMPLES};  // decoded (or decoding) packets, cost = samples

@@ -30,31 +30,56 @@ std::string av_err(int e) {
 
 using PerChannel = std::vector<std::vector<int32_t>>;
 
+struct AvFree {
+    void operator()(AVFormatContext* f) const { avformat_close_input(&f); }
+    void operator()(AVCodecContext* c) const { avcodec_free_context(&c); }
+    void operator()(AVPacket* p) const { av_packet_free(&p); }
+    void operator()(AVFrame* f) const { av_frame_free(&f); }
+};
+/// Owned libav objects: freed however a Decoder's construction ends.
+template <class T>
+using AvPtr = std::unique_ptr<T, AvFree>;
+
+/// True if `packets` could describe a file of `total` samples: consecutive sample
+/// ranges, and timestamps that increase (packets are found again by timestamp).
+bool consistent(const std::vector<AvImage::Packet>& packets, uint64_t total) {
+    uint64_t pos = 0;
+    for (size_t i = 0; i < packets.size(); i++) {
+        if (packets[i].first != pos || (i > 0 && packets[i].pts <= packets[i - 1].pts)) return false;
+        pos += packets[i].count;
+    }
+    return pos == total && total > 0;
+}
+
 }  // namespace
 
 /// A demuxer + decoder for one file.
 struct AvImage::Decoder {
-    AVFormatContext* fmt = nullptr;
-    AVCodecContext* codec = nullptr;
-    AVPacket* pkt = av_packet_alloc();
-    AVFrame* frame = av_frame_alloc();
+    AvPtr<AVFormatContext> fmt;
+    AvPtr<AVCodecContext> codec;
+    AvPtr<AVPacket> pkt{av_packet_alloc()};
+    AvPtr<AVFrame> frame{av_frame_alloc()};
     int stream = -1;
     uint32_t bps = 0;
 
     explicit Decoder(const fs::path& p) {
-        int r = avformat_open_input(&fmt, p.c_str(), nullptr, nullptr);
+        WM_ENSURE(pkt && frame, "out of memory");
+        AVFormatContext* f = nullptr;
+        int r = avformat_open_input(&f, p.c_str(), nullptr, nullptr);  // frees `f` itself on failure
         if (r < 0) fail("cannot open {}: {}", p.string(), av_err(r));
-        if ((r = avformat_find_stream_info(fmt, nullptr)) < 0) fail("{}: {}", p.string(), av_err(r));
+        fmt.reset(f);
+        if ((r = avformat_find_stream_info(fmt.get(), nullptr)) < 0) fail("{}: {}", p.string(), av_err(r));
         const AVCodec* dec = nullptr;
-        stream = av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, -1, &dec, 0);
+        stream = av_find_best_stream(fmt.get(), AVMEDIA_TYPE_AUDIO, -1, -1, &dec, 0);
         WM_ENSURE(stream >= 0 && dec, "{}: no decodable audio stream", p.string());
-        codec = avcodec_alloc_context3(dec);
-        avcodec_parameters_to_context(codec, fmt->streams[stream]->codecpar);
+        auto* par = fmt->streams[stream]->codecpar;
+        codec.reset(avcodec_alloc_context3(dec));
+        WM_ENSURE(codec, "out of memory");
+        if ((r = avcodec_parameters_to_context(codec.get(), par)) < 0) fail("{}: {}", p.string(), av_err(r));
         codec->thread_count = 1;
         // checksums on, and any damage is an error: incomplete files must not pass
         codec->err_recognition = AV_EF_CRCCHECK | AV_EF_BITSTREAM | AV_EF_EXPLODE;
-        if ((r = avcodec_open2(codec, dec, nullptr)) < 0) fail("{}: {}", p.string(), av_err(r));
-        auto* par = fmt->streams[stream]->codecpar;
+        if ((r = avcodec_open2(codec.get(), dec, nullptr)) < 0) fail("{}: {}", p.string(), av_err(r));
         switch (codec->sample_fmt) {
         case AV_SAMPLE_FMT_U8:
         case AV_SAMPLE_FMT_U8P: bps = 8; break;
@@ -62,6 +87,7 @@ struct AvImage::Decoder {
         case AV_SAMPLE_FMT_S16P: bps = 16; break;
         case AV_SAMPLE_FMT_S32:
         case AV_SAMPLE_FMT_S32P:
+            // left-justified in 32 bits; the significant bits, wherever libav says
             bps = par->bits_per_raw_sample > 16 && par->bits_per_raw_sample <= 32 ? uint32_t(par->bits_per_raw_sample)
                   : codec->bits_per_raw_sample > 16 && codec->bits_per_raw_sample <= 32 ? uint32_t(codec->bits_per_raw_sample)
                   : par->bits_per_coded_sample > 16 && par->bits_per_coded_sample <= 32 ? uint32_t(par->bits_per_coded_sample)
@@ -71,63 +97,81 @@ struct AvImage::Decoder {
         }
     }
 
-    ~Decoder() {
-        av_frame_free(&frame);
-        av_packet_free(&pkt);
-        avcodec_free_context(&codec);
-        avformat_close_input(&fmt);
-    }
-
     uint32_t channels() const { return uint32_t(codec->ch_layout.nb_channels); }
+
+    /// Append the current frame's samples of type T, each made a sample by `conv`.
+    template <class T, class Conv>
+    void take_as(PerChannel& out, Conv conv) const {
+        size_t ch = channels(), n = size_t(frame->nb_samples);
+        bool planar = av_sample_fmt_is_planar(codec->sample_fmt);
+        for (size_t c = 0; c < ch; c++) {
+            // planar formats keep channels apart, packed ones interleave them
+            const T* src = reinterpret_cast<const T*>(frame->extended_data[planar ? c : 0]) + (planar ? 0 : c);
+            size_t step = planar ? 1 : ch;
+            auto& o = out[c];
+            size_t old = o.size();
+            o.resize(old + n);
+            for (size_t i = 0; i < n; i++) o[old + i] = conv(src[i * step]);
+        }
+    }
 
     /// Append the current frame's samples (per channel, as signed values of `bps` bits).
     void take(PerChannel& out) const {
-        size_t ch = channels(), n = size_t(frame->nb_samples);
-        out.resize(ch);
-        bool planar = av_sample_fmt_is_planar(codec->sample_fmt);
-        for (size_t c = 0; c < ch; c++) {
-            auto& o = out[c];
-            o.reserve(o.size() + n);
-            for (size_t i = 0; i < n; i++) {
-                size_t idx = planar ? i : i * ch + c;
-                const uint8_t* base = frame->extended_data[planar ? c : 0];
-                switch (codec->sample_fmt) {
-                case AV_SAMPLE_FMT_U8:
-                case AV_SAMPLE_FMT_U8P: o.push_back(int32_t(base[idx]) - 128); break;
-                case AV_SAMPLE_FMT_S16:
-                case AV_SAMPLE_FMT_S16P: o.push_back(reinterpret_cast<const int16_t*>(base)[idx]); break;
-                default: o.push_back(reinterpret_cast<const int32_t*>(base)[idx] >> (32 - bps)); break;
-                }
-            }
+        out.resize(channels());
+        switch (av_get_packed_sample_fmt(codec->sample_fmt)) {
+        case AV_SAMPLE_FMT_U8: take_as<uint8_t>(out, [](uint8_t v) { return int32_t(v) - 128; }); break;
+        case AV_SAMPLE_FMT_S16: take_as<int16_t>(out, [](int16_t v) { return int32_t(v); }); break;
+        default: {
+            int shift = int(32 - bps);
+            uint32_t low = 0;
+            take_as<int32_t>(out, [&](int32_t v) {
+                low |= uint32_t(v);
+                return v >> shift;
+            });
+            // samples must be exact: bits below the ones kept would be lost
+            WM_ENSURE((low & ((uint32_t(1) << shift) - 1)) == 0, "decoder output has more than the {} bits per sample it was taken for", bps);
+        }
         }
     }
 
     /// Decode the packet in `pkt`; append everything it produces.
     void decode_current(PerChannel& out) {
-        int r = avcodec_send_packet(codec, pkt);
+        int r = avcodec_send_packet(codec.get(), pkt.get());
         if (r < 0) fail("decode error: {}", av_err(r));
-        while ((r = avcodec_receive_frame(codec, frame)) >= 0) take(out);
+        receive(out);
+    }
+
+    /// Append the frames the decoder has ready.
+    void receive(PerChannel& out) {
+        int r;
+        while ((r = avcodec_receive_frame(codec.get(), frame.get())) >= 0) take(out);
         if (r != AVERROR(EAGAIN) && r != AVERROR_EOF) fail("decode error: {}", av_err(r));
+    }
+
+    /// Append what the decoder still holds at the end of the stream (lossless
+    /// decoders have no delay, but be exact anyway). Seek and flush to reuse it.
+    void drain(PerChannel& out) {
+        int r = avcodec_send_packet(codec.get(), nullptr);
+        if (r < 0 && r != AVERROR_EOF) fail("decode error: {}", av_err(r));
+        receive(out);
     }
 
     /// Decode the whole file from the start: sink(packet pts, samples of that packet).
     void decode_all(const std::function<void(int64_t, const PerChannel&)>& sink) {
         PerChannel buf;
         int r;
-        while ((r = av_read_frame(fmt, pkt)) >= 0) {
+        while ((r = av_read_frame(fmt.get(), pkt.get())) >= 0) {
             if (pkt->stream_index == stream) {
                 for (auto& c : buf) c.clear();
                 int64_t pts = pkt->pts;
                 decode_current(buf);
                 sink(pts, buf);
             }
-            av_packet_unref(pkt);
+            av_packet_unref(pkt.get());
         }
         if (r != AVERROR_EOF) fail("read error: {}", av_err(r));
-        // flush (lossless decoders have no delay, but be exact anyway)
-        avcodec_send_packet(codec, nullptr);
         for (auto& c : buf) c.clear();
-        while (avcodec_receive_frame(codec, frame) >= 0) take(buf);
+        drain(buf);
         if (!buf.empty() && !buf[0].empty()) sink(AV_NOPTS_VALUE, buf);
     }
 };
@@ -138,17 +182,15 @@ std::shared_ptr<AvImage> AvImage::open(const fs::path& p, const Cache* cache) {
     auto key = SrcKey::of(p);
     auto img = std::make_shared<AvImage>();
     img->path = p;
-    {
-        Decoder d(p);
-        img->sample_rate = uint32_t(d.codec->sample_rate);
-        img->channels = d.channels();
-        img->bps = d.bps;
-        const AVDictionaryEntry* e = nullptr;
-        while ((e = av_dict_iterate(d.fmt->metadata, e))) img->tags.add(e->key, e->value);
-    }
-    fs::path idx_path = cache ? cache->av_index_path(p, key) : fs::path();
+    auto d = std::make_unique<Decoder>(p);
+    img->sample_rate = uint32_t(d->codec->sample_rate);
+    img->channels = d->channels();
+    img->bps = d->bps;
+    const AVDictionaryEntry* e = nullptr;
+    while ((e = av_dict_iterate(d->fmt->metadata, e))) img->tags.add(e->key, e->value);
+    if (cache) img->index_file_ = cache->av_index_path(p, key);
     if (cache)
-        if (auto b = try_read_file(idx_path); b && b->size() >= 32 && std::memcmp(b->data(), INDEX_MAGIC, 8) == 0) {
+        if (auto b = try_read_file(img->index_file_); b && b->size() >= 32 && std::memcmp(b->data(), INDEX_MAGIC, 8) == 0) {
             uint64_t n = le64(&(*b)[24]);
             if (b->size() == 32 + n * 20 && le32(&(*b)[8]) == img->sample_rate && (*b)[12] == img->channels && (*b)[13] == img->bps) {
                 img->total = le64(&(*b)[16]);
@@ -157,19 +199,25 @@ std::shared_ptr<AvImage> AvImage::open(const fs::path& p, const Cache* cache) {
                     const uint8_t* q = &(*b)[32 + 20 * i];
                     img->packets_[i] = {int64_t(le64(q)), le64(q + 8), le32(q + 16)};
                 }
-                return img;
+                // (indexes stored before timestamps were checked are re-checked here)
+                // (no decoder is kept for reads: images are held long before
+                // they are read, and only a read lets idle decoders be trimmed)
+                if (consistent(img->packets_, img->total)) return img;
+                img->packets_.clear();
             }
         }
-    // verify + index: one full decode with checksums
-    Decoder d(p);
+    // verify + index: one full decode with checksums (by the decoder that probed)
     uint64_t pos = 0;
     with_context(p.string(), [&] {
-        d.decode_all([&](int64_t pts, const PerChannel& s) {
+        d->decode_all([&](int64_t pts, const PerChannel& s) {
             uint32_t n = s.empty() ? 0 : uint32_t(s[0].size());
             if (pts == AV_NOPTS_VALUE && !img->packets_.empty()) {
                 img->packets_.back().count += n;  // trailing flush output belongs to the last packet
             } else {
                 WM_ENSURE(pts != AV_NOPTS_VALUE, "packet without timestamp");
+                // packets are found again by timestamp, so equal ones would be ambiguous
+                WM_ENSURE(img->packets_.empty() || pts > img->packets_.back().pts, "packet timestamps do not increase ({} after {})", pts,
+                          img->packets_.back().pts);
                 img->packets_.push_back({pts, pos, n});
             }
             pos += n;
@@ -191,7 +239,7 @@ std::shared_ptr<AvImage> AvImage::open(const fs::path& p, const Cache* cache) {
             put_le64(b, k.first);
             put_le32(b, k.count);
         }
-        atomic_write(idx_path, b);
+        atomic_write(img->index_file_, b);
     }
     return img;
 }
@@ -213,41 +261,47 @@ void AvImage::give_decoder(std::unique_ptr<Decoder> d) const {
     if (idle_.size() < MAX_DECODERS) idle_.push_back(std::move(d));
 }
 
+void AvImage::index_mismatch(size_t k, const std::string& what) const {
+    // The demuxer no longer splits the file the way the index says (e.g. after a
+    // libavformat upgrade): every read of this packet would fail the same way.
+    std::string msg = std::format("{}: packet {} {}", path.string(), k, what);
+    if (index_file_.empty()) fail("{}", msg);
+    std::error_code ec;
+    fs::remove(index_file_, ec);
+    fail("{}: removed the stale index {}; the image is indexed again when its folder is listed anew (after a restart at the latest)", msg,
+         index_file_.string());
+}
+
 AvImage::Samples AvImage::decode_packet(size_t k) const {
     auto d = take_decoder();
     const auto& want = packets_[k];
-    int r = av_seek_frame(d->fmt, d->stream, want.pts, AVSEEK_FLAG_BACKWARD);
+    int r = av_seek_frame(d->fmt.get(), d->stream, want.pts, AVSEEK_FLAG_BACKWARD);
     if (r < 0) fail("{}: seek to packet {} failed: {}", path.string(), k, av_err(r));
-    avcodec_flush_buffers(d->codec);
+    avcodec_flush_buffers(d->codec.get());  // also what lets a drained decoder decode again
     auto out = std::make_shared<PerChannel>(channels);
     while (true) {
-        r = av_read_frame(d->fmt, d->pkt);
+        r = av_read_frame(d->fmt.get(), d->pkt.get());
         if (r < 0) fail("{}: packet {} not found after seeking: {}", path.string(), k, av_err(r));
         if (d->pkt->stream_index != d->stream || d->pkt->pts < want.pts) {
-            av_packet_unref(d->pkt);
+            av_packet_unref(d->pkt.get());
             continue;
         }
         if (d->pkt->pts > want.pts) {
-            av_packet_unref(d->pkt);
-            fail("{}: seeking overshot packet {}", path.string(), k);
+            av_packet_unref(d->pkt.get());
+            index_mismatch(k, "is not where the index says (seeking overshot it)");
         }
         try {
             d->decode_current(*out);
         } catch (...) {
-            av_packet_unref(d->pkt);
+            av_packet_unref(d->pkt.get());
             throw;  // the decoder is dropped: its state is unknown
         }
-        av_packet_unref(d->pkt);
+        av_packet_unref(d->pkt.get());
         break;
     }
-    bool drained = false;
-    if (k + 1 == packets_.size()) {  // the last packet's samples may need a flush
-        avcodec_send_packet(d->codec, nullptr);
-        while (avcodec_receive_frame(d->codec, d->frame) >= 0) d->take(*out);
-        drained = true;
-    }
-    WM_ENSURE((*out)[0].size() == want.count, "{}: packet {} decoded to {} samples, expected {}", path.string(), k, (*out)[0].size(), want.count);
-    if (!drained) give_decoder(std::move(d));
+    if (k + 1 == packets_.size()) d->drain(*out);  // the last packet's samples may need a flush
+    if ((*out)[0].size() != want.count) index_mismatch(k, std::format("decoded to {} samples, the index says {}", (*out)[0].size(), want.count));
+    give_decoder(std::move(d));
     return out;
 }
 
