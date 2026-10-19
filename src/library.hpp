@@ -91,6 +91,9 @@ struct Listing {
 struct VEntry {
     Entry e;           // directories: e.dir = the source folder behind it (empty if purely virtual)
     fs::path src_dir;  // files: the source folder they belong to (tag edits are stored there)
+    /// files: the name in the source folder's listing, which the sidecar knows it
+    /// by; e.name differs when a clash in the mount directory numbered it
+    std::string src_name;
 };
 
 /// A directory of the mount: the source folders placed at its path (by default
@@ -106,6 +109,7 @@ struct VListing {
 /// Where sidecar "_target"s place things (read from the tags tree).
 struct Placements {
     uint64_t version = 0;
+    bool loaded = false;  // false only for the empty set in place before the first scan
     std::map<fs::path, std::string> folder;                  // source folder -> its directory in the mount
     std::multimap<std::string, fs::path> folder_by_target;   // and back
     struct EntryTargets {
@@ -156,8 +160,13 @@ public:
     /// replace the cached listing at any moment, so nothing may keep a pointer
     /// into a listing it no longer holds.
     std::optional<VEntry> lookup(const std::string& vpath, std::string_view name);
-    /// Re-read "_target"s from the tags tree (rate-limited unless forced).
+    /// Re-read "_target"s from the tags tree (rate-limited unless forced; an
+    /// unforced call returns at once while another thread is scanning).
     void refresh_placements(bool force = false);
+    /// Make the next lookups re-check source folder `dir` and rebuild mount
+    /// directories now, instead of trusting listings checked moments ago (after
+    /// a tag edit, so the editor reads back what it wrote).
+    void invalidate(const fs::path& dir);
     /// Root this source path belongs to and the path relative to it.
     std::optional<std::pair<const Root*, fs::path>> root_of(const fs::path& p) const;
     std::optional<fs::path> overlay_dir(const fs::path& dir) const;
@@ -223,6 +232,7 @@ private:
     std::optional<std::string> entry_target(const Placements& p, const fs::path& dir, const Entry& e) const;
     std::shared_ptr<VListing> build_vlisting(const std::string& vpath, const std::shared_ptr<const Placements>& p);
 
+    std::mutex placement_scan_mu_;  // one scan of the tags tree at a time
     std::mutex place_mu_;  // guards the placement state below
     std::shared_ptr<const Placements> placements_ = std::make_shared<Placements>();
     struct SidecarTargets {  // just the "_target"s of a tags-tree sidecar

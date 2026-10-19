@@ -3,6 +3,7 @@
 
 #include <iconv.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <string_view>
 #include <vector>
@@ -23,9 +24,10 @@ std::string decode_1252(std::span<const uint8_t> raw) {
     return o;
 }
 
-/// iconv to UTF-8. With `lenient`, an invalid byte becomes U+FFFD and decoding
+/// iconv to UTF-8. With `lenient`, an invalid code unit (`unit` bytes: 2 for
+/// UTF-16, so that decoding stays aligned) becomes U+FFFD and decoding
 /// continues; otherwise the first invalid sequence fails the whole conversion.
-static std::optional<std::string> iconv_decode(std::span<const uint8_t> raw, const char* from, bool lenient) {
+static std::optional<std::string> iconv_decode(std::span<const uint8_t> raw, const char* from, bool lenient, size_t unit = 1) {
     iconv_t cd = iconv_open("UTF-8", from);
     if (cd == iconv_t(-1)) return std::nullopt;
     std::string out;
@@ -37,17 +39,19 @@ static std::optional<std::string> iconv_decode(std::span<const uint8_t> raw, con
         char* o = buf.data();
         size_t oleft = buf.size();
         size_t r = iconv(cd, &in, &inleft, &o, &oleft);
+        int err = errno;  // before append() can allocate
         out.append(buf.data(), size_t(o - buf.data()));
         if (r != size_t(-1)) continue;
-        if (errno == E2BIG) continue;
+        if (err == E2BIG) continue;
         if (!lenient) {
             ok = false;
             break;
         }
-        // EILSEQ / EINVAL: replace one byte and resync
+        // EILSEQ / EINVAL: replace one code unit and resync
         put_utf8(out, 0xFFFD);
-        in++;
-        inleft--;
+        size_t skip = std::min(unit, inleft);
+        in += skip;
+        inleft -= skip;
         iconv(cd, nullptr, nullptr, nullptr, nullptr);
     }
     iconv_close(cd);
@@ -57,7 +61,7 @@ static std::optional<std::string> iconv_decode(std::span<const uint8_t> raw, con
 
 std::optional<std::string> decode_as(std::span<const uint8_t> raw, const std::string& charset) {
     if (iequals(charset, "windows-1252")) return decode_1252(raw);
-    return iconv_decode(raw, charset.c_str(), true);
+    return iconv_decode(raw, charset.c_str(), true, starts_with(upper(charset), "UTF-16") ? 2 : 1);
 }
 
 // ------------------------------------------------------------------ detection
@@ -78,11 +82,14 @@ const std::u32string FRENCH = U"éèêëàâîïôûùüÿçœæ", GERMAN = U"ä
                      HUNGARIAN = U"áéíóöőúüű", ROMANIAN = U"ăâîșşțţ", CROATIAN = U"čćđšž", TURKISH = U"çğıöşüâîû",
                      LATVIAN = U"āčēģīķļņšūž", LITHUANIAN = U"ąčęėįšųūž", ESTONIAN = U"äöüõšž";
 
-std::vector<Candidate> candidates() {
-    std::vector<std::u32string> west = {FRENCH, GERMAN, SPANISH, PORTUGUESE, ITALIAN, DUTCH, DANISH, SWEDISH, ICELANDIC, CATALAN};
-    auto turkish = west;
-    turkish.push_back(TURKISH);
-    return {
+const std::vector<Candidate>& candidates() {
+    static const std::vector<std::u32string> west = {FRENCH, GERMAN, SPANISH, PORTUGUESE, ITALIAN, DUTCH, DANISH, SWEDISH, ICELANDIC, CATALAN};
+    static const std::vector<std::u32string> turkish = [] {
+        auto t = west;
+        t.push_back(TURKISH);
+        return t;
+    }();
+    static const std::vector<Candidate> c = {
         {"windows-1252", nullptr, false, west},
         {"windows-1250", "CP1250", false, {CZECH, SLOVAK, POLISH, HUNGARIAN, ROMANIAN, CROATIAN, GERMAN}},
         {"windows-1251", "CP1251", false, {}},
@@ -95,18 +102,12 @@ std::vector<Candidate> candidates() {
         {"EUC-KR", "CP949", true, {}},
         {"Big5", "BIG5-HKSCS", true, {}},
     };
+    return c;
 }
 
 std::u32string to_u32(std::string_view s) {
     std::u32string o;
-    for (size_t i = 0; i < s.size();) {
-        auto b = uint8_t(s[i]);
-        int n = b < 0x80 ? 1 : b >= 0xF0 ? 4 : b >= 0xE0 ? 3 : b >= 0xC0 ? 2 : 1;
-        char32_t c = n == 1 ? b : b & (0x3F >> (n - 1));
-        for (int k = 1; k < n && i + k < s.size(); k++) c = c << 6 | (uint8_t(s[i + k]) & 0x3F);
-        o.push_back(c);
-        i += size_t(n);
-    }
+    for (size_t i = 0, len; i < s.size(); i += len) o.push_back(utf8_at(s, i, len));
     return o;
 }
 
@@ -130,10 +131,10 @@ Cls classify(char32_t c) {
 }
 
 char32_t to_lower(char32_t c) {
+    if (c == 0x178) return 0xFF;  // Ÿ: inside Latin Extended-A, but its pair is in Latin-1
     if ((c >= 0xC0 && c <= 0xDE && c != 0xD7)) return c + 0x20;
     if (c >= 0x100 && c <= 0x17F) return (c >= 0x139 && c <= 0x148) || (c >= 0x179 && c <= 0x17E) ? (c % 2 ? c + 1 : c) : (c % 2 ? c : c + 1);
     if (c >= 0x218 && c <= 0x21B) return c % 2 ? c : c + 1;
-    if (c == 0x178) return 0xFF;
     return c;
 }
 
@@ -141,11 +142,13 @@ bool is_upper_cyr_greek(char32_t c) { return (c >= 0x400 && c <= 0x42F) || (c >=
 
 double score(std::string_view text, const Candidate& cand) {
     auto u = to_u32(text);
+    std::vector<Cls> cls(u.size());
+    std::transform(u.begin(), u.end(), cls.begin(), classify);
     double s = 0;
     std::u32string latin;  // non-ASCII Latin letters, lower case
     size_t i = 0;
     while (i < u.size()) {
-        Cls c = classify(u[i]);
+        Cls c = cls[i];
         if (c == Bad) {
             s -= 10;
             i++;
@@ -158,7 +161,7 @@ double score(std::string_view text, const Candidate& cand) {
         size_t j = i;
         int n[Bad + 1] = {};
         while (j < u.size()) {
-            Cls k = classify(u[j]);
+            Cls k = cls[j];
             if (k == Sep || k == Bad) break;
             n[k]++;
             j++;
@@ -170,7 +173,7 @@ double score(std::string_view text, const Candidate& cand) {
         bool prev_lower = false;
         for (size_t k = i; k < j; k++) {
             char32_t ch = u[k];
-            switch (classify(ch)) {
+            switch (cls[k]) {
             case Latin: latin.push_back(to_lower(ch)); break;
             case Cyr:
             case Greek: {
@@ -185,7 +188,7 @@ double score(std::string_view text, const Candidate& cand) {
             case Symbol: s -= has_letters ? 2 : 1; break;
             default: break;
             }
-            prev_lower = classify(ch) == AsciiLetter && ch >= 'a';
+            prev_lower = cls[k] == AsciiLetter && ch >= 'a';
         }
         if (n[Latin] > 0 && letters >= 3 && n[Latin] * 2 > letters) s -= 3;
         i = j;
@@ -204,8 +207,8 @@ double score(std::string_view text, const Candidate& cand) {
 
 Decoded decode_text(std::span<const uint8_t> raw) {
     if (raw.size() >= 3 && raw[0] == 0xEF && raw[1] == 0xBB && raw[2] == 0xBF) return {lossy_utf8(raw.subspan(3)), "UTF-8"};
-    if (raw.size() >= 2 && raw[0] == 0xFF && raw[1] == 0xFE) return {iconv_decode(raw.subspan(2), "UTF-16LE", true).value_or(""), "UTF-16LE"};
-    if (raw.size() >= 2 && raw[0] == 0xFE && raw[1] == 0xFF) return {iconv_decode(raw.subspan(2), "UTF-16BE", true).value_or(""), "UTF-16BE"};
+    if (raw.size() >= 2 && raw[0] == 0xFF && raw[1] == 0xFE) return {iconv_decode(raw.subspan(2), "UTF-16LE", true, 2).value_or(""), "UTF-16LE"};
+    if (raw.size() >= 2 && raw[0] == 0xFE && raw[1] == 0xFF) return {iconv_decode(raw.subspan(2), "UTF-16BE", true, 2).value_or(""), "UTF-16BE"};
     if (auto s = iconv_decode(raw, "UTF-8", false); s && *s == str_of(raw)) return {*s, "UTF-8"};
 
     Decoded best{decode_1252(raw), "windows-1252"};
