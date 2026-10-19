@@ -25,12 +25,38 @@ namespace wm::flac {
 uint8_t crc8(std::span<const uint8_t> data);
 uint16_t crc16_update(uint16_t crc, std::span<const uint8_t> data);
 inline uint16_t crc16(std::span<const uint8_t> data) { return crc16_update(0, data); }
+/// The CRC-16 state `crc` advanced over `n` zero bytes, without touching them.
+/// FLAC's CRC-16 starts at 0 and is linear, so crc16(A || B) is
+/// crc16_shift(crc16(A), |B|) ^ crc16(B): a frame's CRC can be updated for a
+/// changed header from the stored one, without reading the frame's body.
+uint16_t crc16_shift(uint16_t crc, uint64_t n);
 
 // FLAC's extended UTF-8 number coding (frame/sample numbers, up to 36 bits)
 size_t coded_len(uint64_t v);
+/// Writes coded_len(v) bytes at `out`.
+void encode_number(uint64_t v, uint8_t* out);
 void encode_number(uint64_t v, Bytes& out);
 /// (value, byte length)
 std::optional<std::pair<uint64_t, size_t>> decode_number(std::span<const uint8_t> b);
+
+/// What a frame header says, field by field, with its explicit block-size and
+/// sample-rate bytes (which follow the codes that call for them).
+struct HeaderFields {
+    bool variable = false;
+    uint8_t bs_code = 0, sr_code = 0, ch_code = 0, bps_code = 0;
+    /// frame number (fixed blocksize) or first sample number (variable)
+    uint64_t number = 0;
+    std::span<const uint8_t> bs_bytes, sr_bytes;
+};
+
+/// A frame header built in place: at most 16 bytes, so building one allocates nothing.
+struct HeaderBytes {
+    std::array<uint8_t, 16> b{};
+    size_t len = 0;
+    std::span<const uint8_t> span() const { return {b.data(), len}; }
+};
+/// The header for `f`, CRC-8 included.
+HeaderBytes write_header(const HeaderFields& f);
 
 struct FrameHeader {
     bool variable = false;
@@ -46,11 +72,14 @@ struct FrameHeader {
 
     /// Parse and CRC-check a frame header at the start of `b`.
     static std::optional<FrameHeader> parse(std::span<const uint8_t> b);
+    /// The fields of this header, which was parsed from `b` (spans point into it).
+    HeaderFields fields(std::span<const uint8_t> b) const;
+    size_t bs_bytes_len() const { return bs_code == 6 ? 1 : bs_code == 7 ? 2 : 0; }
 };
 
-/// Rewrite a header (`orig`, parsed as `h`) into a variable-blocksize header
-/// carrying `sample_number`, optionally with an explicit bps code.
-Bytes rewrite_header(std::span<const uint8_t> orig, const FrameHeader& h, uint64_t sample_number, std::optional<uint8_t> bps_code);
+/// A header (`orig`, parsed as `h`) made into a variable-blocksize header
+/// carrying `sample_number`.
+HeaderBytes rewrite_header(std::span<const uint8_t> orig, const FrameHeader& h, uint64_t sample_number);
 uint8_t bps_code_for(uint32_t bps);
 
 struct StreamInfo {
@@ -90,7 +119,8 @@ std::vector<std::pair<std::string, std::string>> parse_vorbis(std::span<const ui
 Bytes build_vorbis(const std::string& vendor, const std::vector<std::pair<std::string, std::string>>& tags);
 /// Padding added to generated headers so tag editors can save in place.
 constexpr size_t EDIT_PADDING = 8192;
-/// "fLaC" + STREAMINFO + blocks.
+/// "fLaC" + STREAMINFO + blocks, all in memory: the plain reference the tests
+/// check header_segments against (generated files use header_segments).
 Bytes build_header(const std::array<uint8_t, 34>& si, const std::vector<MetaBlock>& blocks);
 /// A block of a generated header whose body is bytes, a range of the source file
 /// (e.g. a picture, by MetaBlock::offset) or zeros (padding).
@@ -102,6 +132,10 @@ struct HeaderBlock {
 };
 /// The same bytes as build_header, as segments.
 std::vector<Seg> header_segments(const std::array<uint8_t, 34>& si, const std::vector<HeaderBlock>& blocks);
+/// Body of a front-cover PICTURE block whose image is `image`, a range of the
+/// source file (e.g. AvImage::front_cover), referenced rather than copied. The
+/// dimensions are left 0 (unknown): players take them from the image itself.
+std::vector<Seg> picture_body(std::string_view mime, SrcRange image);
 
 /// Byte offsets of every frame of a fixed-blocksize FLAC image, built by a single
 /// sequential pass that verifies each frame's header CRC-8, frame number and
@@ -111,7 +145,6 @@ struct FrameIndex {
     uint32_t block_size = 0;
     /// offsets[k] = start of frame k; offsets[nframes] = end of the last frame
     std::span<const uint64_t> offsets;
-    bool bps_in_header = false;
     /// owner of `offsets`: a vector, or the cache file mapped into memory (pages
     /// the kernel loads when a track is read and may drop again)
     std::shared_ptr<const void> storage;
@@ -119,6 +152,11 @@ struct FrameIndex {
     static FrameIndex build(const fs::path& p, const FlacMeta& meta);
     uint64_t nframes() const { return offsets.size() - 1; }
 };
+
+/// End of the last frame of a file, which starts at `start`: the first position
+/// where the frame's CRC-16 checks out and only EOF or a recognisable trailing tag
+/// follows. nullopt if there is none (an incomplete file).
+std::optional<uint64_t> last_frame_end(const File& f, uint64_t start);
 
 /// Size in bytes of a VERBATIM frame produced by `encode_verbatim`.
 uint64_t verbatim_size(uint32_t samples, uint32_t channels, uint32_t bps, uint64_t sample_number, size_t sr_extra);
@@ -128,11 +166,15 @@ uint64_t verbatim_size(uint32_t samples, uint32_t channels, uint32_t bps, uint64
 Bytes encode_verbatim(const std::vector<std::span<const int32_t>>& chans, uint32_t bps, uint64_t sample_number, uint8_t sr_code,
                       std::span<const uint8_t> sr_extra);
 
-/// Encode one block of per-channel samples as a compressed FLAC frame (libFLAC,
-/// compression level 5) numbered `frame_number` in a fixed-blocksize stream of
-/// `block_size`-sample frames. Frames are encoded independently, so the result
-/// depends only on the samples and the number: the same frame can be produced
-/// again at any time, byte for byte.
+/// Encode per-channel samples as compressed FLAC frames (libFLAC, compression
+/// level 5) of `block_size` samples each (the last may be shorter), numbered from
+/// `first_frame` in a fixed-blocksize stream. Frames are encoded independently, so
+/// each depends only on its samples and number: the same frame can be produced
+/// again at any time, alone or in another run, byte for byte. One encoder serves
+/// the whole run (setting one up costs about a third of encoding a frame).
+std::vector<Bytes> encode_frames(const std::vector<std::span<const int32_t>>& chans, uint32_t bps, uint32_t sample_rate, uint32_t block_size,
+                                 uint64_t first_frame);
+/// One frame of encode_frames.
 Bytes encode_frame(const std::vector<std::span<const int32_t>>& chans, uint32_t bps, uint32_t sample_rate, uint32_t block_size, uint64_t frame_number);
 
 /// Decode one complete frame (first header byte to CRC-16) to per-channel samples.
@@ -140,7 +182,8 @@ Bytes encode_frame(const std::vector<std::span<const int32_t>>& chans, uint32_t 
 std::vector<std::vector<int32_t>> decode_frame(std::span<const uint8_t> frame, uint32_t bps, uint32_t sample_rate);
 
 /// Decode a whole FLAC file, calling `sink(first_sample, per-channel samples)` per
-/// frame. Decoder complaints after `expected` samples (trailing tags) are ignored.
+/// frame. Fails unless `expected` samples decode cleanly; decoder complaints after
+/// them (trailing tags) are ignored.
 void decode_file(const fs::path& p, uint64_t expected, const std::function<void(uint64_t, const std::vector<std::span<const int32_t>>&)>& sink);
 
 }  // namespace wm::flac

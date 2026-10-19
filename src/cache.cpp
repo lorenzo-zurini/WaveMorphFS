@@ -36,8 +36,7 @@ std::optional<flac::FrameIndex> Cache::load_index(const fs::path& src, const Src
     uint64_t n = le64(b + 16);
     if (std::memcmp(b, IDX_MAGIC, 8) != 0 || m->bytes.size() != 24 + n * 8) return std::nullopt;
     flac::FrameIndex idx;
-    idx.block_size = le32(b + 8);
-    idx.bps_in_header = b[12] != 0;
+    idx.block_size = le32(b + 8);  // (bytes 12..15 are unused)
     if constexpr (std::endian::native == std::endian::little) {
         idx.offsets = {reinterpret_cast<const uint64_t*>(b + 24), size_t(n)};
         idx.storage = std::move(m->owner);
@@ -53,8 +52,7 @@ std::optional<flac::FrameIndex> Cache::load_index(const fs::path& src, const Src
 void Cache::store_index(const fs::path& src, const SrcKey& key, const flac::FrameIndex& idx) const {
     Bytes b(IDX_MAGIC, IDX_MAGIC + 8);
     put_le32(b, idx.block_size);
-    b.push_back(idx.bps_in_header ? 1 : 0);
-    b.insert(b.end(), 3, 0);
+    b.insert(b.end(), 4, 0);  // unused (once a flag nothing read)
     put_le64(b, idx.offsets.size());
     for (auto o : idx.offsets) put_le64(b, o);
     atomic_write(idx_path(src, key), b);

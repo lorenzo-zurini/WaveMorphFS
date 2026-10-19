@@ -43,6 +43,35 @@ uint16_t crc16_update(uint16_t crc, std::span<const uint8_t> data) {
     return crc;
 }
 
+namespace {
+
+/// a * b mod P in GF(2)[x], P = x^16 + x^15 + x^2 + 1 (the CRC-16 polynomial);
+/// a CRC state is such a residue, and a zero byte multiplies it by x^8
+uint16_t mulmod(uint16_t a, uint16_t b) {
+    uint16_t r = 0;
+    for (int i = 15; i >= 0; i--) {
+        r = (r & 0x8000) ? uint16_t(r << 1 ^ 0x8005) : uint16_t(r << 1);
+        if (b >> i & 1) r ^= a;
+    }
+    return r;
+}
+
+/// X8N[i] = x^(8 * 2^i) mod P: the effect of 2^i zero bytes
+const auto X8N = [] {
+    std::array<uint16_t, 64> t{};
+    t[0] = 0x0100;
+    for (size_t i = 1; i < t.size(); i++) t[i] = mulmod(t[i - 1], t[i - 1]);
+    return t;
+}();
+
+}  // namespace
+
+uint16_t crc16_shift(uint16_t crc, uint64_t n) {
+    for (size_t i = 0; n; i++, n >>= 1)
+        if (n & 1) crc = mulmod(crc, X8N[i]);
+    return crc;
+}
+
 // ------------------------------------------------------------------ numbers
 
 size_t coded_len(uint64_t v) {
@@ -55,17 +84,23 @@ size_t coded_len(uint64_t v) {
     return 7;
 }
 
-void encode_number(uint64_t v, Bytes& out) {
+void encode_number(uint64_t v, uint8_t* out) {
     size_t n = coded_len(v);
     if (n == 1) {
-        out.push_back(uint8_t(v));
+        out[0] = uint8_t(v);
         return;
     }
     static const uint8_t lead[8] = {0, 0, 0xC0, 0xE0, 0xF0, 0xF8, 0xFC, 0xFE};
     size_t rest = n - 1;
     uint8_t first = n == 7 ? 0 : uint8_t(v >> (6 * rest));
-    out.push_back(lead[n] | first);
-    for (size_t i = rest; i-- > 0;) out.push_back(uint8_t(0x80 | ((v >> (6 * i)) & 0x3F)));
+    out[0] = lead[n] | first;
+    for (size_t i = 1; i < n; i++) out[i] = uint8_t(0x80 | ((v >> (6 * (rest - i))) & 0x3F));
+}
+
+void encode_number(uint64_t v, Bytes& out) {
+    size_t old = out.size();
+    out.resize(old + coded_len(v));
+    encode_number(v, out.data() + old);
 }
 
 std::optional<std::pair<uint64_t, size_t>> decode_number(std::span<const uint8_t> b) {
@@ -126,18 +161,36 @@ std::optional<FrameHeader> FrameHeader::parse(std::span<const uint8_t> b) {
     return h;
 }
 
-Bytes rewrite_header(std::span<const uint8_t> orig, const FrameHeader& h, uint64_t sample_number, std::optional<uint8_t> bps_code) {
-    Bytes out;
-    out.reserve(h.len + 2);
-    out.push_back(0xFF);
-    out.push_back(0xF9);
-    out.push_back(orig[2]);
-    out.push_back(bps_code ? uint8_t((orig[3] & 0xF1) | (*bps_code << 1)) : orig[3]);
-    encode_number(sample_number, out);
-    size_t es = 4 + h.number_len;
-    out.insert(out.end(), orig.begin() + es, orig.begin() + es + h.extra_len);
-    out.push_back(crc8(out));
-    return out;
+HeaderFields FrameHeader::fields(std::span<const uint8_t> b) const {
+    size_t es = 4 + number_len, bl = bs_bytes_len();
+    return {variable, bs_code, sr_code, ch_code, bps_code, number, b.subspan(es, bl), b.subspan(es + bl, extra_len - bl)};
+}
+
+HeaderBytes write_header(const HeaderFields& f) {
+    WM_ENSURE(f.bs_bytes.size() <= 2 && f.sr_bytes.size() <= 2, "bad frame header fields");
+    HeaderBytes h;
+    auto& b = h.b;
+    b[0] = 0xFF;
+    b[1] = f.variable ? 0xF9 : 0xF8;
+    b[2] = uint8_t(f.bs_code << 4 | f.sr_code);
+    b[3] = uint8_t(f.ch_code << 4 | f.bps_code << 1);
+    size_t p = 4;
+    encode_number(f.number, &b[p]);
+    p += coded_len(f.number);
+    for (auto part : {f.bs_bytes, f.sr_bytes}) {
+        std::copy(part.begin(), part.end(), &b[p]);
+        p += part.size();
+    }
+    b[p] = crc8(std::span(b).subspan(0, p));
+    h.len = p + 1;
+    return h;
+}
+
+HeaderBytes rewrite_header(std::span<const uint8_t> orig, const FrameHeader& h, uint64_t sample_number) {
+    auto f = h.fields(orig);
+    f.variable = true;
+    f.number = sample_number;
+    return write_header(f);
 }
 
 uint8_t bps_code_for(uint32_t bps) {
@@ -193,7 +246,8 @@ FlacMeta FlacMeta::read(const fs::path& p) {
             f.read_exact_at(rest, 6, 4);
             uint64_t sz = 0;
             for (int i = 2; i < 6; i++) sz = sz << 7 | (rest[i] & 0x7F);
-            pos = 10 + sz;
+            bool footer = rest[1] & 0x10;  // ID3v2.4: a 10-byte footer follows the tag
+            pos = 10 + sz + (footer ? 10 : 0);
             f.read_exact_at(magic, 4, pos);
             pos += 4;
         }
@@ -280,6 +334,7 @@ Bytes build_vorbis(const std::string& vendor, const std::vector<std::pair<std::s
 Bytes build_header(const std::array<uint8_t, 34>& si, const std::vector<MetaBlock>& blocks) {
     Bytes out = {'f', 'L', 'a', 'C'};
     auto push = [&](uint8_t kind, std::span<const uint8_t> data, bool last) {
+        WM_ENSURE(data.size() < (1u << 24), "metadata block too large");
         out.push_back(kind | (last ? 0x80 : 0));
         put_be24(out, uint32_t(data.size()));
         append(out, data);
@@ -309,6 +364,17 @@ std::vector<Seg> header_segments(const std::array<uint8_t, 34>& si, const std::v
         out.insert(out.end(), blocks[i].body.begin(), blocks[i].body.end());
     }
     return out;
+}
+
+std::vector<Seg> picture_body(std::string_view mime, SrcRange image) {
+    Bytes b;
+    put_be32(b, 3);  // front cover
+    put_be32(b, uint32_t(mime.size()));
+    append(b, mime);
+    put_be32(b, 0);  // description
+    for (int i = 0; i < 4; i++) put_be32(b, 0);  // width, height, depth, colours: unknown
+    put_be32(b, uint32_t(image.len));
+    return {std::move(b), image};
 }
 
 // ------------------------------------------------------------------ frame index
@@ -348,24 +414,49 @@ struct Window {
     }
 };
 
-/// True if the bytes from `end` to EOF are empty or a recognisable trailing tag.
-bool trailing_is_tag(const File& f, uint64_t end, uint64_t flen) {
-    uint64_t tail = flen - end;
-    if (tail == 0) return true;
-    if (tail > (1 << 20)) return false;
-    uint8_t head[8] = {};
-    size_t n = size_t(std::min<uint64_t>(tail, 8));
-    try {
-        f.read_exact_at(head, n, end);
-    } catch (...) {
-        return false;
+/// Trailing tags longer than this are not recognised (an unfinished file is more likely).
+constexpr uint64_t TAIL_TAG_MAX = 1 << 20;
+/// Upper bound on a frame's size: 65535 samples x 8 channels x 32 bits, plus headers.
+constexpr uint64_t FRAME_MAX = 65535ull * 8 * 4 + 1024;
+
+/// True if `tail` (the bytes after the last frame, up to EOF) is empty or a
+/// recognisable trailing tag. No allowance for zero padding on purpose: an
+/// unfinished file also ends in zeros.
+bool is_trailing_tag(std::span<const uint8_t> tail) {
+    if (tail.empty()) return true;
+    if (tail.size() > TAIL_TAG_MAX) return false;
+    auto at = [&](size_t pos, std::string_view magic) { return pos + magic.size() <= tail.size() && std::memcmp(&tail[pos], magic.data(), magic.size()) == 0; };
+    if ((tail.size() == 128 && at(0, "TAG")) || at(0, "APETAGEX") || at(0, "ID3")) return true;
+    // an APEv2 tag without a header: its footer ends the file (or precedes an ID3v1
+    // tag), and its size field covers the items and the footer
+    for (size_t v1 : {size_t(0), size_t(128)}) {
+        if (tail.size() < v1 + 32 || (v1 && !at(tail.size() - 128, "TAG"))) continue;
+        size_t footer = tail.size() - v1 - 32;
+        if (at(footer, "APETAGEX") && le32(&tail[footer + 12]) == tail.size() - v1) return true;
     }
-    // No allowance for zero padding on purpose: an unfinished file also ends in zeros.
-    return (tail == 128 && std::memcmp(head, "TAG", 3) == 0) || (n >= 8 && std::memcmp(head, "APETAGEX", 8) == 0) ||
-           (n >= 3 && std::memcmp(head, "ID3", 3) == 0);
+    return false;
 }
 
 }  // namespace
+
+std::optional<uint64_t> last_frame_end(const File& f, uint64_t start) {
+    uint64_t flen = f.size();
+    if (start >= flen || flen - start > FRAME_MAX + TAIL_TAG_MAX) return std::nullopt;
+    Bytes b(size_t(flen - start));
+    f.read_exact_at(b.data(), b.size(), start);
+    auto hdr = FrameHeader::parse(b);
+    if (!hdr) return std::nullopt;
+    // CRC-16 alone false-matches about once per 65536 bytes, also inside a trailing
+    // tag (and a tag whose own CRC-16 is 0 makes EOF match): the first position
+    // where the frame checks out and only EOF or a tag follows is the end
+    uint16_t crc = crc16(std::span(b).subspan(0, hdr->len));
+    for (size_t p = hdr->len; p < b.size();) {
+        crc = uint16_t(crc << 8) ^ CRC16[uint8_t(crc >> 8) ^ b[p]];
+        p++;
+        if (crc == 0 && p >= hdr->len + 2 && is_trailing_tag(std::span(b).subspan(p))) return start + p;
+    }
+    return std::nullopt;
+}
 
 FrameIndex FrameIndex::build(const fs::path& path, const FlacMeta& meta) {
     const auto& si = meta.streaminfo;
@@ -382,10 +473,10 @@ FrameIndex FrameIndex::build(const fs::path& path, const FlacMeta& meta) {
     uint32_t bs = h0.block_size;
     WM_ENSURE(si.min_block == si.max_block || si.max_block == bs, "inconsistent block size");
     uint64_t nframes = (si.total_samples + bs - 1) / bs;
+    uint64_t last_bs = si.total_samples - (nframes - 1) * bs;
 
     FrameIndex idx;
     idx.block_size = bs;
-    idx.bps_in_header = h0.bps_code != 0;
     auto offs = std::make_shared<std::vector<uint64_t>>();
     offs->reserve(nframes + 1);
     offs->push_back(meta.audio_start);
@@ -399,9 +490,18 @@ FrameIndex FrameIndex::build(const fs::path& path, const FlacMeta& meta) {
         WM_ENSURE(hdr.has_value(), "frame {} header invalid at byte {}", k, w.off + cur);
         WM_ENSURE(hdr->number == k, "frame {}: header says frame {}", k, hdr->number);
         bool is_last = k + 1 == nframes;
+        // track sizes are computed from these: the number must be coded in the
+        // shortest form, and every frame must hold the samples STREAMINFO implies
+        WM_ENSURE(hdr->number_len == coded_len(k), "frame {}: frame number coded in {} bytes", k, hdr->number_len);
+        WM_ENSURE(hdr->block_size == (is_last ? last_bs : bs), "frame {}: {} samples, expected {}", k, hdr->block_size, is_last ? last_bs : bs);
+        if (is_last) {
+            auto end = last_frame_end(f, w.off + cur);
+            WM_ENSURE(end.has_value(), "last frame: no valid end followed by EOF or a tag (incomplete file?)");
+            offs->push_back(*end);
+            break;
+        }
         uint16_t crc = crc16_update(0, std::span(w.buf).subspan(cur, hdr->len));
         size_t p = cur + hdr->len;
-        std::vector<uint64_t> last_candidates;
         std::optional<uint64_t> end;
         while (true) {
             if (p >= w.buf.size()) {
@@ -413,12 +513,6 @@ FrameIndex FrameIndex::build(const fs::path& path, const FlacMeta& meta) {
             p++;
             // p - cur is invariant under compaction; need at least header + CRC-16
             if (crc != 0 || p - cur < hdr->len + 2) continue;
-            if (is_last) {
-                // CRC-16 alone false-matches ~1/65536 bytes: collect every candidate
-                // up to EOF and pick the one followed only by a recognisable tag.
-                last_candidates.push_back(w.off + p);
-                continue;
-            }
             if (p + 32 > w.buf.size() && !w.eof) w.compact(cur, &p);
             if (auto nh = FrameHeader::parse(std::span(w.buf).subspan(p))) {
                 // the final frame usually carries an explicit (smaller) block size
@@ -430,16 +524,7 @@ FrameIndex FrameIndex::build(const fs::path& path, const FlacMeta& meta) {
                 }
             }
         }
-        if (is_last) {
-            for (auto it = last_candidates.rbegin(); it != last_candidates.rend(); ++it)
-                if (trailing_is_tag(f, *it, flen)) {
-                    end = *it;
-                    break;
-                }
-            WM_ENSURE(end.has_value(), "last frame: no valid end followed by EOF or a tag (incomplete file?)");
-        } else {
-            WM_ENSURE(end.has_value(), "frame {}: no valid end found (incomplete file?)", k);
-        }
+        WM_ENSURE(end.has_value(), "frame {}: no valid end found (incomplete file?)", k);
         offs->push_back(*end);
         cur = size_t(*end - w.off);
     }
@@ -481,16 +566,14 @@ Bytes encode_verbatim(const std::vector<std::span<const int32_t>>& chans, uint32
                       std::span<const uint8_t> sr_extra) {
     size_t n = chans[0].size();
     WM_ENSURE(n >= 1 && n <= 65535, "FLAC block size must be 1..=65535");
-    Bytes h = {0xFF, 0xF9};
-    uint8_t bs_code = n <= 256 ? 6 : 7;
-    h.push_back(uint8_t(bs_code << 4 | sr_code));
-    h.push_back(uint8_t((chans.size() - 1) << 4 | bps_code_for(bps) << 1));
-    encode_number(sample_number, h);
-    if (bs_code == 6) h.push_back(uint8_t(n - 1));
-    else put_be16(h, uint16_t(n - 1));
-    append(h, sr_extra);
-    h.push_back(crc8(h));
-    BitWriter w{std::move(h)};
+    // explicit block size: 8 bits up to 256 samples, else 16 bits
+    uint8_t bs_bytes[2] = {uint8_t((n - 1) >> 8), uint8_t(n - 1)};
+    bool small = n <= 256;
+    auto h = write_header({true, uint8_t(small ? 6 : 7), sr_code, uint8_t(chans.size() - 1), bps_code_for(bps), sample_number,
+                           std::span<const uint8_t>(bs_bytes).subspan(small ? 1 : 0), sr_extra});
+    BitWriter w;
+    w.buf.reserve(size_t(verbatim_size(uint32_t(n), uint32_t(chans.size()), bps, sample_number, sr_extra.size())));
+    append(w.buf, h.span());
     for (auto& ch : chans) {
         w.put(0b00000010, 8);  // zero pad bit, SUBFRAME_VERBATIM, no wasted bits
         for (int32_t s : ch) w.put(uint32_t(s), bps);
@@ -504,52 +587,76 @@ Bytes encode_verbatim(const std::vector<std::span<const int32_t>>& chans, uint32
 // ------------------------------------------------------------------ encoding (libFLAC)
 
 namespace {
-struct FrameSink {
-    Bytes frame;
-};
 
-FLAC__StreamEncoderWriteStatus enc_write(const FLAC__StreamEncoder*, const FLAC__byte buffer[], size_t bytes, uint32_t samples, uint32_t, void* cd) {
-    // metadata is written with samples == 0; only the audio frame is kept
-    if (samples > 0) static_cast<FrameSink*>(cd)->frame.insert(static_cast<FrameSink*>(cd)->frame.end(), buffer, buffer + bytes);
+/// Keeps the audio frames libFLAC writes, by frame number (metadata comes with samples == 0).
+FLAC__StreamEncoderWriteStatus enc_write(const FLAC__StreamEncoder*, const FLAC__byte buffer[], size_t bytes, uint32_t samples, uint32_t current_frame,
+                                         void* cd) {
+    auto& frames = *static_cast<std::vector<Bytes>*>(cd);
+    if (samples == 0) return FLAC__STREAM_ENCODER_WRITE_STATUS_OK;
+    if (current_frame >= frames.size()) frames.resize(size_t(current_frame) + 1);
+    frames[current_frame].insert(frames[current_frame].end(), buffer, buffer + bytes);
     return FLAC__STREAM_ENCODER_WRITE_STATUS_OK;
 }
+
+struct EncoderDelete {
+    void operator()(FLAC__StreamEncoder* e) const { FLAC__stream_encoder_delete(e); }
+};
+
 }  // namespace
 
-Bytes encode_frame(const std::vector<std::span<const int32_t>>& chans, uint32_t bps, uint32_t sample_rate, uint32_t block_size, uint64_t frame_number) {
+std::vector<Bytes> encode_frames(const std::vector<std::span<const int32_t>>& chans, uint32_t bps, uint32_t sample_rate, uint32_t block_size,
+                                 uint64_t first_frame) {
     size_t n = chans[0].size();
-    WM_ENSURE(n >= 1 && n <= block_size, "bad block of {} samples", n);
-    FLAC__StreamEncoder* e = FLAC__stream_encoder_new();
+    WM_ENSURE(n >= 1 && block_size >= 16, "bad run of {} samples in blocks of {}", n, block_size);
+    std::unique_ptr<FLAC__StreamEncoder, EncoderDelete> e(FLAC__stream_encoder_new());
     WM_ENSURE(e, "out of memory");
-    struct Free {
-        FLAC__StreamEncoder* e;
-        ~Free() { FLAC__stream_encoder_delete(e); }
-    } guard{e};
-    FLAC__stream_encoder_set_channels(e, uint32_t(chans.size()));
-    FLAC__stream_encoder_set_bits_per_sample(e, bps);
-    FLAC__stream_encoder_set_sample_rate(e, sample_rate);
-    FLAC__stream_encoder_set_compression_level(e, 5);
+    FLAC__stream_encoder_set_channels(e.get(), uint32_t(chans.size()));
+    FLAC__stream_encoder_set_bits_per_sample(e.get(), bps);
+    FLAC__stream_encoder_set_sample_rate(e.get(), sample_rate);
+    FLAC__stream_encoder_set_compression_level(e.get(), 5);
     // per-frame stereo decisions only (loose mid-side would carry state between frames)
-    FLAC__stream_encoder_set_loose_mid_side_stereo(e, false);
-    FLAC__stream_encoder_set_blocksize(e, block_size);
-    FLAC__stream_encoder_set_total_samples_estimate(e, n);
-    FrameSink sink;
-    if (FLAC__stream_encoder_init_stream(e, enc_write, nullptr, nullptr, nullptr, &sink) != FLAC__STREAM_ENCODER_INIT_STATUS_OK)
-        fail("FLAC encoder init failed");
+    FLAC__stream_encoder_set_loose_mid_side_stereo(e.get(), false);
+    FLAC__stream_encoder_set_blocksize(e.get(), block_size);
+    FLAC__stream_encoder_set_total_samples_estimate(e.get(), n);
+    std::vector<Bytes> frames;
+    auto init = [&] { return FLAC__stream_encoder_init_stream(e.get(), enc_write, nullptr, nullptr, nullptr, &frames); };
+    auto st = init();
+    if (st == FLAC__STREAM_ENCODER_INIT_STATUS_NOT_STREAMABLE) {
+        // outside the streamable subset (e.g. 28 bits per sample, or rates over
+        // 655350 Hz) libFLAC refuses by default; only these streams are made
+        // non-subset, so every other stream keeps the exact encoder setup
+        FLAC__stream_encoder_set_streamable_subset(e.get(), false);
+        st = init();
+    }
+    if (st != FLAC__STREAM_ENCODER_INIT_STATUS_OK) fail("FLAC encoder init failed: {}", FLAC__StreamEncoderInitStatusString[st]);
     std::vector<const FLAC__int32*> ptrs;
     for (auto& c : chans) ptrs.push_back(c.data());
-    bool ok = FLAC__stream_encoder_process(e, ptrs.data(), uint32_t(n)) && FLAC__stream_encoder_finish(e);
-    WM_ENSURE(ok, "FLAC encoding failed: {}", FLAC__StreamEncoderStateString[FLAC__stream_encoder_get_state(e)]);
-    // the frame was numbered 0; renumber it
-    auto h = FrameHeader::parse(sink.frame);
-    WM_ENSURE(h.has_value() && !h->variable && h->number == 0, "unexpected encoder output");
-    Bytes out(sink.frame.begin(), sink.frame.begin() + 4);
-    encode_number(frame_number, out);
-    size_t es = 4 + h->number_len;
-    out.insert(out.end(), sink.frame.begin() + ptrdiff_t(es), sink.frame.begin() + ptrdiff_t(es + h->extra_len));
-    out.push_back(crc8(out));
-    out.insert(out.end(), sink.frame.begin() + ptrdiff_t(h->len), sink.frame.end() - 2);
-    put_be16(out, crc16(out));
-    return out;
+    bool ok = FLAC__stream_encoder_process(e.get(), ptrs.data(), uint32_t(n)) && FLAC__stream_encoder_finish(e.get());
+    WM_ENSURE(ok, "FLAC encoding failed: {}", FLAC__StreamEncoderStateString[FLAC__stream_encoder_get_state(e.get())]);
+    WM_ENSURE(frames.size() == (n + block_size - 1) / block_size, "FLAC encoder wrote {} frames for {} samples", frames.size(), n);
+    // renumber: the frames were numbered from 0
+    for (size_t i = 0; i < frames.size(); i++) {
+        auto& fr = frames[i];
+        auto h = FrameHeader::parse(fr);
+        WM_ENSURE(h.has_value() && !h->variable && h->number == i, "unexpected encoder output");
+        auto f = h->fields(fr);
+        f.number = first_frame + i;
+        auto hdr = write_header(f);
+        std::span<const uint8_t> body(fr.data() + h->len, fr.size() - h->len - 2);
+        Bytes out(hdr.len + body.size() + 2);
+        std::copy(hdr.b.begin(), hdr.b.begin() + ptrdiff_t(hdr.len), out.begin());
+        std::copy(body.begin(), body.end(), out.begin() + ptrdiff_t(hdr.len));
+        uint16_t crc = crc16(std::span(out).first(out.size() - 2));
+        out[out.size() - 2] = uint8_t(crc >> 8);
+        out[out.size() - 1] = uint8_t(crc);
+        fr = std::move(out);
+    }
+    return frames;
+}
+
+Bytes encode_frame(const std::vector<std::span<const int32_t>>& chans, uint32_t bps, uint32_t sample_rate, uint32_t block_size, uint64_t frame_number) {
+    WM_ENSURE(chans[0].size() <= block_size, "bad block of {} samples", chans[0].size());
+    return std::move(encode_frames(chans, bps, sample_rate, block_size, frame_number)[0]);
 }
 
 // ------------------------------------------------------------------ decoding (libFLAC)
@@ -598,25 +705,24 @@ std::vector<std::vector<int32_t>> decode_frame(std::span<const uint8_t> frame, u
     Bytes owned;
     // libFLAC needs STREAMINFO for headers that defer to it: write explicit codes instead
     if (h->bps_code == 0 || h->sr_code == 0) {
-        uint8_t bps_code = h->bps_code ? h->bps_code : bps_code_for(bps);
-        WM_ENSURE(bps_code != 0, "unsupported bits per sample {}", bps);
-        uint8_t sr_code = h->sr_code;
-        Bytes sr_bytes;
-        size_t es = 4 + h->number_len;
-        size_t bs_extra = h->bs_code == 6 ? 1 : h->bs_code == 7 ? 2 : 0;
-        if (sr_code == 0) {
-            if (sample_rate <= 65535) sr_code = 13, put_be16(sr_bytes, uint16_t(sample_rate));
-            else if (sample_rate % 10 == 0 && sample_rate / 10 <= 65535) sr_code = 14, put_be16(sr_bytes, uint16_t(sample_rate / 10));
+        auto f = h->fields(frame);
+        if (f.bps_code == 0) f.bps_code = bps_code_for(bps);
+        WM_ENSURE(f.bps_code != 0, "unsupported bits per sample {}", bps);
+        uint32_t coded_rate = sample_rate;  // in Hz (code 13) or tens of Hz (code 14)
+        if (f.sr_code == 0) {
+            if (sample_rate <= 65535) f.sr_code = 13;
+            else if (sample_rate % 10 == 0 && sample_rate / 10 <= 65535) f.sr_code = 14, coded_rate = sample_rate / 10;
             else fail("unsupported sample rate {}", sample_rate);
-        } else {
-            sr_bytes.assign(frame.begin() + es + bs_extra, frame.begin() + es + h->extra_len);
         }
-        owned = {0xFF, frame[1], uint8_t(h->bs_code << 4 | sr_code), uint8_t((frame[3] & 0xF1) | bps_code << 1)};
-        owned.insert(owned.end(), frame.begin() + 4, frame.begin() + es + bs_extra);
-        append(owned, sr_bytes);
-        owned.push_back(crc8(owned));
-        owned.insert(owned.end(), frame.begin() + h->len, frame.end() - 2);
-        put_be16(owned, crc16(owned));
+        uint8_t sr_bytes[2] = {uint8_t(coded_rate >> 8), uint8_t(coded_rate)};
+        if (h->sr_code == 0) f.sr_bytes = sr_bytes;
+        auto hdr = write_header(f);
+        std::span<const uint8_t> body = frame.subspan(h->len, frame.size() - h->len - 2);
+        uint16_t crc = crc16_update(crc16(hdr.span()), body);
+        owned.reserve(hdr.len + body.size() + 2);
+        append(owned, hdr.span());
+        append(owned, body);
+        put_be16(owned, crc);
         frame = owned;
     }
     Decoder dec;
@@ -626,7 +732,9 @@ std::vector<std::vector<int32_t>> decode_frame(std::span<const uint8_t> frame, u
     if (FLAC__stream_decoder_init_stream(dec.d, mem_read, nullptr, nullptr, nullptr, nullptr, mem_write, nullptr, on_error, &src) !=
         FLAC__STREAM_DECODER_INIT_STATUS_OK)
         fail("FLAC decoder init failed");
-    for (int i = 0; i < 8 && src.out.empty(); i++) {
+    // a few steps: libFLAC looks for metadata first, then finds the frame's sync code
+    constexpr int MAX_STEPS = 8;
+    for (int i = 0; i < MAX_STEPS && src.out.empty(); i++) {
         if (!FLAC__stream_decoder_process_single(dec.d)) break;
         if (FLAC__stream_decoder_get_state(dec.d) == FLAC__STREAM_DECODER_END_OF_STREAM) break;
     }
@@ -640,6 +748,7 @@ struct FileSink {
     const std::function<void(uint64_t, const std::vector<std::span<const int32_t>>&)>* sink;
     uint64_t pos = 0;
     std::string error;
+    uint64_t error_at = UINT64_MAX;  // sample position of the first decoder complaint
     std::string exception;
 };
 
@@ -659,7 +768,10 @@ FLAC__StreamDecoderWriteStatus file_write(const FLAC__StreamDecoder*, const FLAC
 
 void file_error(const FLAC__StreamDecoder*, FLAC__StreamDecoderErrorStatus st, void* cd) {
     auto* s = static_cast<FileSink*>(cd);
-    if (s->error.empty()) s->error = FLAC__StreamDecoderErrorStatusString[st];
+    if (s->error.empty()) {
+        s->error = FLAC__StreamDecoderErrorStatusString[st];
+        s->error_at = s->pos;
+    }
 }
 }  // namespace
 
@@ -673,8 +785,10 @@ void decode_file(const fs::path& p, uint64_t expected, const std::function<void(
     bool ok = FLAC__stream_decoder_process_until_end_of_stream(dec.d);
     FLAC__stream_decoder_finish(dec.d);
     if (!s.exception.empty()) throw Error(s.exception);
-    if (s.pos >= expected) return;
-    WM_ENSURE(ok && s.error.empty(), "decoding {}: {}", p.string(), s.error.empty() ? "decoder failed" : s.error);
+    // libFLAC reports a frame with a bad CRC and then delivers it as silence, so
+    // reaching `expected` samples proves nothing: only complaints past it are fine
+    if (s.error_at < expected) fail("decoding {}: {} at sample {}", p.string(), s.error, s.error_at);
+    WM_ENSURE(s.pos >= expected, "decoding {}: {} of {} samples ({})", p.string(), s.pos, expected, ok ? "early end of stream" : "decoder failed");
 }
 
 }  // namespace wm::flac
