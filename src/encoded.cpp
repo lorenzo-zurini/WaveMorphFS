@@ -100,8 +100,6 @@ std::optional<std::vector<TrackLayout>> load_layout(const AvImage& img, const Ra
 
 std::vector<TrackLayout> build_layout(const AvImage& img, const Ranges& ranges, const Cache* cache) {
     std::vector<TrackLayout> out;
-    size_t bytes = (img.bps + 7) / 8;
-    Bytes pcm_bytes;
     for (auto [s, e] : ranges) {
         TrackLayout tl;
         Md5 md5;
@@ -110,15 +108,9 @@ std::vector<TrackLayout> build_layout(const AvImage& img, const Ranges& ranges, 
             uint64_t j1 = std::min(nf, j0 + BATCH);
             uint64_t a = s + j0 * ENCODED_BLOCK, b = std::min(e, s + j1 * ENCODED_BLOCK);
             auto pcm = img.decode_range(a, b);
-            for (auto& fr : flac::encode_frames(slice(pcm, 0, size_t(b - a)), img.bps, img.sample_rate, ENCODED_BLOCK, j0))
-                tl.frame_sizes.push_back(uint32_t(fr.size()));
-            pcm_bytes.clear();
-            for (size_t i = 0; i < pcm[0].size(); i++)
-                for (auto& c : pcm) {
-                    uint32_t v = uint32_t(c[i]);
-                    for (size_t k = 0; k < bytes; k++) pcm_bytes.push_back(uint8_t(v >> (8 * k)));
-                }
-            md5.update(pcm_bytes);
+            auto chans = slice(pcm, 0, size_t(b - a));
+            for (auto& fr : flac::encode_frames(chans, img.bps, img.sample_rate, ENCODED_BLOCK, j0)) tl.frame_sizes.push_back(uint32_t(fr.size()));
+            md5_pcm(md5, chans, 0, size_t(b - a), img.bps);
         }
         tl.md5 = md5.finish();
         out.push_back(std::move(tl));

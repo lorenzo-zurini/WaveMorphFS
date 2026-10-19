@@ -99,32 +99,21 @@ std::vector<std::vector<int32_t>> FlacImage::decode_range(uint64_t s, uint64_t e
     for (uint64_t k = k0; k <= k1; k++) {
         size_t fa = size_t(index.offsets[k] - a), fb = size_t(index.offsets[k + 1] - a);
         auto dec = flac::decode_frame(std::span(buf).subspan(fa, fb - fa), si().bps, si().sample_rate);
-        uint64_t fs = k * bs();
-        uint64_t lo = std::max(s, fs) - fs, hi = std::min(e, frame_end(k)) - fs;
+        uint64_t first = k * bs();
+        uint64_t lo = std::max(s, first) - first, hi = std::min(e, frame_end(k)) - first;
         for (size_t c = 0; c < ch; c++) out[c].insert(out[c].end(), dec[c].begin() + ptrdiff_t(lo), dec[c].begin() + ptrdiff_t(hi));
     }
     return out;
 }
 
 std::vector<std::array<uint8_t, 16>> track_md5s(const FlacImage& img, const std::vector<std::pair<uint64_t, uint64_t>>& ranges) {
-    const auto& si = img.si();
-    size_t bytes = (si.bps + 7) / 8;
     std::vector<Md5> ctx(ranges.size());
-    Bytes pcm;
-    flac::decode_file(img.path, img.total(), [&](uint64_t fs, const std::vector<std::span<const int32_t>>& dec) {
-        uint64_t fe = fs + dec[0].size();
+    flac::decode_file(img.path, img.total(), [&](uint64_t first, const std::vector<std::span<const int32_t>>& dec) {
+        uint64_t last = first + dec[0].size();
         for (size_t ri = 0; ri < ranges.size(); ri++) {
             auto [s, e] = ranges[ri];
-            if (s >= fe || e <= fs) continue;
-            size_t lo = size_t(std::max(s, fs) - fs), hi = size_t(std::min(e, fe) - fs);
-            pcm.clear();
-            pcm.reserve((hi - lo) * dec.size() * bytes);
-            for (size_t i = lo; i < hi; i++)
-                for (auto& c : dec) {
-                    uint32_t v = uint32_t(c[i]);
-                    for (size_t k = 0; k < bytes; k++) pcm.push_back(uint8_t(v >> (8 * k)));
-                }
-            ctx[ri].update(pcm);
+            if (s >= last || e <= first) continue;
+            md5_pcm(ctx[ri], dec, size_t(std::max(s, first) - first), size_t(std::min(e, last) - first), img.si().bps);
         }
     });
     std::vector<std::array<uint8_t, 16>> out;

@@ -23,4 +23,8 @@ private:
     uint64_t len_ = 0;
 };
 
+/// Add samples [lo, hi) of per-channel audio the way FLAC's STREAMINFO MD5 takes
+/// them: interleaved, little-endian, ceil(bps/8) bytes per sample.
+void md5_pcm(Md5& md5, std::span<const std::span<const int32_t>> chans, size_t lo, size_t hi, uint32_t bps);
+
 }  // namespace wm

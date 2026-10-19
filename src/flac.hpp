@@ -119,7 +119,8 @@ std::vector<std::pair<std::string, std::string>> parse_vorbis(std::span<const ui
 Bytes build_vorbis(const std::string& vendor, const std::vector<std::pair<std::string, std::string>>& tags);
 /// Padding added to generated headers so tag editors can save in place.
 constexpr size_t EDIT_PADDING = 8192;
-/// "fLaC" + STREAMINFO + blocks.
+/// "fLaC" + STREAMINFO + blocks, all in memory: the plain reference the tests
+/// check header_segments against (generated files use header_segments).
 Bytes build_header(const std::array<uint8_t, 34>& si, const std::vector<MetaBlock>& blocks);
 /// A block of a generated header whose body is bytes, a range of the source file
 /// (e.g. a picture, by MetaBlock::offset) or zeros (padding).
@@ -140,7 +141,6 @@ struct FrameIndex {
     uint32_t block_size = 0;
     /// offsets[k] = start of frame k; offsets[nframes] = end of the last frame
     std::span<const uint64_t> offsets;
-    bool bps_in_header = false;
     /// owner of `offsets`: a vector, or the cache file mapped into memory (pages
     /// the kernel loads when a track is read and may drop again)
     std::shared_ptr<const void> storage;

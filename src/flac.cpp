@@ -334,6 +334,7 @@ Bytes build_vorbis(const std::string& vendor, const std::vector<std::pair<std::s
 Bytes build_header(const std::array<uint8_t, 34>& si, const std::vector<MetaBlock>& blocks) {
     Bytes out = {'f', 'L', 'a', 'C'};
     auto push = [&](uint8_t kind, std::span<const uint8_t> data, bool last) {
+        WM_ENSURE(data.size() < (1u << 24), "metadata block too large");
         out.push_back(kind | (last ? 0x80 : 0));
         put_be24(out, uint32_t(data.size()));
         append(out, data);
@@ -465,7 +466,6 @@ FrameIndex FrameIndex::build(const fs::path& path, const FlacMeta& meta) {
 
     FrameIndex idx;
     idx.block_size = bs;
-    idx.bps_in_header = h0.bps_code != 0;
     auto offs = std::make_shared<std::vector<uint64_t>>();
     offs->reserve(nframes + 1);
     offs->push_back(meta.audio_start);
