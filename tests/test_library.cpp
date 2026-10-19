@@ -268,3 +268,30 @@ TEST(removing_a_sidecar_does_not_turn_mtimes_back) {
     CHECK(e->file->describe().starts_with("passthrough:"));
     CHECK_MSG(e->mtime > before, "{} <= {}", e->mtime, before);
 }
+
+TEST(variable_blocksize_images_keep_their_front_cover) {
+    Scratch s("varcover");
+    sine(s.src / "a.flac", "flac", 4);
+    ok(run({"ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=c=red:s=16x16", "-frames:v", "1", (s.dir / "c.png").string()}));
+    ok(run({"metaflac", "--import-picture-from=3||||" + (s.dir / "c.png").string(), (s.src / "a.flac").string()}));
+    age(s.src / "a.flac");
+    atomic_write(s.src / "a.cue", two_track_cue("a.flac", "1"));
+    age(s.src / "a.cue");
+    auto lib = s.library();
+    auto split = lib->list_dir(s.src);
+    auto t = split->find("01 - One.flac");  // variable-blocksize, with the cover
+    CHECK(t);
+    fs::path v = s.dir / "lib" / "Var";
+    fs::create_directories(v);
+    atomic_write(v / "v.flac", t->file->read_at(0, size_t(t->file->size())));
+    age(v / "v.flac");
+    atomic_write(v / "v.cue", std::string_view("FILE \"v.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 00:00:40\n"));
+    age(v / "v.cue");
+    auto l = lib->list_dir(v);
+    CHECK(l->entries.size() == 2 && l->entries[0].file->describe().starts_with("flac-encoded:"));
+    fs::path out = s.dir / "out.flac";
+    atomic_write(out, l->entries[0].file->read_at(0, size_t(l->entries[0].file->size())));
+    CHECK(run({"flac", "-t", "-s", out.string()}).ok());
+    ok(run({"metaflac", "--export-picture-to=" + (s.dir / "back.png").string(), out.string()}));
+    CHECK_MSG(try_read_file(s.dir / "back.png") == try_read_file(s.dir / "c.png"), "the image's front cover");
+}

@@ -610,6 +610,12 @@ Library::ReadyImage Library::process_image(const fs::path& src) const {
     }
     auto meta = flac::FlacMeta::read(src);
     r.source_tags = Tags::from_pairs(meta.vorbis_comments());
+    // the front cover goes into the tracks, referenced in the image file
+    for (auto* b : meta.pictures())
+        if (b->data.size() <= MAX_COVER_BYTES && picture_type(b->data) == PICTURE_FRONT_COVER) {
+            r.pictures.push_back({b->kind, SrcRange{b->offset, b->data.size()}});
+            break;
+        }
     if (variable_blocksize(src, meta)) {
         // frames can only be copied from fixed-blocksize images; others are
         // decoded and re-encoded on the fly like non-FLAC images
@@ -617,11 +623,6 @@ Library::ReadyImage Library::process_image(const fs::path& src) const {
         return r;
     }
     auto idx = cache.index_for(src, meta);
-    for (auto* b : meta.pictures())
-        if (b->data.size() <= MAX_COVER_BYTES && picture_type(b->data) == PICTURE_FRONT_COVER) {
-            r.pictures.push_back({b->kind, SrcRange{b->offset, b->data.size()}});
-            break;
-        }
     r.flac = FlacImage::open(src, std::move(meta), std::move(idx));
     return r;
 }
@@ -1174,8 +1175,8 @@ std::optional<Entry> Library::standalone_track(ListingBuild& b, const std::strin
         if (auto f = b.sc->file(name)) tg.overlay(*f);
     }
     const Cover* cv = b.sc ? b.covers.get(b.sc->cover_for(name, nullptr)) : nullptr;
-    std::vector<flac::HeaderBlock> pictures;
-    if (cv) pictures.push_back({flac::BLOCK_PICTURE, flac_picture(*cv)});
+    std::vector<flac::HeaderBlock> pictures = ready.pictures;
+    if (cv) pictures = {{flac::BLOCK_PICTURE, flac_picture(*cv)}};
     mt = output_mtime(std::max(mt, results_mtime(ready, ranges)), cv);
     return Entry::make_tagged(name, std::make_shared<EncodedTrack>(av, 0, av->total, tg, (*layout)[0], pictures), mt, EDIT_FILE, name, "flac");
 }
@@ -1235,14 +1236,14 @@ std::optional<std::vector<Entry>> Library::image_tracks(ListingBuild& b, const C
             vf = std::make_shared<WvTrack>(ready.wv, s, e, tg, wv_layout[i], cv);
         } else {
             // a sidecar cover replaces the image's picture
-            std::vector<flac::HeaderBlock> cover_block;
-            if (cv) cover_block.push_back({flac::BLOCK_PICTURE, flac_picture(*cv)});
+            std::vector<flac::HeaderBlock> pictures = ready.pictures;
+            if (cv) pictures = {{flac::BLOCK_PICTURE, flac_picture(*cv)}};
             if (ready.av) {
-                vf = std::make_shared<EncodedTrack>(ready.av, s, e, tg, (*layout)[i], cover_block);
+                vf = std::make_shared<EncodedTrack>(ready.av, s, e, tg, (*layout)[i], pictures);
             } else {
                 std::optional<std::array<uint8_t, 16>> md5;
                 if (auto it = md5s.find({s, e}); it != md5s.end()) md5 = it->second;
-                vf = std::make_shared<FlacTrack>(img, s, e, tg, cv ? cover_block : ready.pictures, md5);
+                vf = std::make_shared<FlacTrack>(img, s, e, tg, pictures, md5);
             }
         }
         out.push_back(Entry::make_tagged(std::move(name), std::move(vf), output_mtime(mt, cv), EDIT_TRACK, std::move(key), ext));

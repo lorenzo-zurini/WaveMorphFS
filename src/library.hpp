@@ -187,7 +187,7 @@ private:
         std::shared_ptr<const WvImage> wv;
         std::shared_ptr<const AvImage> av;
         Tags source_tags;
-        std::vector<flac::HeaderBlock> pictures;  // referenced in the image file, not held
+        std::vector<flac::HeaderBlock> pictures;  // FLAC images: the front cover, referenced in the image file
     };
     template <class T>
     using Work = detail::Work<T>;
