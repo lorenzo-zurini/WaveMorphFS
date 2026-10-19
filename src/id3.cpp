@@ -2,12 +2,23 @@
 #include "id3.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <map>
+#include <tuple>
 
 namespace wm::id3 {
 
 namespace {
+
+/// Padding after the frames, so tag editors can save in place.
+constexpr uint64_t PADDING = 4096;
+/// Sizes in ID3v2 headers are 28-bit synchsafe integers.
+constexpr uint64_t MAX_SIZE = 1u << 28;
+
+// frame format flags (second flag byte) of ID3v2.4 and ID3v2.3
+constexpr uint8_t V24_GROUP = 0x40, V24_COMPRESSED = 0x08, V24_ENCRYPTED = 0x04, V24_UNSYNC = 0x02, V24_DATA_LENGTH = 0x01;
+constexpr uint8_t V23_COMPRESSED = 0x80, V23_ENCRYPTED = 0x40, V23_GROUP = 0x20;
 
 /// Where a tag name goes in ID3v2.4.
 struct Target {
@@ -78,7 +89,10 @@ Target target_for(const std::string& key) {
     return raw ? Target{Target::Text, k} : Target{Target::Txxx, key};
 }
 
-std::array<uint8_t, 4> synchsafe(uint32_t n) { return {uint8_t(n >> 21 & 0x7F), uint8_t(n >> 14 & 0x7F), uint8_t(n >> 7 & 0x7F), uint8_t(n & 0x7F)}; }
+std::array<uint8_t, 4> synchsafe(uint64_t n) {
+    WM_ENSURE(n < MAX_SIZE, "ID3 size {} does not fit 28 bits", n);
+    return {uint8_t(n >> 21 & 0x7F), uint8_t(n >> 14 & 0x7F), uint8_t(n >> 7 & 0x7F), uint8_t(n & 0x7F)};
+}
 
 uint32_t unsynchsafe(const uint8_t* b) {
     uint32_t v = 0;
@@ -94,6 +108,10 @@ Bytes deunsync(std::span<const uint8_t> b) {
         if (b[i] == 0xFF && i + 1 < b.size() && b[i + 1] == 0) i++;
     }
     return out;
+}
+
+bool valid_id(const uint8_t* p, size_t n) {
+    return std::all_of(p, p + n, [](uint8_t c) { return (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'); });
 }
 
 /// Split at the encoding's string terminator.
@@ -137,14 +155,13 @@ std::string decode_text(uint8_t enc, std::span<const uint8_t> b) {
     return lossy_utf8(b);
 }
 
-/// Frame body without a data length indicator; nullopt if compressed/encrypted.
+/// Frame body without the bytes its flags add (group id, data length
+/// indicator); nullopt if compressed or encrypted.
 std::optional<std::span<const uint8_t>> body_of(const Frame& f) {
-    if (f.flags[1] & 0x0C) return std::nullopt;
-    if (f.flags[1] & 0x01) {
-        if (f.data.size() < 4) return std::nullopt;
-        return std::span(f.data).subspan(4);
-    }
-    return std::span<const uint8_t>(f.data);
+    if (f.flags[1] & (V24_COMPRESSED | V24_ENCRYPTED)) return std::nullopt;
+    size_t skip = (f.flags[1] & V24_GROUP ? 1 : 0) + (f.flags[1] & V24_DATA_LENGTH ? 4 : 0);
+    if (f.data.size() < skip) return std::nullopt;
+    return std::span(f.data).subspan(skip);
 }
 
 /// Description of a TXXX/COMM/USLT frame.
@@ -157,9 +174,25 @@ std::optional<std::string> description(const Frame& f) {
     return decode_text(enc, split_terminated(enc, b->subspan(skip)).first);
 }
 
-Frame make_frame(const char* id, Bytes data) {
+/// The values of a text frame body (encoding byte, then terminated strings).
+std::vector<std::string> text_values(std::span<const uint8_t> b) {
+    std::vector<std::string> out;
+    if (b.empty()) return out;
+    uint8_t enc = b[0];
+    auto rest = b.subspan(1);
+    while (!rest.empty()) {
+        auto [v, next] = split_terminated(enc, rest);
+        std::string s = decode_text(enc, v);
+        if (!s.empty()) out.push_back(s);
+        if (next.size() == rest.size()) break;
+        rest = next;
+    }
+    return out;
+}
+
+Frame make_frame(std::string_view id, Bytes data) {
     Frame f;
-    std::memcpy(f.id, id, 4);
+    std::memcpy(f.id, id.data(), 4);
     f.data = std::move(data);
     return f;
 }
@@ -176,7 +209,7 @@ std::string joined(const std::vector<std::string>& vs, std::string_view sep) {
 Frame text_frame(const std::string& id, const std::vector<std::string>& values) {
     Bytes body = {3};  // UTF-8
     append(body, joined(values, std::string_view("\0", 1)));
-    return make_frame(id.c_str(), std::move(body));
+    return make_frame(id, std::move(body));
 }
 
 Frame txxx_frame(const std::string& desc, const std::vector<std::string>& values) {
@@ -196,17 +229,18 @@ Frame lang_frame(const char* id, const std::string& lang, const std::string& tex
     return make_frame(id, std::move(body));
 }
 
+/// First value of the text frame `id`.
 std::optional<std::string> frame_text(const std::vector<Frame>& frames, std::string_view id) {
     for (auto& f : frames)
-        if (f.sid() == id && !f.data.empty()) {
-            std::string t = decode_text(f.data[0], std::span(f.data).subspan(1));
-            while (!t.empty() && t.back() == '\0') t.pop_back();
-            return trim(t);
-        }
+        if (f.sid() == id)
+            if (auto b = body_of(f)) {
+                auto vs = text_values(*b);
+                return vs.empty() ? "" : trim(vs[0]);
+            }
     return std::nullopt;
 }
 
-/// Replace the ID3v2.3-only date frames with their 2.4 counterparts.
+/// Replace the ID3v2.3-only frames that have ID3v2.4 counterparts.
 std::vector<Frame> upgrade_v23(std::vector<Frame> frames) {
     auto year = frame_text(frames, "TYER");
     auto ddmm = frame_text(frames, "TDAT");
@@ -215,6 +249,8 @@ std::vector<Frame> upgrade_v23(std::vector<Frame> frames) {
         auto i = f.sid();
         return i == "TYER" || i == "TDAT" || i == "TIME" || i == "TRDA" || i == "TORY" || i == "TSIZ";
     });
+    for (auto& f : frames)
+        if (f.sid() == "IPLS") std::memcpy(f.id, "TIPL", 4);  // same layout: pairs of strings
     auto has = [&](std::string_view id) { return std::any_of(frames.begin(), frames.end(), [&](auto& f) { return f.sid() == id; }); };
     if (year && !year->empty() && !has("TDRC")) {
         std::string date = *year;
@@ -226,50 +262,154 @@ std::vector<Frame> upgrade_v23(std::vector<Frame> frames) {
     return frames;
 }
 
+/// ID3v2.2 frame id -> ID3v2.3 id (dates are upgraded to v2.4 with the v2.3 ones).
+/// iTunes wrote v2.2 tags for years; RVA/EQU (other layouts in later versions)
+/// and the obsolete link/encryption frames have no counterpart and are dropped.
+const std::map<std::string_view, std::string_view> V22_IDS = {
+    {"BUF", "RBUF"}, {"CNT", "PCNT"}, {"COM", "COMM"}, {"CRA", "AENC"}, {"ETC", "ETCO"}, {"GEO", "GEOB"}, {"IPL", "IPLS"},
+    {"MCI", "MCDI"}, {"MLL", "MLLT"}, {"POP", "POPM"}, {"REV", "RVRB"}, {"SLT", "SYLT"}, {"STC", "SYTC"}, {"TAL", "TALB"},
+    {"TBP", "TBPM"}, {"TCM", "TCOM"}, {"TCO", "TCON"}, {"TCP", "TCMP"}, {"TCR", "TCOP"}, {"TDA", "TDAT"}, {"TDY", "TDLY"},
+    {"TEN", "TENC"}, {"TFT", "TFLT"}, {"TIM", "TIME"}, {"TKE", "TKEY"}, {"TLA", "TLAN"}, {"TLE", "TLEN"}, {"TMT", "TMED"},
+    {"TOA", "TOPE"}, {"TOF", "TOFN"}, {"TOL", "TOLY"}, {"TOR", "TORY"}, {"TOT", "TOAL"}, {"TP1", "TPE1"}, {"TP2", "TPE2"},
+    {"TP3", "TPE3"}, {"TP4", "TPE4"}, {"TPA", "TPOS"}, {"TPB", "TPUB"}, {"TRC", "TSRC"}, {"TRD", "TRDA"}, {"TRK", "TRCK"},
+    {"TS2", "TSO2"}, {"TSA", "TSOA"}, {"TSC", "TSOC"}, {"TSI", "TSIZ"}, {"TSP", "TSOP"}, {"TSS", "TSSE"}, {"TST", "TSOT"},
+    {"TT1", "TIT1"}, {"TT2", "TIT2"}, {"TT3", "TIT3"}, {"TXT", "TEXT"}, {"TXX", "TXXX"}, {"TYE", "TYER"}, {"UFI", "UFID"},
+    {"ULT", "USLT"}, {"WAF", "WOAF"}, {"WAR", "WOAR"}, {"WAS", "WOAS"}, {"WCM", "WCOM"}, {"WCP", "WCOP"}, {"WPB", "WPUB"},
+    {"WXX", "WXXX"},
+};
+
+/// An ID3v2.2 frame as ID3v2.3; nullopt if it has no later counterpart.
+std::optional<Frame> from_v22(std::string_view id, std::span<const uint8_t> data) {
+    if (id == "PIC") {
+        // PIC has a three-letter image format where APIC has a MIME type
+        if (data.size() < 4) return std::nullopt;
+        std::string fmt = lower(str_of(data.subspan(1, 3)));
+        Bytes b = {data[0]};
+        append(b, fmt == "jpg" ? std::string("image/jpeg") : "image/" + fmt);
+        b.push_back(0);
+        append(b, data.subspan(4));
+        return make_frame("APIC", std::move(b));
+    }
+    auto it = V22_IDS.find(id);
+    if (it == V22_IDS.end()) return std::nullopt;
+    return make_frame(it->second, Bytes(data.begin(), data.end()));
+}
+
+/// ID3v2.3 frame flags and the bytes they add, moved to their ID3v2.4 places:
+/// v2.3 puts the decompressed size, encryption method and group id after the
+/// header in that order; v2.4 has group id, encryption method, then the
+/// decompressed size as a synchsafe data length indicator. nullopt if the frame
+/// is too short for what its flags announce.
+std::optional<Frame> from_v23(Frame f) {
+    uint8_t st = f.flags[0], fmt = f.flags[1];
+    size_t p = 0;
+    std::optional<uint32_t> size;
+    std::optional<uint8_t> method, group;
+    if (fmt & V23_COMPRESSED) {
+        if (f.data.size() < 4) return std::nullopt;
+        size = be32(f.data.data());
+        if (*size >= MAX_SIZE) return std::nullopt;  // not expressible in v2.4 (nor plausible)
+        p = 4;
+    }
+    if (fmt & V23_ENCRYPTED) {
+        if (f.data.size() <= p) return std::nullopt;
+        method = f.data[p++];
+    }
+    if (fmt & V23_GROUP) {
+        if (f.data.size() <= p) return std::nullopt;
+        group = f.data[p++];
+    }
+    // status flags: tag alter, file alter and read-only preservation, one bit lower in v2.4
+    f.flags[0] = uint8_t((st & 0xE0) >> 1);
+    f.flags[1] = uint8_t((group ? V24_GROUP : 0) | (method ? V24_ENCRYPTED : 0) | (size ? V24_COMPRESSED | V24_DATA_LENGTH : 0));
+    std::array<uint8_t, 6> added{};
+    size_t n = 0;
+    if (group) added[n++] = *group;
+    if (method) added[n++] = *method;
+    if (size)
+        for (auto b : synchsafe(*size)) added[n++] = b;
+    f.data.erase(f.data.begin(), f.data.begin() + ptrdiff_t(p));
+    f.data.insert(f.data.begin(), added.begin(), added.begin() + ptrdiff_t(n));
+    return f;
+}
+
+/// Whether the frames from `pos` on, read with synchsafe or with plain 32-bit
+/// sizes, end exactly at the padding or the end of the tag.
+bool frames_fit(std::span<const uint8_t> body, size_t pos, bool synchsafe_sizes) {
+    while (pos + 10 <= body.size() && body[pos] != 0) {
+        if (!valid_id(&body[pos], 4)) return false;
+        uint64_t fs = synchsafe_sizes ? unsynchsafe(&body[pos + 4]) : be32(&body[pos + 4]);
+        if (fs > body.size() - pos - 10) return false;
+        pos += 10 + size_t(fs);
+    }
+    return true;
+}
+
 }  // namespace
+
+std::optional<uint64_t> tag_length(std::span<const uint8_t> head) {
+    if (head.size() < 10 || std::memcmp(head.data(), "ID3", 3) != 0) return std::nullopt;
+    bool footer = head[3] == 4 && (head[5] & 0x10);
+    return 10 + uint64_t(unsynchsafe(&head[6])) + (footer ? 10 : 0);
+}
 
 std::pair<SourceTag, size_t> parse_tag(std::span<const uint8_t> b) {
     WM_ENSURE(b.size() >= 10, "truncated ID3 tag");
     uint8_t major = b[3], hflags = b[5];
     size_t size = unsynchsafe(&b[6]);
     size_t total = 10 + size + (major == 4 && (hflags & 0x10) ? 10 : 0);
-    WM_ENSURE(major == 3 || major == 4, "ID3v2.{} tag", major);
+    WM_ENSURE(major >= 2 && major <= 4, "ID3v2.{} tag", major);
+    WM_ENSURE(!(major == 2 && (hflags & 0x40)), "compressed ID3v2.2 tag");
     WM_ENSURE(b.size() >= 10 + size, "truncated ID3 tag");
     Bytes body(b.begin() + 10, b.begin() + 10 + ptrdiff_t(size));
-    if (major == 3 && (hflags & 0x80)) body = deunsync(body);
+    if (major < 4 && (hflags & 0x80)) body = deunsync(body);
     size_t pos = 0;
-    if ((hflags & 0x40) && body.size() >= 4) pos = major == 3 ? 4 + be32(&body[0]) : unsynchsafe(&body[0]);
+    if (major > 2 && (hflags & 0x40) && body.size() >= 4) pos = major == 3 ? 4 + size_t(be32(&body[0])) : unsynchsafe(&body[0]);
+    // v2.4 frame sizes are synchsafe, but iTunes and others wrote plain ones:
+    // take those when only they lead from frame to frame (as mutagen does)
+    bool plain_sizes = major == 3 || (major == 4 && !frames_fit(body, pos, true) && frames_fit(body, pos, false));
+    size_t id_len = major == 2 ? 3 : 4, head_len = major == 2 ? 6 : 10;
     SourceTag tag;
-    while (pos + 10 <= body.size() && body[pos] != 0) {
-        Frame f;
-        std::memcpy(f.id, &body[pos], 4);
-        size_t fs = major == 4 ? unsynchsafe(&body[pos + 4]) : be32(&body[pos + 4]);
-        f.flags[0] = body[pos + 8];
-        f.flags[1] = body[pos + 9];
-        WM_ENSURE(pos + 10 + fs <= body.size(), "frame overruns tag");
-        f.data.assign(body.begin() + ptrdiff_t(pos + 10), body.begin() + ptrdiff_t(pos + 10 + fs));
-        pos += 10 + fs;
-        if (!std::all_of(f.id, f.id + 4, [](char c) { return (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'); })) break;
+    while (pos + head_len <= body.size() && body[pos] != 0) {
+        // anything that is not a frame (non-zero padding, junk) ends the frames
+        if (!valid_id(&body[pos], id_len)) break;
+        uint64_t fs = major == 2 ? uint64_t(body[pos + 3]) << 16 | body[pos + 4] << 8 | body[pos + 5]
+                      : plain_sizes ? be32(&body[pos + 4]) : unsynchsafe(&body[pos + 4]);
+        if (fs > body.size() - pos - head_len) {
+            debug("ID3: frame {} overruns the tag; ignoring the rest", str_of(std::span(body).subspan(pos, id_len)));
+            break;
+        }
+        size_t at = pos;
+        pos += head_len + size_t(fs);
+        std::string_view id = str_of(std::span(body).subspan(at, id_len));
+        auto data = std::span(body).subspan(at + head_len, size_t(fs));
+        if (major == 2) {
+            if (auto f = from_v22(id, data)) tag.frames.push_back(std::move(*f));
+            continue;
+        }
+        Frame f = make_frame(id, Bytes(data.begin(), data.end()));
+        f.flags[0] = body[at + 8];
+        f.flags[1] = body[at + 9];
         if (major == 3) {
-            // ID3v2.3: compressed/encrypted/grouped frames have a different layout in 2.4
-            if (f.flags[1] & 0xE0) continue;
-            f.flags[0] = f.flags[1] = 0;
-        } else if ((hflags & 0x80) || (f.flags[1] & 0x02)) {
+            auto g = from_v23(std::move(f));
+            if (!g) continue;
+            f = std::move(*g);
+        } else if ((hflags & 0x80) || (f.flags[1] & V24_UNSYNC)) {
             // ID3v2.4 unsynchronises per frame; the header flag means all of them
             // (writers set it without flagging the frames). Frames are kept plain,
             // so the tag is written without unsynchronisation and new frames and
-            // pictures can sit next to them.
-            size_t dli = (f.flags[1] & 0x01) ? 4 : 0;
-            if (f.data.size() >= dli) {
-                Bytes plain(f.data.begin(), f.data.begin() + ptrdiff_t(dli));
-                append(plain, deunsync(std::span(f.data).subspan(dli)));
+            // pictures can sit next to them. The bytes the flags add come first.
+            size_t added = (f.flags[1] & V24_GROUP ? 1 : 0) + (f.flags[1] & V24_ENCRYPTED ? 1 : 0) + (f.flags[1] & V24_DATA_LENGTH ? 4 : 0);
+            if (f.data.size() >= added) {
+                Bytes plain(f.data.begin(), f.data.begin() + ptrdiff_t(added));
+                append(plain, deunsync(std::span(f.data).subspan(added)));
                 f.data = std::move(plain);
             }
-            f.flags[1] &= uint8_t(~0x02);
+            f.flags[1] &= uint8_t(~V24_UNSYNC);
         }
         tag.frames.push_back(std::move(f));
     }
-    if (major == 3) tag.frames = upgrade_v23(std::move(tag.frames));
+    if (major < 4) tag.frames = upgrade_v23(std::move(tag.frames));
     return {std::move(tag), total};
 }
 
@@ -332,22 +472,6 @@ void apply(std::vector<Frame>& frames, const Tags& overlay) {
     }
 }
 
-Bytes serialize(const std::vector<Frame>& frames) {
-    Bytes body;
-    for (auto& f : frames) {
-        body.insert(body.end(), f.id, f.id + 4);
-        append(body, synchsafe(uint32_t(f.data.size())));
-        body.push_back(f.flags[0]);
-        body.push_back(f.flags[1]);
-        append(body, f.data);
-    }
-    body.insert(body.end(), 4096, 0);  // padding, so tag editors can save in place
-    Bytes out = {'I', 'D', '3', 4, 0, 0};
-    append(out, synchsafe(uint32_t(body.size())));
-    append(out, body);
-    return out;
-}
-
 Tags read_tags(std::span<const uint8_t> tag) {
     static const std::map<std::string, std::string> names = {
         {"TIT2", "TITLE"}, {"TPE1", "ARTIST"}, {"TPE2", "ALBUMARTIST"}, {"TPE3", "CONDUCTOR"}, {"TPE4", "REMIXER"},
@@ -361,20 +485,6 @@ Tags read_tags(std::span<const uint8_t> tag) {
     Tags t;
     if (tag.size() < 10 || std::memcmp(tag.data(), "ID3", 3) != 0) return t;
     auto frames = parse_tag(tag).first.frames;
-    auto values = [](std::span<const uint8_t> b) {
-        std::vector<std::string> out;
-        if (b.empty()) return out;
-        uint8_t enc = b[0];
-        auto rest = b.subspan(1);
-        while (!rest.empty()) {
-            auto [v, next] = split_terminated(enc, rest);
-            std::string s = decode_text(enc, v);
-            if (!s.empty()) out.push_back(s);
-            if (next.size() == rest.size()) break;
-            rest = next;
-        }
-        return out;
-    };
     for (auto& f : frames) {
         auto body = body_of(f);
         if (!body || body->empty()) continue;
@@ -382,9 +492,11 @@ Tags read_tags(std::span<const uint8_t> tag) {
         if (id == "TXXX") {
             uint8_t enc = (*body)[0];
             auto [d, rest] = split_terminated(enc, body->subspan(1));
-            std::vector<uint8_t> tmp = {enc};
-            tmp.insert(tmp.end(), rest.begin(), rest.end());
-            for (auto& v : values(tmp)) t.add(decode_text(enc, d), v);
+            std::string name = decode_text(enc, d);
+            if (name.empty()) continue;  // a value without a name is no tag
+            Bytes values = {enc};
+            append(values, rest);
+            for (auto& v : text_values(values)) t.add(name, v);
         } else if (id == "COMM" || id == "USLT") {
             uint8_t enc = (*body)[0];
             if (body->size() < 4) continue;
@@ -394,14 +506,14 @@ Tags read_tags(std::span<const uint8_t> tag) {
             while (!v.empty() && v.back() == '\0') v.pop_back();  // optional terminator
             t.add(id == "COMM" ? "COMMENT" : "LYRICS", v);
         } else if (id == "TRCK" || id == "TPOS") {
-            auto vs = values(*body);
+            auto vs = text_values(*body);
             if (vs.empty()) continue;
             auto p = split(vs[0], '/');
             t.add(id == "TRCK" ? "TRACKNUMBER" : "DISCNUMBER", trim(p[0]));
             if (p.size() > 1) t.add(id == "TRCK" ? "TRACKTOTAL" : "DISCTOTAL", trim(p[1]));
         } else if (id[0] == 'T' || id == "MVNM") {
             auto it = names.find(id);
-            for (auto& v : values(*body)) t.add(it != names.end() ? it->second : id, v);
+            for (auto& v : text_values(*body)) t.add(it != names.end() ? it->second : id, v);
         }
     }
     return t;
@@ -409,36 +521,51 @@ Tags read_tags(std::span<const uint8_t> tag) {
 
 namespace {
 
-/// serialize(), with the pictures replaced by `cover` (referenced, not copied).
-std::vector<Seg> serialize_segments(std::vector<Frame> frames, const Cover* cover) {
-    if (!cover) return {serialize(frames)};
-    std::erase_if(frames, [](const Frame& f) { return f.sid() == "APIC"; });
+void put_frame_header(Bytes& out, std::string_view id, const uint8_t flags[2], uint64_t size) {
+    append(out, id);
+    append(out, synchsafe(size));
+    out.push_back(flags[0]);
+    out.push_back(flags[1]);
+}
+
+/// Tag header and frames, then (when `apic` has bytes) the header of an APIC
+/// frame of `apic` bytes; the tag size counts them and the padding.
+Bytes tag_head(const std::vector<Frame>& frames, uint64_t apic) {
     Bytes body;
     for (auto& f : frames) {
-        body.insert(body.end(), f.id, f.id + 4);
-        append(body, synchsafe(uint32_t(f.data.size())));
-        body.push_back(f.flags[0]);
-        body.push_back(f.flags[1]);
+        put_frame_header(body, f.sid(), f.flags, f.data.size());
         append(body, f.data);
     }
-    auto apic = id3_apic(*cover);
-    uint64_t apic_len = 0;
-    for (auto& s : apic) apic_len += seg_size(s);
-    append(body, std::string_view("APIC"));
-    append(body, synchsafe(uint32_t(apic_len)));
-    body.push_back(0);
-    body.push_back(0);
-    uint64_t total = body.size() + apic_len + 4096;
+    static const uint8_t no_flags[2] = {0, 0};
+    if (apic) put_frame_header(body, "APIC", no_flags, apic);
     Bytes out = {'I', 'D', '3', 4, 0, 0};
-    append(out, synchsafe(uint32_t(total)));
+    append(out, synchsafe(body.size() + apic + PADDING));
     append(out, body);
-    std::vector<Seg> segs = {std::move(out)};
+    return out;
+}
+
+/// serialize(), with the pictures replaced by `cover` (referenced, not copied).
+std::vector<Seg> serialize_segments(std::vector<Frame> frames, const Cover* cover) {
+    std::vector<Seg> apic;
+    uint64_t apic_len = 0;
+    if (cover) {
+        std::erase_if(frames, [](const Frame& f) { return f.sid() == "APIC"; });
+        apic = id3_apic(*cover);
+        for (auto& s : apic) apic_len += seg_size(s);
+    }
+    std::vector<Seg> segs = {tag_head(frames, apic_len)};
     segs.insert(segs.end(), apic.begin(), apic.end());
-    segs.push_back(Zeros{4096});  // padding, so tag editors can save in place
+    segs.push_back(Zeros{PADDING});
     return segs;
 }
 
 }  // namespace
+
+Bytes serialize(const std::vector<Frame>& frames) {
+    Bytes out = tag_head(frames, 0);
+    out.resize(out.size() + PADDING);
+    return out;
+}
 
 std::vector<Seg> build_segments(const Tags& tags, const Cover* cover) {
     std::vector<Frame> frames;
@@ -454,38 +581,16 @@ Bytes build(const Tags& tags) {
 
 std::pair<std::vector<Seg>, uint64_t> retag_at(const File& f, uint64_t pos, const Tags& overlay, const Cover* cover) {
     uint8_t head[10] = {};
-    size_t n = f.read_at(head, 10, pos);
     SourceTag src;
     uint64_t len = 0;
-    if (n == 10 && std::memcmp(head, "ID3", 3) == 0) {
-        size_t total = 10 + unsynchsafe(&head[6]);
-        Bytes b(total);
-        f.read_exact_at(b.data(), total, pos);
-        auto [tag, l] = parse_tag(b);
-        src = std::move(tag);
-        len = l;
-    }
+    if (f.read_at(head, 10, pos) == 10)
+        if (auto total = tag_length(head)) {
+            auto [tag, l] = parse_tag(f.read_vec(pos, size_t(*total)));
+            src = std::move(tag);
+            len = l;
+        }
     apply(src.frames, overlay);
     return {serialize_segments(std::move(src.frames), cover), len};
 }
-
-std::pair<Bytes, uint64_t> retag_at(const File& f, uint64_t pos, const Tags& overlay) {
-    uint8_t head[10] = {};
-    size_t n = f.read_at(head, 10, pos);
-    SourceTag src;
-    uint64_t len = 0;
-    if (n == 10 && std::memcmp(head, "ID3", 3) == 0) {
-        size_t total = 10 + unsynchsafe(&head[6]);
-        Bytes b(total);
-        f.read_exact_at(b.data(), total, pos);
-        auto [tag, l] = parse_tag(b);
-        src = std::move(tag);
-        len = l;
-    }
-    apply(src.frames, overlay);
-    return {serialize(src.frames), len};
-}
-
-std::pair<Bytes, uint64_t> retag_mp3(const fs::path& p, const Tags& overlay) { return retag_at(File(p), 0, overlay); }
 
 }  // namespace wm::id3
