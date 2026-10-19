@@ -11,28 +11,71 @@ them once on their next scan.
 
 ## [0.2.0] - unreleased
 
+A release-readiness pass: every part of the code was reviewed, and the bugs,
+duplication and rough edges found were fixed. Generated files change for the
+cases listed below, so their modification times move forward once.
+
 ### Added
 - 32-bit floating-point WavPack images (which FLAC cannot hold) are split into
   WavPack tracks made of the image's own blocks; only each track's first block
   and a partial last block are encoded again. Standalone float `.wv` files get
   sidecar tags as APEv2. Tags on WavPack files can be edited on the mount.
 - `wavemorphfs --version`; the mount logs its version when it starts.
+- `--prescan 0` turns the periodic re-walk off. `tags-init` reads DSF, MP3, M4A
+  and WavPack files too.
 - Build options `WAVEMORPH_WERROR` and `WAVEMORPH_SANITIZE`; CI runs the test
-  suite under AddressSanitizer and UndefinedBehaviorSanitizer.
-- GitHub releases with notes from this changelog.
+  suite under AddressSanitizer and UndefinedBehaviorSanitizer, and tags create
+  GitHub releases with notes from this changelog.
+- Tests for SACD parsing, DSF output and the DST decoder (on synthetic discs,
+  checked against FFmpeg), the FUSE layer, listings, sidecar edits and the tag
+  parsers (including malformed input): 40 tests became more than 100.
 
 ### Changed
-- The container image no longer ships the `ffmpeg` and `flac` tools (only the
-  libraries the filesystem links), which more than halves its size.
-  `verify` and `compare` need those tools; run them from a source build.
-- The entrypoint gives the mount, tags and cache directories to `PUID`/`PGID`
-  when Docker Compose created them as root, and stops the filesystem cleanly.
+- The mount enforces file permissions (`default_permissions`): only the user
+  running WaveMorphFS (and root) can edit tags through it.
+- The container image ships only the libraries the filesystem links, not the
+  `ffmpeg` and `flac` tools (540 MB → 246 MB); `verify` and `compare` need them,
+  so run those from a source build. The documented compose setup drops every
+  capability the container does not need.
+- The entrypoint gives the mount, tags and cache folders to `PUID`/`PGID` when
+  Docker Compose created them as root, and stops the filesystem cleanly.
+- One table drives tag-name synonyms and the ID3/MP4 frame mapping. Names from
+  other conventions (`aART`, `DISK`, `trkn`, `SORT_*`, ...) reach the right
+  frame or atom, and fields that were written twice under two names are written
+  once. Names keep the spelling given.
+- Lyrics in several languages are kept side by side in MP3s.
+- Background jobs that fail are remembered per file version instead of being
+  retried on every listing, and the image stays visible as it is; failures are
+  listed in `status.txt`.
+- Edits on the mount are visible immediately instead of after about 2 s.
+- SACD DST decoding is faster, and readers no longer cancel each other's
+  read-ahead.
 
 ### Fixed
-- A race between path lookups and directory listing rebuilds could read freed
-  memory (seen as occasional `std::bad_alloc` errors on `getattr`).
-- MP3 files whose ID3v2.4 tag is flagged as unsynchronised now get sidecar
-  covers, and their UTF-16 text is read correctly.
+- Reads of freed memory in path lookups and write sessions (seen as occasional
+  `std::bad_alloc` errors), and exceptions that could end the mount.
+- Sidecar track keys spelled differently (`"05"` / `"5"`, `"2-5"` / `"2-05"`)
+  were separate tables, so edits on the mount could be lost or hidden.
+- Editing a multichannel SACD track renamed its stereo twin.
+- A corrupt M4A box size could hang a folder listing; malformed ID3, MP4, APEv2,
+  DSF, SACD and CUE data is bounds-checked throughout.
+- A sidecar with a syntax error no longer drops the folder's other sidecar and
+  pinned names (the previous version is used until it is fixed).
+- Files copied into the library are re-listed once they stop changing, so a
+  half-copied file's size is not kept.
+- Sidecar writes are durable (synced before they replace the old file).
+- MP3s with unsynchronised ID3v2.4 tags get sidecar covers; ID3v2.2 tags and
+  iTunes-style frame sizes are read; MP3 `TXXX` and M4A freeform items are
+  replaced under any spelling of their name.
+- 24 SACDs carried an empty `CATALOGNUMBER` tag; it is now left out. A disc with
+  only a multichannel area is listed once.
+- FLAC images whose trailing tag happened to look like a frame ending lost their
+  last track; very short tracks could get a block shorter than FLAC allows.
+- Covers are never enlarged, and JPEG sizes are found past large EXIF/ICC data.
+- UTF-16 CUE sheets with a damaged character, CR-only CUE sheets, and invalid
+  UTF-8 in tags are handled.
+- Disc numbers, names that collide, emptied folders on the mount, root-folder
+  targets and mtimes that could go backwards are handled consistently.
 
 ## [0.1.9] - 2026-10-07
 
