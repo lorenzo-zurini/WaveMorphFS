@@ -2,9 +2,8 @@
 #include "encoded.hpp"
 
 #include <algorithm>
-#include <cmath>
+#include <cstdlib>
 #include <cstring>
-#include <numbers>
 #include <tuple>
 
 #include "cache.hpp"
@@ -45,19 +44,20 @@ std::vector<std::span<const int32_t>> slice(const std::vector<std::vector<int32_
 const std::array<uint8_t, 16>& encoder_fingerprint() {
     static const auto fp = [] {
         // a few frames per common shape, from a signal that exercises LPC and
-        // stereo decisions; the ranges cover what layouts are measured for
+        // stereo decisions (two triangle waves and noise, made with integers only
+        // so that the signal itself is the same everywhere)
         Md5 md5;
         for (auto [ch, bps, rate] : {std::tuple{2u, 16u, 44100u}, {2u, 24u, 96000u}, {1u, 24u, 48000u}, {6u, 16u, 48000u}, {2u, 8u, 22050u}}) {
             size_t n = 3 * ENCODED_BLOCK + 123;
             std::vector<std::vector<int32_t>> pcm(ch, std::vector<int32_t>(n));
-            double amp = double((1 << (bps - 1)) - 1) * 0.7;
+            int64_t amp = (int64_t(1) << (bps - 1)) / 4;
+            auto triangle = [](int64_t i, int64_t period, int64_t a) { return std::abs((i % period) * 4 * a / period - 2 * a) - a; };
             uint32_t seed = 1;
             for (size_t c = 0; c < ch; c++)
                 for (size_t i = 0; i < n; i++) {
                     seed = seed * 1664525u + 1013904223u;
-                    double t = double(i) / rate;
-                    double v = 0.6 * std::sin(t * 2 * std::numbers::pi * 440 * double(c + 1)) + 0.3 * std::sin(t * 2 * std::numbers::pi * 97) + 0.1 * (double(seed >> 8) / double(1 << 24) - 0.5);
-                    pcm[c][i] = int32_t(std::lround(amp * v));
+                    int64_t noise = int64_t(seed >> 16) * amp / 4 / 65536;
+                    pcm[c][i] = int32_t(triangle(int64_t(i), 100 + 37 * int64_t(c), amp) + triangle(int64_t(i), 451, amp) / 2 + noise);
                 }
             for (auto& fr : flac::encode_frames(slice(pcm, 0, n), bps, rate, ENCODED_BLOCK, 0)) md5.update(fr);
         }
