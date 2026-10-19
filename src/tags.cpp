@@ -2,7 +2,6 @@
 #include "tags.hpp"
 
 #include <algorithm>
-#include <set>
 
 #include "util.hpp"
 
@@ -19,75 +18,176 @@ bool KeyLess::operator()(std::string_view a, std::string_view b) const {
     return a.size() < b.size();
 }
 
-const std::vector<std::string_view> TRACK_SPECIFIC = {
-    "TITLE",          "TRACKNUMBER",           "TRACKTOTAL",          "TOTALTRACKS",           "ISRC",
-    "CUESHEET",       "LYRICS",                "UNSYNCEDLYRICS",      "MUSICBRAINZ_TRACKID",   "MUSICBRAINZ_RELEASETRACKID",
-    "MUSICBRAINZ_WORKID", "ACOUSTID_ID",       "ACOUSTID_FINGERPRINT", "REPLAYGAIN_TRACK_GAIN", "REPLAYGAIN_TRACK_PEAK",
-    "LENGTH",         "PART",                  "MOVEMENTNAME",        "MOVEMENT",              "WORK",
+namespace {
+
+struct Field {
+    FieldSpec spec;
+    std::vector<std::string_view> synonyms;  // other spellings (compared case-insensitively)
 };
 
-bool is_track_specific(std::string_view key) {
-    std::string c = canonical_field(key);
-    return std::any_of(TRACK_SPECIFIC.begin(), TRACK_SPECIFIC.end(), [&](auto n) { return c == n; });
+// One table for the synonyms and for where ID3 and MP4 keep each field, so that
+// the tag writers, the tag readers and the overlay rules agree on what a name
+// means. The owners of shared places come first (see FieldSpec). Built on first
+// use, like the index over it, so lookups are safe during static initialisation.
+const std::vector<Field>& fields() {
+    static const std::vector<Field> f = {
+        {{"TITLE", "TIT2", "\u00A9nam"}, {}},
+        {{"ARTIST", "TPE1", "\u00A9ART"}, {}},
+        {{"ALBUMARTIST", "TPE2", "aART"}, {"ALBUM_ARTIST", "ALBUM ARTIST"}},
+        {{"ALBUM", "TALB", "\u00A9alb"}, {}},
+        {{"DATE", "TDRC", "\u00A9day"}, {}},
+        {{"ORIGINALDATE", "TDOR", ""}, {"ORIGINAL_DATE"}},
+        {{"RELEASEDATE", "TDRL", ""}, {}},
+        {{"GENRE", "TCON", "\u00A9gen"}, {}},
+        {{"COMPOSER", "TCOM", "\u00A9wrt"}, {}},
+        {{"CONDUCTOR", "TPE3", ""}, {}},
+        {{"REMIXER", "TPE4", ""}, {"MIXARTIST"}},
+        {{"LYRICIST", "TEXT", ""}, {}},
+        {{"LABEL", "TPUB", ""}, {"PUBLISHER", "ORGANIZATION"}},
+        {{"COPYRIGHT", "TCOP", "cprt"}, {}},
+        {{"ISRC", "TSRC", ""}, {}},
+        {{"GROUPING", "TIT1", "\u00A9grp"}, {}},
+        {{"SUBTITLE", "TIT3", ""}, {}},
+        {{"BPM", "TBPM", "tmpo"}, {}},
+        {{"MOOD", "TMOO", ""}, {}},
+        {{"ENCODEDBY", "TENC", ""}, {"ENCODED_BY"}},
+        // ffprobe reports TSSE as "encoder", Picard writes it as ENCODERSETTINGS
+        {{"ENCODER", "TSSE", "\u00A9too"}, {"ENCODERSETTINGS"}},
+        {{"COMPILATION", "TCMP", "cpil"}, {}},
+        {{"MEDIA", "TMED", ""}, {}},
+        {{"LANGUAGE", "TLAN", ""}, {}},
+        {{"DISCSUBTITLE", "TSST", ""}, {"DISC_SUBTITLE"}},
+        {{"CREATION_TIME", "TDEN", ""}, {}},
+        {{"MOVEMENTNAME", "MVNM", "\u00A9mvn"}, {}},
+        {{"TITLESORT", "TSOT", "sonm"}, {"TITLE_SORT", "TITLE-SORT", "SORT_NAME"}},
+        {{"ALBUMSORT", "TSOA", "soal"}, {"ALBUM_SORT", "ALBUM-SORT", "SORT_ALBUM"}},
+        {{"ARTISTSORT", "TSOP", "soar"}, {"ARTIST_SORT", "ARTIST-SORT", "SORT_ARTIST"}},
+        {{"ALBUMARTISTSORT", "TSO2", "soaa"}, {"ALBUM_ARTIST_SORT", "ALBUM_ARTIST-SORT", "ALBUM-ARTIST-SORT", "SORT_ALBUM_ARTIST"}},
+        {{"COMPOSERSORT", "TSOC", "socm"}, {"COMPOSER_SORT", "COMPOSER-SORT", "SORT_COMPOSER"}},
+        {{"COMMENT", "COMM", "\u00A9cmt"}, {}},
+        {{"LYRICS", "USLT", "\u00A9lyr"}, {"UNSYNCEDLYRICS"}},
+        {{"DESCRIPTION", "", "desc"}, {}},
+        {{"SYNOPSIS", "", "ldes"}, {}},
+        {{"SHOW", "", "tvsh"}, {}},
+        {{"NETWORK", "", "tvnn"}, {}},
+        {{"EPISODE_ID", "", "tven"}, {}},
+        {{"PURCHASE_DATE", "", "purd"}, {}},
+        {{"GAPLESS_PLAYBACK", "", "pgap"}, {}},
+        {{"MEDIA_TYPE", "", "stik"}, {}},
+        {{"RATING", "", "rtng"}, {}},
+        // number and total share TRCK/TPOS and trkn/disk; the formats join them
+        {{"TRACKNUMBER", "TRCK", "trkn"}, {"TRACK"}},
+        {{"TRACKTOTAL", "", ""}, {"TOTALTRACKS", "TRACKC"}},
+        {{"DISCNUMBER", "TPOS", "disk"}, {"DISC"}},
+        {{"DISCTOTAL", "", ""}, {"TOTALDISCS", "DISCC"}},
+        {{"MUSICBRAINZ_ALBUMID", "", ""}, {"MUSICBRAINZ ALBUM ID"}},
+        {{"MUSICBRAINZ_ARTISTID", "", ""}, {"MUSICBRAINZ ARTIST ID"}},
+        {{"MUSICBRAINZ_ALBUMARTISTID", "", ""}, {"MUSICBRAINZ ALBUM ARTIST ID"}},
+        {{"MUSICBRAINZ_TRACKID", "", ""}, {"MUSICBRAINZ TRACK ID"}},
+        {{"MUSICBRAINZ_RELEASETRACKID", "", ""}, {"MUSICBRAINZ RELEASE TRACK ID"}},
+        {{"MUSICBRAINZ_RELEASEGROUPID", "", ""}, {"MUSICBRAINZ RELEASE GROUP ID"}},
+        {{"MUSICBRAINZ_WORKID", "", ""}, {"MUSICBRAINZ WORK ID"}},
+        {{"MUSICBRAINZ_DISCID", "", ""}, {"MUSICBRAINZ DISC ID"}},
+        {{"RELEASECOUNTRY", "", ""}, {"MUSICBRAINZ ALBUM RELEASE COUNTRY"}},
+        {{"RELEASESTATUS", "", ""}, {"MUSICBRAINZ ALBUM STATUS"}},
+        {{"RELEASETYPE", "", ""}, {"MUSICBRAINZ ALBUM TYPE"}},
+        {{"ACOUSTID_ID", "", ""}, {"ACOUSTID ID"}},
+        {{"ACOUSTID_FINGERPRINT", "", ""}, {"ACOUSTID FINGERPRINT"}},
+        // fields that share a place they do not own: written there only without the owner
+        {{"YEAR", "TDRC", "\u00A9day"}, {}},
+        {{"WORK", "TIT1", "\u00A9wrk"}, {}},
+    };
+    return f;
 }
 
+struct FieldIndex {
+    std::map<std::string_view, const FieldSpec*, KeyLess> by_name;
+    std::map<std::string_view, const FieldSpec*> id3, mp4;  // place -> owner
+};
+
+const FieldIndex& field_index() {
+    static const FieldIndex ix = [] {
+        FieldIndex x;
+        for (auto& f : fields()) {
+            x.by_name.emplace(f.spec.name, &f.spec);
+            for (auto s : f.synonyms) x.by_name.emplace(s, &f.spec);
+            // the owner of a place answers to the place's id as well (TPE2, aART)
+            for (auto [place, owners] : {std::pair{f.spec.id3, &x.id3}, std::pair{f.spec.mp4, &x.mp4}})
+                if (!place.empty() && owners->emplace(place, &f.spec).second) x.by_name.emplace(place, &f.spec);
+        }
+        return x;
+    }();
+    return ix;
+}
+
+// Names compared on their canonical form (TRACKTOTAL covers TOTALTRACKS).
+const std::vector<std::string_view> TRACK_SPECIFIC = {
+    "TITLE",          "TRACKNUMBER",           "TRACKTOTAL",          "ISRC",                  "CUESHEET",
+    "LYRICS",         "MUSICBRAINZ_TRACKID",   "MUSICBRAINZ_RELEASETRACKID", "MUSICBRAINZ_WORKID", "ACOUSTID_ID",
+    "ACOUSTID_FINGERPRINT", "REPLAYGAIN_TRACK_GAIN", "REPLAYGAIN_TRACK_PEAK", "LENGTH", "PART",
+    "MOVEMENTNAME",   "MOVEMENT",              "WORK",
+};
+
 // remove `key` under any spelling or synonym
-static void erase_field(std::map<std::string, std::vector<std::string>, KeyLess>& m, std::string_view key) {
-    std::string c = canonical_field(key);
-    std::erase_if(m, [&](auto& kv) { return canonical_field(kv.first) == c; });
+void erase_field(std::map<std::string, std::vector<std::string>, KeyLess>& m, std::string_view key) {
+    std::erase_if(m, [&](auto& kv) { return same_field(kv.first, key); });
+}
+
+bool blank(const std::string& v) { return trim(v).empty(); }
+
+}  // namespace
+
+const FieldSpec* field_spec(std::string_view key) {
+    auto& m = field_index().by_name;
+    auto it = m.find(key);
+    return it == m.end() ? nullptr : it->second;
+}
+
+const FieldSpec* id3_owner(std::string_view id) {
+    auto& m = field_index().id3;
+    auto it = m.find(id);
+    return it == m.end() ? nullptr : it->second;
+}
+
+const FieldSpec* mp4_owner(std::string_view atom) {
+    auto& m = field_index().mp4;
+    auto it = m.find(atom);
+    return it == m.end() ? nullptr : it->second;
 }
 
 std::string canonical_field(std::string_view key) {
-    static const std::map<std::string, std::string> aliases = [] {
-        const std::vector<std::vector<std::string>> groups = {
-            {"ALBUMARTIST", "ALBUM_ARTIST", "ALBUM ARTIST", "TPE2", "AART"},
-            {"TRACKNUMBER", "TRACK", "TRCK", "TRKN"},
-            {"DISCNUMBER", "DISC", "TPOS", "DISK"},
-            {"TRACKTOTAL", "TOTALTRACKS", "TRACKC"},
-            {"DISCTOTAL", "TOTALDISCS", "DISCC"},
-            {"DISCSUBTITLE", "DISC_SUBTITLE", "TSST"},
-            {"TITLE", "TIT2", "\u00A9NAM"},
-            {"ARTIST", "TPE1", "\u00A9ART"},
-            {"ALBUM", "TALB", "\u00A9ALB"},
-            {"GENRE", "TCON", "\u00A9GEN"},
-            {"COMPOSER", "TCOM", "\u00A9WRT"},
-            {"LABEL", "PUBLISHER", "ORGANIZATION", "TPUB"},
-            {"COPYRIGHT", "TCOP", "CPRT"},
-            {"ISRC", "TSRC"},
-            {"MEDIA", "TMED"},
-            {"ENCODEDBY", "ENCODED_BY", "TENC"},
-            {"ORIGINALDATE", "ORIGINAL_DATE", "TDOR"},
-            {"MOVEMENTNAME", "MVNM", "\u00A9MVN"},
-            {"ALBUMSORT", "ALBUM_SORT", "ALBUM-SORT", "SORT_ALBUM", "TSOA", "SOAL"},
-            {"ARTISTSORT", "ARTIST_SORT", "ARTIST-SORT", "SORT_ARTIST", "TSOP", "SOAR"},
-            {"TITLESORT", "TITLE_SORT", "TITLE-SORT", "SORT_NAME", "TSOT", "SONM"},
-            {"ALBUMARTISTSORT", "ALBUM_ARTIST_SORT", "ALBUM_ARTIST-SORT", "ALBUM-ARTIST-SORT", "SORT_ALBUM_ARTIST", "TSO2", "SOAA"},
-            {"COMPOSERSORT", "COMPOSER_SORT", "COMPOSER-SORT", "SORT_COMPOSER", "TSOC", "SOCM"},
-            {"MUSICBRAINZ_ALBUMID", "MUSICBRAINZ ALBUM ID"},
-            {"MUSICBRAINZ_ARTISTID", "MUSICBRAINZ ARTIST ID"},
-            {"MUSICBRAINZ_ALBUMARTISTID", "MUSICBRAINZ ALBUM ARTIST ID"},
-            {"MUSICBRAINZ_TRACKID", "MUSICBRAINZ TRACK ID"},
-            {"MUSICBRAINZ_RELEASETRACKID", "MUSICBRAINZ RELEASE TRACK ID"},
-            {"MUSICBRAINZ_RELEASEGROUPID", "MUSICBRAINZ RELEASE GROUP ID"},
-            {"MUSICBRAINZ_WORKID", "MUSICBRAINZ WORK ID"},
-            {"MUSICBRAINZ_DISCID", "MUSICBRAINZ DISC ID"},
-            {"RELEASECOUNTRY", "MUSICBRAINZ ALBUM RELEASE COUNTRY"},
-            {"RELEASESTATUS", "MUSICBRAINZ ALBUM STATUS"},
-            {"RELEASETYPE", "MUSICBRAINZ ALBUM TYPE"},
-            {"ACOUSTID_ID", "ACOUSTID ID"},
-            {"ACOUSTID_FINGERPRINT", "ACOUSTID FINGERPRINT"},
-        };
-        std::map<std::string, std::string> m;
-        for (auto& g : groups)
-            for (auto& a : g) m[a] = g[0];
-        return m;
-    }();
-    std::string u = upper(key);
-    auto it = aliases.find(u);
-    return it == aliases.end() ? u : it->second;
+    auto f = field_spec(key);
+    return f ? std::string(f->name) : upper(key);
 }
 
-static bool blank(const std::string& v) { return trim(v).empty(); }
+bool same_field(std::string_view a, std::string_view b) {
+    // every canonical name is in the table too, so an unknown name can only be
+    // the same field as another spelling of itself
+    auto fa = field_spec(a), fb = field_spec(b);
+    return fa || fb ? fa == fb : iequals(a, b);
+}
+
+bool is_track_specific(std::string_view key) {
+    auto f = field_spec(key);
+    std::string_view name = f ? f->name : key;
+    return std::any_of(TRACK_SPECIFIC.begin(), TRACK_SPECIFIC.end(), [&](auto n) { return iequals(name, n); });
+}
+
+bool is_number_field(std::string_view key) {
+    auto f = field_spec(key);
+    return f && (f->name == "TRACKNUMBER" || f->name == "TRACKTOTAL" || f->name == "DISCNUMBER" || f->name == "DISCTOTAL");
+}
+
+std::string join_number(const std::string& number, const std::string* total) {
+    return total && number.find('/') == std::string::npos ? number + "/" + *total : number;
+}
+
+void add_number(Tags& t, const std::string& num_field, const std::string& total_field, std::string_view value) {
+    auto parts = split(value, '/');
+    std::string n = trim(parts[0]), total = parts.size() > 1 ? trim(parts[1]) : "";
+    if (!n.empty() && !t.get_all(num_field)) t.add(num_field, n);
+    if (!total.empty() && !t.get_all(total_field)) t.add(total_field, total);
+}
 
 Tags Tags::from_pairs(const std::vector<std::pair<std::string, std::string>>& pairs) {
     Tags t;
@@ -113,9 +213,8 @@ void Tags::set_many(const std::string& key, std::vector<std::string> values) {
 
 const std::vector<std::string>* Tags::get_all(std::string_view key) const {
     if (auto it = m.find(key); it != m.end()) return &it->second;
-    std::string c = canonical_field(key);
     for (auto& [k, v] : m)
-        if (canonical_field(k) == c) return &v;
+        if (same_field(k, key)) return &v;
     return nullptr;
 }
 
@@ -124,20 +223,15 @@ const std::string* Tags::get(std::string_view key) const {
     return v && !v->empty() ? &v->front() : nullptr;
 }
 
-void Tags::overlay(const Tags& other) {
-    std::set<std::string> fields;
-    for (auto& kv : other.m) fields.insert(canonical_field(kv.first));
-    std::erase_if(m, [&](auto& kv) { return fields.contains(canonical_field(kv.first)); });
+void Tags::replace_fields_of(const Tags& other, bool keep_removals) {
+    std::erase_if(m, [&](auto& kv) { return std::any_of(other.m.begin(), other.m.end(), [&](auto& o) { return same_field(o.first, kv.first); }); });
     for (auto& [k, v] : other.m)
-        if (!v.empty()) m.emplace(k, v);
+        if (keep_removals || !v.empty()) m.emplace(k, v);
 }
 
-void Tags::merge(const Tags& other) {
-    std::set<std::string> fields;
-    for (auto& kv : other.m) fields.insert(canonical_field(kv.first));
-    std::erase_if(m, [&](auto& kv) { return fields.contains(canonical_field(kv.first)); });
-    for (auto& [k, v] : other.m) m.emplace(k, v);
-}
+void Tags::overlay(const Tags& other) { replace_fields_of(other, false); }
+
+void Tags::merge(const Tags& other) { replace_fields_of(other, true); }
 
 Tags Tags::without_track_specific() const {
     Tags t = *this;
@@ -203,11 +297,11 @@ std::string sanitize_name(std::string_view s) {
     out = trim(out);
     while (!out.empty() && out.back() == '.') out.pop_back();
     // keep names well under the 255-byte limit (room for prefix + extension)
-    while (out.size() > 200) {
-        out.pop_back();
-        while (!out.empty() && (uint8_t(out.back()) & 0xC0) == 0x80) out.pop_back();
-        // drop a dangling lead byte left by the loop above
-        if (!out.empty() && uint8_t(out.back()) >= 0xC0) out.pop_back();
+    // (cut at a character boundary: back off continuation bytes)
+    if (out.size() > 200) {
+        size_t n = 200;
+        while (n > 0 && (uint8_t(out[n]) & 0xC0) == 0x80) n--;
+        out.resize(n);
     }
     return out;
 }

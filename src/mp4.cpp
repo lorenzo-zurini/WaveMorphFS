@@ -2,9 +2,9 @@
 #include "mp4.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <cmath>
 #include <cstring>
-#include <map>
 
 namespace wm::mp4 {
 
@@ -141,21 +141,14 @@ std::pair<uint64_t, uint64_t> find_moov(const ByteReader& read, uint64_t size) {
     return *moov;
 }
 
-enum class Kind { Text, Pair, U8, U16 };
+enum class Kind { Text, U8, U16 };
 
-/// What an ilst item is keyed by.
-struct Item {
-    enum { Atom, Freeform, Ignore } what;
-    Type atom{};
-    Kind kind = Kind::Text;
-    std::string name;
-    bool operator==(const Item& o) const {
-        if (what != o.what) return false;
-        if (what == Atom) return atom == o.atom;
-        if (what == Freeform) return iequals(name, o.name);
-        return true;
-    }
-};
+/// How an ilst atom stores its value.
+Kind kind_of(const Type& atom) {
+    for (auto a : {"cpil", "pgap", "stik", "rtng"})
+        if (atom == T(a)) return Kind::U8;
+    return atom == T("tmpo") ? Kind::U16 : Kind::Text;
+}
 
 /// "©nam" -> atom name (© is 0xA9)
 Type atom(std::string_view s) {
@@ -172,64 +165,32 @@ Type atom(std::string_view s) {
     return out;
 }
 
-const std::vector<std::string_view> TRACK_NAMES = {"TRACKNUMBER", "TRACK", "TRKN"};
-const std::vector<std::string_view> TRACK_TOTALS = {"TRACKTOTAL", "TOTALTRACKS"};
-const std::vector<std::string_view> DISC_NAMES = {"DISCNUMBER", "DISC", "DISK"};
-const std::vector<std::string_view> DISC_TOTALS = {"DISCTOTAL", "TOTALDISCS"};
+/// What an ilst item is keyed by.
+struct Item {
+    enum { Atom, Freeform, Ignore } what;
+    Type atom{};
+    std::string name;   // freeform name
+    bool owner = true;  // the field owns the atom (see FieldSpec)
 
-bool in(const std::vector<std::string_view>& v, std::string_view k) { return std::find(v.begin(), v.end(), k) != v.end(); }
+    bool same_place(const Item& o) const {
+        if (what != o.what) return false;
+        if (what == Atom) return atom == o.atom;
+        if (what == Freeform) return same_field(name, o.name);
+        return true;
+    }
+};
 
-size_t utf8_chars(std::string_view s) {
-    return size_t(std::count_if(s.begin(), s.end(), [](char c) { return (uint8_t(c) & 0xC0) != 0x80; }));
-}
-
-/// Tag name -> ilst item. Accepts Vorbis names (TITLE, ALBUMARTIST), the names
-/// ffprobe reports for MP4 sources (album_artist, sort_album, ...) and raw atom
-/// names (©nam, aART). Case-insensitive except for raw atom names.
+/// Tag name -> ilst item. Accepts every spelling field_spec() knows (Vorbis
+/// TITLE, ffprobe album_artist / sort_album, atom names such as aART) and raw
+/// ©-atom names. Track and disc numbers are not handled here.
 Item item_for(const std::string& key) {
     std::string k = upper(key);
-    auto a = [](const char* s) { return Item{Item::Atom, atom(s), Kind::Text, ""}; };
-    if (in(TRACK_NAMES, k) || in(TRACK_TOTALS, k)) return {Item::Atom, T("trkn"), Kind::Pair, ""};
-    if (in(DISC_NAMES, k) || in(DISC_TOTALS, k)) return {Item::Atom, T("disk"), Kind::Pair, ""};
-    static const std::vector<std::pair<std::vector<std::string_view>, const char*>> text = {
-        {{"TITLE"}, "©nam"},
-        {{"ARTIST"}, "©ART"},
-        {{"ALBUMARTIST", "ALBUM_ARTIST", "ALBUM ARTIST"}, "aART"},
-        {{"ALBUM"}, "©alb"},
-        {{"DATE", "YEAR"}, "©day"},
-        {{"GENRE"}, "©gen"},
-        {{"COMPOSER"}, "©wrt"},
-        {{"COMMENT"}, "©cmt"},
-        {{"DESCRIPTION"}, "desc"},
-        {{"SYNOPSIS"}, "ldes"},
-        {{"ENCODER"}, "©too"},
-        {{"COPYRIGHT"}, "cprt"},
-        {{"GROUPING"}, "©grp"},
-        {{"LYRICS", "UNSYNCEDLYRICS"}, "©lyr"},
-        {{"WORK"}, "©wrk"},
-        {{"MOVEMENTNAME"}, "©mvn"},
-        {{"TITLESORT", "TITLE_SORT", "SORT_NAME"}, "sonm"},
-        {{"ALBUMSORT", "ALBUM_SORT", "SORT_ALBUM"}, "soal"},
-        {{"ARTISTSORT", "ARTIST_SORT", "SORT_ARTIST"}, "soar"},
-        {{"ALBUMARTISTSORT", "ALBUM_ARTIST_SORT", "SORT_ALBUM_ARTIST"}, "soaa"},
-        {{"COMPOSERSORT", "COMPOSER_SORT", "SORT_COMPOSER"}, "socm"},
-        {{"SHOW"}, "tvsh"},
-        {{"NETWORK"}, "tvnn"},
-        {{"EPISODE_ID"}, "tven"},
-        {{"PURCHASE_DATE"}, "purd"},
-    };
-    if (k == "MAJOR_BRAND" || k == "MINOR_VERSION" || k == "COMPATIBLE_BRANDS" || k == "CREATION_TIME") return {Item::Ignore, {}, Kind::Text, ""};
-    for (auto& [names, at] : text)
-        if (in(names, k)) return a(at);
-    if (k == "COMPILATION") return {Item::Atom, T("cpil"), Kind::U8, ""};
-    if (k == "GAPLESS_PLAYBACK") return {Item::Atom, T("pgap"), Kind::U8, ""};
-    if (k == "MEDIA_TYPE") return {Item::Atom, T("stik"), Kind::U8, ""};
-    if (k == "RATING") return {Item::Atom, T("rtng"), Kind::U8, ""};
-    if (k == "BPM" || k == "TMPO") return {Item::Atom, T("tmpo"), Kind::U16, ""};
-    if (utf8_chars(key) == 4 && starts_with(key, "©")) return a(key.c_str());
-    for (auto raw : {"aART", "cprt", "desc", "ldes", "sonm", "soal", "soar", "soaa", "socm", "tvsh", "tvnn", "tven", "purd"})
-        if (key == raw) return a(raw);
-    return {Item::Freeform, {}, Kind::Text, key};
+    // container metadata ffprobe reports next to the tags
+    if (k == "MAJOR_BRAND" || k == "MINOR_VERSION" || k == "COMPATIBLE_BRANDS" || k == "CREATION_TIME") return {Item::Ignore};
+    if (auto f = field_spec(key); f && !f->mp4.empty()) return {Item::Atom, atom(f->mp4), "", mp4_owner(f->mp4) == f};
+    // a raw atom such as ©st3: © and three ASCII characters
+    if (key.size() == 5 && starts_with(key, "©")) return {Item::Atom, atom(key)};
+    return {Item::Freeform, {}, key};
 }
 
 Node data_atom(uint32_t typ, std::span<const uint8_t> payload) {
@@ -263,31 +224,69 @@ std::optional<uint16_t> parse_u16(std::string_view s) {
     return uint16_t(*v);
 }
 
-std::pair<std::optional<uint16_t>, std::optional<uint16_t>> parse_pair(const std::string& s) {
-    auto p = split(s, '/');
-    return {parse_u16(p[0]), p.size() > 1 ? parse_u16(p[1]) : std::nullopt};
+/// The item for `vs`; nullopt if the value does not fit the atom (a number atom
+/// given text).
+std::optional<Node> make_item(const Item& it, const std::vector<std::string>& vs) {
+    std::vector<Node> kids;
+    if (it.what == Item::Freeform) {
+        Bytes mean = {0, 0, 0, 0}, name = {0, 0, 0, 0};
+        append(mean, std::string_view("com.apple.iTunes"));
+        append(name, it.name);
+        kids.push_back(leaf(T("mean"), mean));
+        kids.push_back(leaf(T("name"), name));
+        for (auto& v : vs) kids.push_back(data_atom(1, bytes_of(v)));
+        return box(T("----"), std::move(kids));
+    }
+    std::string v = trim(vs[0]);
+    switch (kind_of(it.atom)) {
+    case Kind::Text:
+        for (auto& x : vs) kids.push_back(data_atom(1, bytes_of(x)));
+        break;
+    case Kind::U8: {
+        std::optional<uint8_t> n;
+        if (auto x = parse_u64(v); x && *x <= 255) n = uint8_t(*x);
+        else if (iequals(v, "true")) n = 1;
+        else if (iequals(v, "false")) n = 0;
+        if (!n) return std::nullopt;
+        kids.push_back(data_atom(21, std::array<uint8_t, 1>{*n}));
+        break;
+    }
+    case Kind::U16: {
+        // BPM may come with decimals ("120.5"); the atom holds a whole number
+        double d = 0;
+        auto [end, ec] = std::from_chars(v.data(), v.data() + v.size(), d);
+        if (v.empty() || ec != std::errc() || end != v.data() + v.size() || !(d >= 0 && d <= 65535)) return std::nullopt;
+        Bytes b;
+        put_be16(b, uint16_t(std::lround(d)));
+        kids.push_back(data_atom(21, b));
+        break;
+    }
+    }
+    return box(it.atom, std::move(kids));
 }
 
 /// Apply `overlay` to an ilst's items.
 void apply(std::vector<Node>& items, const Tags& overlay) {
-    auto get = [&](const std::vector<std::string_view>& names) -> const std::string* {
-        for (auto n : names)
-            if (auto v = overlay.get(n)) return v;
-        return nullptr;
-    };
-    auto named = [&](const std::vector<std::string_view>& names) {
-        return std::any_of(names.begin(), names.end(), [&](auto n) { return overlay.get_all(n) != nullptr; });
-    };
-    for (auto [typ, nums, totals] : {std::tuple{T("trkn"), &TRACK_NAMES, &TRACK_TOTALS}, std::tuple{T("disk"), &DISC_NAMES, &DISC_TOTALS}}) {
-        if (!named(*nums) && !named(*totals)) continue;
+    for (auto [typ, num, total] : {std::tuple{T("trkn"), "TRACKNUMBER", "TRACKTOTAL"}, std::tuple{T("disk"), "DISCNUMBER", "DISCTOTAL"}}) {
+        bool num_named = overlay.get_all(num) != nullptr, total_named = overlay.get_all(total) != nullptr;
+        if (!num_named && !total_named) continue;
+        const std::string *nv = overlay.get(num), *tv = overlay.get(total);
+        std::optional<uint16_t> n, t, t_in_n;
+        if (nv) {
+            auto p = split(*nv, '/');
+            n = parse_u16(p[0]);
+            if (p.size() > 1) t_in_n = parse_u16(p[1]);
+        }
+        if (tv) t = parse_u16(*tv);
+        if ((nv && !n) || (tv && !t)) {
+            // the atom holds numbers only ("A1" for a vinyl side does not fit)
+            warn("MP4: \"{}\" is not a number; {} kept as it is", nv && !n ? *nv : *tv, str_of(typ));
+            continue;
+        }
         auto old = old_pair(items, typ);
-        std::optional<uint16_t> n, t_in_n;
-        if (auto v = get(*nums)) std::tie(n, t_in_n) = parse_pair(*v);
-        if (!named(*nums) && old) n = old->first;
-        std::optional<uint16_t> t;
-        if (auto v = get(*totals)) t = parse_u16(*v);
+        if (!num_named && old) n = old->first;
         if (!t) t = t_in_n;
-        if (!t && !named(*totals) && old) t = old->second;
+        if (!t && !total_named && old) t = old->second;
         std::erase_if(items, [&](auto& i) { return i.typ == typ; });
         if (n) {
             Bytes p = {0, 0};
@@ -297,50 +296,37 @@ void apply(std::vector<Node>& items, const Tags& overlay) {
             items.push_back(box(typ, {data_atom(0, p)}));
         }
     }
-    std::vector<Item> used;
+    // One item per place; when several fields of the overlay share an atom the
+    // owner wins (see id3::apply).
+    struct Pick {
+        Item item;
+        std::optional<Node> node;  // none: remove the item
+    };
+    std::vector<Pick> picks;
     for (auto& [k, vs] : overlay.m) {
+        if (is_number_field(k)) continue;
         Item it = item_for(k);
-        if (it.what == Item::Ignore || (it.what == Item::Atom && it.kind == Kind::Pair)) continue;
-        if (std::find(used.begin(), used.end(), it) != used.end()) continue;
-        if (it.what == Item::Atom)
-            std::erase_if(items, [&](auto& i) { return i.typ == it.atom || (it.atom == atom("©gen") && i.typ == T("gnre")); });
-        else
-            std::erase_if(items, [&](auto& i) {
-                auto n = i.typ == T("----") ? freeform_name(i) : std::nullopt;
-                return n && iequals(*n, it.name);
-            });
-        if (!vs.empty()) {
-            std::vector<Node> kids;
-            if (it.what == Item::Freeform) {
-                Bytes mean = {0, 0, 0, 0}, name = {0, 0, 0, 0};
-                append(mean, std::string_view("com.apple.iTunes"));
-                append(name, it.name);
-                kids.push_back(leaf(T("mean"), mean));
-                kids.push_back(leaf(T("name"), name));
-                for (auto& v : vs) kids.push_back(data_atom(1, bytes_of(v)));
-            } else if (it.kind == Kind::Text) {
-                for (auto& v : vs) kids.push_back(data_atom(1, bytes_of(v)));
-            } else if (it.kind == Kind::U8) {
-                std::string v = trim(vs[0]);
-                std::optional<uint8_t> n;
-                if (auto x = parse_u64(v); x && *x <= 255) n = uint8_t(*x);
-                else if (v == "true") n = 1;
-                else if (v == "false") n = 0;
-                if (n) kids.push_back(data_atom(21, std::array<uint8_t, 1>{*n}));
-            } else if (it.kind == Kind::U16) {
-                try {
-                    size_t used_chars = 0;
-                    double d = std::stod(trim(vs[0]), &used_chars);
-                    Bytes b;
-                    put_be16(b, uint16_t(std::lround(d)));
-                    kids.push_back(data_atom(21, b));
-                } catch (...) {
-                }
-            }
-            if (!kids.empty()) items.push_back(box(it.what == Item::Atom ? it.atom : T("----"), std::move(kids)));
+        if (it.what == Item::Ignore) continue;
+        auto p = std::find_if(picks.begin(), picks.end(), [&](auto& x) { return x.item.same_place(it); });
+        if (p != picks.end() && (p->item.owner || !it.owner)) continue;
+        std::optional<Node> node;
+        if (!vs.empty() && !(node = make_item(it, vs))) {
+            warn("MP4: \"{}\" does not fit the {} atom; kept as it is", vs[0], k);
+            continue;
         }
-        used.push_back(it);
+        if (p != picks.end()) *p = {std::move(it), std::move(node)};
+        else picks.push_back({std::move(it), std::move(node)});
     }
+    for (auto& p : picks) {
+        auto& it = p.item;
+        std::erase_if(items, [&](auto& i) {
+            if (it.what == Item::Atom) return i.typ == it.atom || (it.atom == atom("©gen") && i.typ == T("gnre"));
+            auto n = i.typ == T("----") ? freeform_name(i) : std::nullopt;
+            return n && same_field(*n, it.name);
+        });
+    }
+    for (auto& p : picks)
+        if (p.node) items.push_back(std::move(*p.node));
 }
 
 /// ilst items: each item is a container of data/mean/name atoms.
@@ -390,14 +376,6 @@ void shift_offsets(Node& n, uint64_t from, int64_t delta) {
 }  // namespace
 
 Tags read_tags(const ByteReader& read, uint64_t size) {
-    static const std::map<std::string, std::string> names = {
-        {"\u00A9nam", "TITLE"}, {"\u00A9ART", "ARTIST"}, {"aART", "ALBUMARTIST"}, {"\u00A9alb", "ALBUM"}, {"\u00A9day", "DATE"},
-        {"\u00A9gen", "GENRE"}, {"\u00A9wrt", "COMPOSER"}, {"\u00A9cmt", "COMMENT"}, {"desc", "DESCRIPTION"}, {"ldes", "SYNOPSIS"},
-        {"\u00A9too", "ENCODER"}, {"cprt", "COPYRIGHT"}, {"\u00A9grp", "GROUPING"}, {"\u00A9lyr", "LYRICS"}, {"\u00A9wrk", "WORK"},
-        {"\u00A9mvn", "MOVEMENTNAME"}, {"sonm", "TITLESORT"}, {"soal", "ALBUMSORT"}, {"soar", "ARTISTSORT"}, {"soaa", "ALBUMARTISTSORT"},
-        {"socm", "COMPOSERSORT"}, {"tvsh", "SHOW"}, {"tvnn", "NETWORK"}, {"tven", "EPISODE_ID"}, {"purd", "PURCHASE_DATE"},
-        {"cpil", "COMPILATION"}, {"pgap", "GAPLESS_PLAYBACK"}, {"stik", "MEDIA_TYPE"}, {"rtng", "RATING"}, {"tmpo", "BPM"},
-    };
     Tags t;
     std::vector<Node> top;
     try {
@@ -420,11 +398,6 @@ Tags read_tags(const ByteReader& read, uint64_t size) {
         if (data.empty()) continue;
         auto payload = [](const Node* d) { return std::span<const uint8_t>(d->data).subspan(8); };
         uint32_t type = be32(data[0]->data.data()) & 0xFFFFFF;
-        std::string atom_name;
-        for (uint8_t c : item.typ) {
-            if (c == 0xA9) atom_name += "\u00A9";
-            else atom_name += char(c);
-        }
         if (item.typ == T("trkn") || item.typ == T("disk")) {
             auto p = payload(data[0]);
             if (p.size() < 6) continue;
@@ -440,8 +413,11 @@ Tags read_tags(const ByteReader& read, uint64_t size) {
             if (!n) continue;
             name = *n;
         } else {
-            auto it = names.find(atom_name);
-            name = it != names.end() ? it->second : atom_name;
+            for (uint8_t c : item.typ) {
+                if (c == 0xA9) name += "©";
+                else name += char(c);
+            }
+            if (auto o = mp4_owner(name)) name = o->name;
         }
         for (auto* d : data) {
             auto p = payload(d);
