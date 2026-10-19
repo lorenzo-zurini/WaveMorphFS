@@ -73,7 +73,17 @@ install(TARGETS wavemorphfs RUNTIME DESTINATION bin)
 option(WAVEMORPH_TESTS "Build the test program" ON)
 if(WAVEMORPH_TESTS)
   enable_testing()
-  add_executable(wavemorphfs-tests tests/main.cpp tests/test_flac.cpp tests/test_formats.cpp tests/test_tags.cpp tests/test_wavpack.cpp tests/test_fs.cpp tests/test_sacd.cpp)
+  add_executable(wavemorphfs-tests
+    tests/main.cpp
+    tests/test_flac.cpp
+    tests/test_formats.cpp
+    tests/test_fs.cpp
+    tests/test_library.cpp
+    tests/test_sacd.cpp
+    tests/test_tagformats.cpp
+    tests/test_tags.cpp
+    tests/test_wavpack.cpp
+  )
   target_link_libraries(wavemorphfs-tests PRIVATE wmcore)
   add_test(NAME unit COMMAND wavemorphfs-tests)
 endif()
