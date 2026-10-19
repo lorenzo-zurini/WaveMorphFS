@@ -532,11 +532,11 @@ void Library::run_job(Job job) {
         }
         bump(j->dir);
     } else if (auto* j = std::get_if<EncodeJob>(&job)) {
-        const fs::path& path = j->image->path;
+        const fs::path& path = j->src;
         auto key = SrcKey::try_of(path);
         try {
             auto t = Clock::now();
-            build_layout(*j->image, j->ranges, &cache);
+            j->measure();
             info("tracks measured: {} ({:.0f}s)", path.string(), std::chrono::duration<double>(Clock::now() - t).count());
         } catch (const std::exception& e) {
             warn("measuring tracks of {}: {}", path.string(), e.what());
@@ -554,7 +554,6 @@ void Library::run_job(Job job) {
         auto st = attempt<SacdDisc>([&] { return SacdDisc::open(j->src, &cache, j->mc); });
         if (st.st == Work<SacdDisc>::Ready)
             info("SACD {} area ready: {} ({} tracks, {} ch{})", area, j->src.string(), st.ready->tracks.size(), st.ready->channels, st.ready->dst ? ", DST" : "");
-        else if (st.err.find("no multichannel area") != std::string::npos) debug("{}: {}", j->src.string(), st.err);
         else warn("SACD {} area failed: {}: {}", area, j->src.string(), st.err);
         if (key) settle_work(sacds_, std::pair{j->src, j->mc}, *key, std::move(st));
         bump(j->dir);
@@ -642,10 +641,7 @@ void Library::write_status() const {
             std::string label = std::string(pk.second ? "SACD/MC " : "SACD    ") + pk.first.string();
             if (st.st == Work<SacdDisc>::Ready)
                 label += std::format("  ({} tracks, {} ch{})", st.ready->tracks.size(), st.ready->channels, st.ready->dst ? ", DST" : "");
-            if (st.st == Work<SacdDisc>::Failed) {
-                if (st.err.find("no multichannel area") != std::string::npos) continue;
-                label += "\n         " + st.err;
-            }
+            if (st.st == Work<SacdDisc>::Failed) label += "\n         " + st.err;
             sections[status_section(st)].push_back(std::move(label));
         }
         for (auto& [d, err] : sidecar_errors_) sections[3].push_back(std::format("sidecar {}\n         {}", d.string(), err));
@@ -1036,7 +1032,9 @@ void Library::add_sacd_isos(ListingBuild& b) {
         if (st.st == Work<SacdDisc>::Ready) {
             try {
                 auto tracks = sacd_tracks(b, st.ready, disc, area_mtime(false), false);
-                if (cfg.sacd_multichannel)
+                // only discs with a separate multichannel area (one that has nothing
+                // but multichannel serves it as its main area)
+                if (cfg.sacd_multichannel && sacd_has_area(p, true))
                     if (auto mc = sacd_state(p, b.dir, true); mc.st == Work<SacdDisc>::Ready)
                         for (auto& e : sacd_tracks(b, mc.ready, disc, area_mtime(true), true)) tracks.push_back(std::move(e));
                 for (auto& e : tracks) b.virtuals.push_back(std::move(e));
@@ -1120,31 +1118,38 @@ bool Library::add_standalone(ListingBuild& b, const DirItem& n) {
     }
 }
 
-std::optional<std::vector<TrackLayout>> Library::track_layouts(const std::shared_ptr<const AvImage>& av, const Ranges& ranges, const fs::path& dir) {
-    if (auto layout = load_layout(*av, ranges, cache)) return layout;
+template <class L>
+std::optional<L> Library::measured(const fs::path& src, const fs::path& dir, const std::function<std::optional<L>()>& load,
+                                   std::function<L()> build) {
+    if (auto layout = load()) return layout;
     // measuring this version failed before: fail again rather than decode it all
     // again on every rebuild (and leave the image visible as it is)
-    if (auto err = failure_of(encode_failed_, av->path)) fail("measuring tracks failed before: {}", *err);
+    if (auto err = failure_of(encode_failed_, src)) fail("measuring tracks failed before: {}", *err);
     bool fresh;
     {
         std::lock_guard g(mu_);
-        fresh = encode_queued_.insert(av->path).second;
+        fresh = encode_queued_.insert(src).second;
     }
     if (!fresh) return std::nullopt;
-    if (enqueue(EncodeJob{av, ranges, dir})) return std::nullopt;
-    std::optional<std::vector<TrackLayout>> layout;
-    auto key = SrcKey::try_of(av->path);
+    if (enqueue(EncodeJob{src, [build] { build(); }, dir})) return std::nullopt;
+    std::optional<L> layout;
+    auto key = SrcKey::try_of(src);
     try {
-        layout = build_layout(*av, ranges, &cache);
+        layout = build();
     } catch (const std::exception& e) {
         std::lock_guard g(mu_);
-        encode_queued_.erase(av->path);
-        if (key) encode_failed_[av->path] = {*key, e.what()};
+        encode_queued_.erase(src);
+        if (key) encode_failed_[src] = {*key, e.what()};
         throw;
     }
     std::lock_guard g(mu_);
-    encode_queued_.erase(av->path);
+    encode_queued_.erase(src);
     return layout;
+}
+
+std::optional<std::vector<TrackLayout>> Library::track_layouts(const std::shared_ptr<const AvImage>& av, const Ranges& ranges, const fs::path& dir) {
+    return measured<std::vector<TrackLayout>>(
+        av->path, dir, [&] { return load_layout(*av, ranges, cache); }, [this, av, ranges] { return build_layout(*av, ranges, &cache); });
 }
 
 int64_t Library::results_mtime(const ReadyImage& ready, const Ranges& ranges) const {
@@ -1159,7 +1164,7 @@ int64_t Library::results_mtime(const ReadyImage& ready, const Ranges& ranges) co
     auto k = SrcKey::try_of(src);
     if (!k) return 0;  // gone: the next listing drops its tracks
     if (ready.av) return newest({cache.av_index_path(src, *k), layout_path(*ready.av, ranges, cache)});
-    if (ready.wv) return newest({cache.wv_index_path(src, *k), wv_layout_path(*ready.wv, ranges, cache)});
+    if (ready.wv) return newest({cache.wv_index_path(src, ready.wv->key), wv_layout_path(*ready.wv, ranges, cache)});
     return newest({cache.idx_path(src, *k), cache.md5_path(src, *k)});
 }
 
@@ -1200,8 +1205,13 @@ std::optional<std::vector<Entry>> Library::image_tracks(ListingBuild& b, const C
         layout = track_layouts(ready.av, ranges, b.dir);
         if (!layout) return std::nullopt;
     }
-    std::vector<WvLayout> wv_layout;
-    if (ready.wv) wv_layout = wv_layouts(*ready.wv, ranges, &cache);  // a few blocks per track: quick
+    std::optional<std::vector<WvLayout>> wv_layout;
+    if (ready.wv) {
+        auto wv = ready.wv;
+        wv_layout = measured<std::vector<WvLayout>>(
+            wv->path, b.dir, [&] { return load_wv_layout(*wv, ranges, cache); }, [this, wv, ranges] { return build_wv_layout(*wv, ranges, &cache); });
+        if (!wv_layout) return std::nullopt;
+    }
     Md5Map md5s = img ? cache.load_md5s(img->path) : Md5Map{};
     bool missing = img && std::any_of(ranges.begin(), ranges.end(), [&](auto& r) { return !md5s.contains(r); });
     auto key = img ? SrcKey::try_of(img->path) : std::nullopt;
@@ -1233,7 +1243,7 @@ std::optional<std::vector<Entry>> Library::image_tracks(ListingBuild& b, const C
         auto [name, key, cv] = name_track(b, tg, disc, t.number, "", ext, true);
         VFilePtr vf;
         if (ready.wv) {
-            vf = std::make_shared<WvTrack>(ready.wv, s, e, tg, wv_layout[i], cv);
+            vf = std::make_shared<WvTrack>(ready.wv, s, e, tg, (*wv_layout)[i], cv);
         } else {
             // a sidecar cover replaces the image's picture
             std::vector<flac::HeaderBlock> pictures = ready.pictures;

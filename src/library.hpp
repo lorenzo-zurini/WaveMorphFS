@@ -217,9 +217,9 @@ private:
         Ranges ranges;
         fs::path dir;
     };
-    struct EncodeJob {  // measure the encoded tracks of a decoded image
-        std::shared_ptr<const AvImage> image;
-        Ranges ranges;
+    struct EncodeJob {  // measure the tracks of an image whose parts are encoded on the fly
+        fs::path src;
+        std::function<void()> measure;  // builds and caches the layout
         fs::path dir;
     };
     /// A background step that failed for a version of a source file: not retried
@@ -278,7 +278,12 @@ private:
     std::vector<Entry> sacd_tracks(detail::ListingBuild& b, const std::shared_ptr<const SacdDisc>& sacd, const detail::DiscSlot& disc, int64_t mtime,
                                    bool mc);
     /// Encoded-track layouts of `ranges` of a decoded image; nullopt while being measured.
+    /// Layout `L` of an image's tracks (sizes of what is encoded on the fly): from
+    /// the cache, or measured by a queued job (nullopt meanwhile) or right here.
+    /// Throws if measuring this version of the image failed before.
     std::optional<std::vector<TrackLayout>> track_layouts(const std::shared_ptr<const AvImage>& av, const Ranges& ranges, const fs::path& dir);
+    template <class L>
+    std::optional<L> measured(const fs::path& src, const fs::path& dir, const std::function<std::optional<L>()>& load, std::function<L()> build);
     /// Newest of the cache files holding processing results the tracks of `ready`
     /// are made from (indexes, layouts, MD5s).
     int64_t results_mtime(const ReadyImage& ready, const Ranges& ranges) const;
