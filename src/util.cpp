@@ -115,6 +115,15 @@ std::vector<std::string> split(std::string_view s, char sep) {
     return out;
 }
 
+std::string join(const std::vector<std::string>& parts, std::string_view sep) {
+    std::string o;
+    for (size_t i = 0; i < parts.size(); i++) {
+        if (i) o += sep;
+        o += parts[i];
+    }
+    return o;
+}
+
 std::string hex(std::span<const uint8_t> b) {
     static const char* d = "0123456789abcdef";
     std::string o;

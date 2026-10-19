@@ -4,6 +4,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "apetag.hpp"
 #include "id3.hpp"
 #include "mp4.hpp"
 #include "test.hpp"
@@ -131,6 +132,35 @@ Tags m4a_retagged(const fs::path& dir, const Bytes& file, const Tags& overlay) {
     append(out, r.moov);
     out.insert(out.end(), file.begin() + ptrdiff_t(r.moov_pos + r.moov_len), file.end());
     return mp4::read_tags(reader_of(out), out.size());
+}
+
+/// The bytes of segments that are all in memory.
+Bytes flat(const std::vector<Seg>& segs) {
+    Bytes o;
+    for (auto& s : segs) append(o, std::get<Bytes>(s));
+    return o;
+}
+
+/// An APEv2 item.
+Bytes ape_item(std::string_view key, std::string_view value, uint32_t flags = 0) {
+    Bytes b;
+    put_le32(b, uint32_t(value.size()));
+    put_le32(b, flags);
+    append(b, key);
+    b.push_back(0);
+    append(b, value);
+    return b;
+}
+
+/// An APEv2 tag of `items` (footer only).
+Bytes ape_tag(std::initializer_list<Bytes> items) {
+    Bytes body = cat(items), footer = B("APETAGEX");
+    put_le32(footer, 2000);
+    put_le32(footer, uint32_t(body.size() + 32));
+    put_le32(footer, uint32_t(items.size()));
+    put_le32(footer, 0);
+    footer.resize(32);
+    return cat({body, footer});
 }
 
 }  // namespace
@@ -340,4 +370,42 @@ TEST(mp4_values_that_do_not_fit_keep_the_item) {
     t = m4a_retagged(d, file, Tags::from_pairs({{"BPM", "120.6"}, {"COMPILATION", "False"}, {"TRACKTOTAL", "12"}}));
     CHECK(value(t, "BPM") == "121" && value(t, "COMPILATION") == "0" && value(t, "TRACKNUMBER") == "4" && value(t, "TRACKTOTAL") == "12");
     fs::remove_all(d);
+}
+
+TEST(ape_pictures_are_located_not_read) {
+    std::string picture(8 << 20, 'p');
+    Bytes file = cat({B("audio"), ape_tag({ape_item("Title", "T"), ape_item("Cover Art (Front)", std::string("c.jpg\0", 6) + picture, 2)})});
+    uint64_t asked = 0;
+    auto tag = ape::read([&](uint64_t off, size_t len) {
+        asked += len;
+        return off >= file.size() ? Bytes{} : Bytes(file.begin() + ptrdiff_t(off), file.begin() + ptrdiff_t(std::min<uint64_t>(file.size(), off + len)));
+    }, file.size());
+    CHECK(tag && value(tag->tags, "TITLE") == "T" && tag->front_cover && tag->front_cover->len == picture.size() + 6);
+    CHECK_MSG(asked < 4096, "read {} bytes", asked);
+    // a footer claiming more than the file holds
+    Bytes bad = ape_tag({ape_item("Title", "T")});
+    bad[bad.size() - 32 + 15] = 0x7F;
+    CHECK(!ape::read(reader_of(bad), bad.size()));
+}
+
+TEST(ape_year_and_date_share_the_year_item) {
+    auto read_back = [](const Tags& t) { auto b = flat(ape::build(t, nullptr, std::nullopt)); return ape::read(reader_of(b), b.size())->tags; };
+    auto t = read_back(Tags::from_pairs({{"DATE", "2001-02-03"}}));
+    CHECK(t.m.contains("Year") && value(t, "YEAR") == "2001-02-03");
+    t = read_back(Tags::from_pairs({{"YEAR", "1971"}, {"DATE", "1980"}}));
+    CHECK_MSG(t.m.size() == 1 && value(t, "YEAR") == "1971", "one date, the Year item's own field");
+    // a sidecar YEAR replaces the source's Year (an edit is read back as Year)
+    auto src = read_back(Tags::from_pairs({{"Year", "1971"}, {"Album Artist", "A"}}));
+    src.overlay(Tags::from_pairs({{"YEAR", "1980"}}));
+    t = read_back(src);
+    CHECK(value(t, "YEAR") == "1980" && t.m.size() == 2 && value(t, "ALBUMARTIST") == "A");
+}
+
+TEST(ape_track_numbers_are_read_once) {
+    Bytes tag = ape_tag({ape_item("Track", "3/12"), ape_item("TRACKTOTAL", "12"), ape_item("Disc", "/2")});
+    auto t = ape::read(reader_of(tag), tag.size())->tags;
+    CHECK(value(t, "TRACKNUMBER") == "3" && t.get_all("TRACKTOTAL")->size() == 1);
+    CHECK(!t.get("DISCNUMBER") && value(t, "DISCTOTAL") == "2");
+    auto b = flat(ape::build(Tags::from_pairs({{"TRACKNUMBER", "3"}, {"TOTALTRACKS", "12"}}), nullptr, std::nullopt));
+    CHECK(std::string(b.begin(), b.end()).find(std::string("Track\0" "3/12", 10)) != std::string::npos);
 }

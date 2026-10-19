@@ -164,18 +164,9 @@ Frame make_frame(std::string_view id, Bytes data) {
     return f;
 }
 
-std::string joined(const std::vector<std::string>& vs, std::string_view sep) {
-    std::string o;
-    for (size_t i = 0; i < vs.size(); i++) {
-        if (i) o += sep;
-        o += vs[i];
-    }
-    return o;
-}
-
 Frame text_frame(const std::string& id, const std::vector<std::string>& values) {
     Bytes body = {3};  // UTF-8
-    append(body, joined(values, std::string_view("\0", 1)));
+    append(body, join(values, std::string_view("\0", 1)));
     return make_frame(id, std::move(body));
 }
 
@@ -183,7 +174,7 @@ Frame txxx_frame(const std::string& desc, const std::vector<std::string>& values
     Bytes body = {3};
     append(body, desc);
     body.push_back(0);
-    append(body, joined(values, std::string_view("\0", 1)));
+    append(body, join(values, std::string_view("\0", 1)));
     return make_frame("TXXX", std::move(body));
 }
 
@@ -428,8 +419,8 @@ void apply(std::vector<Frame>& frames, const Tags& overlay) {
         switch (t.kind) {
         case Target::Text: frames.push_back(text_frame(t.s, *vs)); break;
         case Target::Txxx: frames.push_back(txxx_frame(t.s, *vs)); break;
-        case Target::Comment: frames.push_back(lang_frame("COMM", "eng", joined(*vs, "\n"))); break;
-        case Target::Lyrics: frames.push_back(lang_frame("USLT", t.s.empty() ? "xxx" : t.s, joined(*vs, "\n"))); break;
+        case Target::Comment: frames.push_back(lang_frame("COMM", "eng", join(*vs, "\n"))); break;
+        case Target::Lyrics: frames.push_back(lang_frame("USLT", t.s.empty() ? "xxx" : t.s, join(*vs, "\n"))); break;
         }
     }
 }
