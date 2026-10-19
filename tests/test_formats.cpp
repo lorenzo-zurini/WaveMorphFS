@@ -133,7 +133,7 @@ TEST(id3_retag_keeps_unnamed_frames_and_replaces_named) {
     CHECK(len == tag.size());
     auto ov = Tags::from_pairs({{"title", "New"}, {"MUSICBRAINZ ALBUM ID", "new"}, {"TRACKTOTAL", "12"}});
     id3::apply(src.frames, ov);
-    auto out = id3::serialize(src.flags, src.frames);
+    auto out = id3::serialize(src.frames);
     auto fr = id3::parse_tag(out).first.frames;
     auto has = [&](std::string_view id) { return std::any_of(fr.begin(), fr.end(), [&](auto& f) { return f.sid() == id; }); };
     CHECK_MSG(has("APIC"), "picture kept");
@@ -144,6 +144,36 @@ TEST(id3_retag_keeps_unnamed_frames_and_replaces_named) {
     CHECK_MSG(s.find("MusicBrainz Album Id") == std::string::npos && s.find("MUSICBRAINZ ALBUM ID") != std::string::npos, "TXXX replaced case-insensitively");
     CHECK_MSG(s.find("4/12") != std::string::npos, "track number kept, total set");
     CHECK(s.find("1999") != std::string::npos);
+}
+
+TEST(id3_unsynchronised_v24_tag_is_read_and_written_plain) {
+    // a v2.4 tag flagged unsynchronised in its header (frames unflagged, as some
+    // writers do) plus one frame flagged itself, with a data length indicator
+    Bytes body;
+    auto v24 = [&](const char* id, uint8_t fl, std::string_view data) {
+        append(body, std::string_view(id, 4));
+        for (int sh : {21, 14, 7, 0}) body.push_back(uint8_t((data.size() >> sh) & 0x7F));
+        body.push_back(0);
+        body.push_back(fl);
+        append(body, data);
+    };
+    using namespace std::string_view_literals;
+    v24("TIT2", 0, "\x01\xFF\x00\xFEO\0l\0d\0"sv);  // UTF-16 with its BOM unsynchronised
+    v24("TXXX", 0x03, "\x00\x00\x00\x0C\x00Work\x00\xFF\x00\xE0xyz"sv);
+    Bytes tag = {'I', 'D', '3', 4, 0, 0x80};
+    uint32_t sz = uint32_t(body.size() + 16);
+    for (int sh : {21, 14, 7, 0}) tag.push_back(uint8_t((sz >> sh) & 0x7F));
+    append(tag, body);
+    tag.insert(tag.end(), 16, 0);
+    auto t = id3::read_tags(tag);
+    CHECK_MSG(t.get("TITLE") && *t.get("TITLE") == "Old", "title {}", t.get("TITLE") ? *t.get("TITLE") : "-");
+    auto [src, len] = id3::parse_tag(tag);
+    CHECK(len == tag.size());
+    auto out = id3::serialize(src.frames);
+    CHECK_MSG(out[5] == 0, "written without unsynchronisation");
+    auto fr = id3::parse_tag(out).first.frames;
+    CHECK(fr.size() == 2 && fr[1].data == Bytes({0, 0, 0, 0x0C, 0, 'W', 'o', 'r', 'k', 0, 0xFF, 0xE0, 'x', 'y', 'z'}) && fr[1].flags[1] == 0x01);
+    CHECK(id3::read_tags(out).get("TITLE") && *id3::read_tags(out).get("TITLE") == "Old");
 }
 
 TEST(mp4_rewrites_ilst_and_shifts_offsets) {

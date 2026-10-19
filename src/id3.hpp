@@ -45,12 +45,11 @@ struct Frame {
     std::string_view sid() const { return {id, 4}; }
 };
 struct SourceTag {
-    uint8_t flags = 0;  // tag-wide flags kept (v2.4 unsynchronisation)
-    std::vector<Frame> frames;
+    std::vector<Frame> frames;  // as ID3v2.4, without unsynchronisation
 };
 /// Parse an ID3v2.3/2.4 tag; returns the tag and its total length.
 std::pair<SourceTag, size_t> parse_tag(std::span<const uint8_t> b);
 void apply(std::vector<Frame>& frames, const Tags& overlay);
-Bytes serialize(uint8_t flags, const std::vector<Frame>& frames);
+Bytes serialize(const std::vector<Frame>& frames);
 
 }  // namespace wm::id3
