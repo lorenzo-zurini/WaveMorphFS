@@ -114,11 +114,12 @@ Frames scan_frames(const File& f, uint64_t start, uint64_t end, uint32_t channel
             uint64_t sec_no = s + i;
             AudioSector p;
             try {
-                p = with_context(std::format("sector {}", sec_no), [&] { return parse_sector(&buf[size_t(i * SECTOR)]); });
-                WM_ENSURE(p.dst == dst, "sector {}: DST flag {} in a {} area", sec_no, p.dst, dst ? "DST" : "plain DSD");
+                p = parse_sector(&buf[size_t(i * SECTOR)]);
+                WM_ENSURE(p.dst == dst, "DST flag {} in a {} area", p.dst, dst ? "DST" : "plain DSD");
             } catch (const Error& e) {
-                if (!complete()) throw;
-                info("{}: ignored, all {} frames already found", e.what(), needed);
+                // (the sector number is only formatted here: this runs for every sector of the disc)
+                if (!complete()) fail("sector {}: {}", sec_no, e.what());
+                info("sector {}: {}: ignored, all {} frames already found", sec_no, e.what(), needed);
                 frames.emplace_back(uint32_t(sec_no), 0);
                 return frames;
             }
@@ -391,16 +392,18 @@ std::vector<Bytes> SacdDisc::coded_frames(uint64_t f0, uint64_t f1) const {
 std::vector<Bytes> SacdDisc::read_frames(uint64_t f0, uint64_t f1) const {
     size_t ch = channels, per_frame = SACD_FRAME_BYTES * ch;
     auto coded = coded_frames(f0, f1);
-    std::vector<Bytes> out(ch);
-    for (auto& o : out) o.reserve(SACD_FRAME_BYTES * coded.size());
+    std::vector<Bytes> out(ch, Bytes(size_t(SACD_FRAME_BYTES) * coded.size()));
     std::unique_ptr<DstDecoder> dec;
     if (dst) dec = std::make_unique<DstDecoder>(ch);
     Bytes raw(per_frame);
     for (size_t i = 0; i < coded.size(); i++) {
         const Bytes* inter = &coded[i];
         if (dec) {
-            raw.resize(per_frame);
-            with_context(std::format("frame {}", f0 + i), [&] { dec->decode(coded[i], raw); });
+            try {
+                dec->decode(coded[i], raw);
+            } catch (const std::exception& e) {
+                fail("frame {}: {}", f0 + i, e.what());
+            }
             inter = &raw;
         } else if (coded[i].size() != per_frame) {
             bool last = f0 + i + 2 == frames_.size();  // frames_ ends with the end marker
@@ -409,8 +412,12 @@ std::vector<Bytes> SacdDisc::read_frames(uint64_t f0, uint64_t f1) const {
             raw.resize(per_frame, 0x69);  // DSD silence
             inter = &raw;
         }
-        // de-interleave (byte-interleaved channels)
-        for (size_t j = 0; j < inter->size(); j++) out[j % ch].push_back((*inter)[j]);
+        // de-interleave the byte-interleaved channels, in DSF's bit order
+        const uint8_t* in = inter->data();
+        for (size_t c = 0; c < ch; c++) {
+            uint8_t* o = out[c].data() + i * SACD_FRAME_BYTES;
+            for (size_t j = 0; j < SACD_FRAME_BYTES; j++) o[j] = BIT_REVERSE[in[j * ch + c]];
+        }
     }
     return out;
 }
@@ -551,8 +558,7 @@ void DsfTrack::read_data(uint64_t a, uint64_t b, Bytes& out) const {
             const Bytes& src = (*data)[size_t(c)];
             WM_ENSURE(off < src.size(), "internal: byte {} of a {}-byte chunk", off, src.size());
             uint64_t n = std::min({run, uint64_t(src.size()) - off, bytes_per_ch_ - jj});
-            const uint8_t* s = src.data() + off;
-            for (uint64_t x = 0; x < n; x++) dst[x] = BIT_REVERSE[s[x]];
+            std::memcpy(dst, src.data() + off, size_t(n));
             dst += n, pos += n, jj += n, run -= n;
         }
     }
