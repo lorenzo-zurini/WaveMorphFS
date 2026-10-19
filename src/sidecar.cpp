@@ -120,29 +120,37 @@ Sidecar Sidecar::parse(const std::string& text) {
     return sc;
 }
 
+void Sidecar::merge(const Sidecar& later, int64_t later_mtime) {
+    // merge, not overlay: removals ("KEY": "") must survive to be applied
+    album.merge(later.album);
+    for (auto& [k, v] : later.tracks) tracks[k].merge(v);
+    for (auto& [k, v] : later.files) files[k].merge(v);
+    for (auto& [k, v] : later.track_names) track_names[k] = v;
+    hidden.insert(later.hidden.begin(), later.hidden.end());
+    hidden_tracks.insert(later.hidden_tracks.begin(), later.hidden_tracks.end());
+    // "_target"s are not merged: they are read from the tags tree only (placement.cpp)
+    if (later.cover) cover = later.cover;
+    for (auto& [k, v] : later.track_covers) track_covers[k] = v;
+    for (auto& [k, v] : later.file_covers) file_covers[k] = v;
+    mtime = std::max(mtime.value_or(later_mtime), later_mtime);
+}
+
+std::vector<fs::path> Sidecar::paths(const fs::path& src_dir, const std::optional<fs::path>& overlay_dir) {
+    std::vector<fs::path> out = {src_dir / SIDECAR_NAME};
+    if (overlay_dir) out.push_back(*overlay_dir / SIDECAR_NAME);
+    return out;
+}
+
 std::optional<Sidecar> Sidecar::load(const fs::path& src_dir, const std::optional<fs::path>& overlay_dir) {
     std::optional<Sidecar> out;
-    std::vector<fs::path> candidates = {src_dir / SIDECAR_NAME};
-    if (overlay_dir) candidates.push_back(*overlay_dir / SIDECAR_NAME);
-    for (auto& p : candidates) {
+    for (auto& p : paths(src_dir, overlay_dir)) {
         auto m = mtime_ns(p);
         if (!m) continue;
         auto text = try_read_text(p);
         WM_ENSURE(text.has_value(), "read {}", p.string());
         Sidecar sc = with_context("parse " + p.string(), [&] { return parse(*text); });
         if (!out) out.emplace();
-        // merge, not overlay: removals ("KEY": "") must survive to be applied
-        out->album.merge(sc.album);
-        for (auto& [k, v] : sc.tracks) out->tracks[k].merge(v);
-        for (auto& [k, v] : sc.files) out->files[k].merge(v);
-        for (auto& [k, v] : sc.track_names) out->track_names[k] = v;
-        out->hidden.insert(sc.hidden.begin(), sc.hidden.end());
-        out->hidden_tracks.insert(sc.hidden_tracks.begin(), sc.hidden_tracks.end());
-        // "_target"s are not merged: they are read from the tags tree only (placement.cpp)
-        if (sc.cover) out->cover = sc.cover;
-        for (auto& [k, v] : sc.track_covers) out->track_covers[k] = v;
-        for (auto& [k, v] : sc.file_covers) out->file_covers[k] = v;
-        out->mtime = std::max(out->mtime.value_or(*m), *m);
+        out->merge(sc, *m);
     }
     return out;
 }
