@@ -44,6 +44,9 @@ public:
         uint32_t count;  // samples
     };
     fs::path path;
+    /// the source version indexed (cache names derive from it, not from the file
+    /// as it is when they are written)
+    SrcKey key;
     uint32_t sample_rate = 0, channels = 0;
     uint64_t total = 0;
     uint64_t audio_end = 0;  // end of the last block (tags follow)
@@ -61,7 +64,7 @@ public:
 private:
     // encoder settings taken from the source
     int bits_ = 0, bytes_ = 0, norm_exp_ = 0, channel_mask_ = 0, qmode_ = 0, mode_ = 0;
-    bool float_ = false;
+    std::string chan_ids_;  // identities of the channels beyond the mask, if any are assigned
     void read_settings();
 };
 
@@ -73,9 +76,15 @@ Bytes rebuild_block(std::span<const uint8_t> block, uint64_t index, uint64_t tot
 struct WvLayout {
     uint32_t head = 0, tail = 0;
 };
-/// Layouts of tracks [s, e) of `img`, from the cache or measured (and cached) now.
-std::vector<WvLayout> wv_layouts(const WvImage& img, const std::vector<std::pair<uint64_t, uint64_t>>& ranges, const Cache* cache);
-fs::path wv_layout_path(const WvImage& img, const std::vector<std::pair<uint64_t, uint64_t>>& ranges, const Cache& cache);
+using Ranges = std::vector<std::pair<uint64_t, uint64_t>>;
+/// Layouts of tracks [s, e) of `img` from the cache, if they have been measured.
+std::optional<std::vector<WvLayout>> load_wv_layout(const WvImage& img, const Ranges& ranges, const Cache& cache);
+/// Measure them now (re-encoding each track's head and tail, which can take a
+/// while in the slower WavPack modes: a job for a background worker) and cache them.
+std::vector<WvLayout> build_wv_layout(const WvImage& img, const Ranges& ranges, const Cache* cache);
+/// From the cache, or measured (and cached) now.
+std::vector<WvLayout> wv_layouts(const WvImage& img, const Ranges& ranges, const Cache* cache);
+fs::path wv_layout_path(const WvImage& img, const Ranges& ranges, const Cache& cache);
 
 class WvTrack : public VFile, public Trimmable, public std::enable_shared_from_this<WvTrack> {
 public:
@@ -95,7 +104,7 @@ private:
     Shared part_bytes(Shared& cell, const Part& p) const;
     /// Copied block i (of [b1, b2)) as served, kept briefly: readers often ask for
     /// a few KB at a time, and a block is ~100 KB.
-    Shared block_bytes(size_t i) const;
+    Shared block_bytes(size_t i, std::optional<File>& file) const;
     std::shared_ptr<const std::vector<uint64_t>> vstarts() const;
     void read_copy(uint64_t off, size_t len, Bytes& out) const;
 
