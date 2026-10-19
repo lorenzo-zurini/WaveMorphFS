@@ -1,9 +1,25 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "md5.hpp"
 
+#include <algorithm>
 #include <cstring>
 
 namespace wm {
+
+void md5_pcm(Md5& md5, std::span<const std::span<const int32_t>> chans, size_t lo, size_t hi, uint32_t bps) {
+    size_t bytes = (bps + 7) / 8, per = bytes * chans.size();
+    uint8_t buf[8192];
+    size_t step = std::max<size_t>(1, sizeof buf / per);  // samples per chunk
+    for (size_t i0 = lo; i0 < hi; i0 += step) {
+        size_t i1 = std::min(hi, i0 + step), n = 0;
+        for (size_t i = i0; i < i1; i++)
+            for (auto& c : chans) {
+                uint32_t v = uint32_t(c[i]);
+                for (size_t k = 0; k < bytes; k++) buf[n++] = uint8_t(v >> (8 * k));
+            }
+        md5.update({buf, n});
+    }
+}
 
 static const uint32_t K[64] = {
     0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501, 0x698098d8, 0x8b44f7af, 0xffff5bb1,

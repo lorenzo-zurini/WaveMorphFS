@@ -75,6 +75,7 @@ if(WAVEMORPH_TESTS)
   enable_testing()
   add_executable(wavemorphfs-tests
     tests/main.cpp
+    tests/test_audio.cpp
     tests/test_flac.cpp
     tests/test_formats.cpp
     tests/test_fs.cpp
