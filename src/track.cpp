@@ -154,7 +154,7 @@ FlacTrack::FlacTrack(std::shared_ptr<const FlacImage> img, uint64_t start, uint6
     tsi.bps = si.bps;
     tsi.total_samples = end - start;
     if (md5) tsi.md5 = *md5;  // all-zero = unknown until the background job has computed it
-    std::vector<flac::HeaderBlock> meta = {{flac::BLOCK_VORBIS, flac::build_vorbis("WaveMorphFS", tags.to_pairs())}};
+    std::vector<flac::HeaderBlock> meta = {{flac::BLOCK_VORBIS, flac::build_vorbis("WaveMorphFS", vorbis_comments(tags))}};
     meta.insert(meta.end(), pictures.begin(), pictures.end());
     meta.push_back({flac::BLOCK_PADDING, Zeros{flac::EDIT_PADDING}});
     header_ = Segments(flac::header_segments(tsi.encode(0, 0), meta));
