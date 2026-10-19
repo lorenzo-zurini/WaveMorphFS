@@ -175,8 +175,11 @@ int commit(Handle& h) {
     try {
         auto& n = h.node;
         auto& ws = *h.session;
-        Tags before = read_file_tags(n.tag_ext, [&](uint64_t o, size_t l) { return n.file->read_at(o, l); }, n.file->size());
-        Tags after = read_file_tags(n.tag_ext, [&](uint64_t o, size_t l) { return ws.read(o, l); }, ws.size());
+        uint64_t seen = ws.changes();  // what is read back below includes these
+        Tags before = with_context("generated file", [&] {
+            return read_file_tags(n.tag_ext, [&](uint64_t o, size_t l) { return n.file->read_at(o, l); }, n.file->size());
+        });
+        Tags after = with_context("edited file", [&] { return read_file_tags(n.tag_ext, [&](uint64_t o, size_t l) { return ws.read(o, l); }, ws.size()); });
         Tags changes = tag_changes(before, after);
         if (changes.empty()) {
             info("edit of {}: no tag changes", h.path);
@@ -186,7 +189,7 @@ int commit(Handle& h) {
             for (auto& [k, v] : changes.m) what += (what.empty() ? "" : ", ") + k + (v.empty() ? " (removed)" : "");
             info("edit of {}: {} -> sidecar {}[{}]", h.path, what, n.tag_section, n.tag_key);
         }
-        ws.mark_clean();
+        ws.mark_stored(seen);
         return 0;
     } catch (const std::exception& e) {
         warn("edit of {} not stored: {}", h.path, e.what());
