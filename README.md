@@ -112,6 +112,31 @@ Beyond splitting and converting:
   checksums before its tracks are shown, so damaged files and files still being
   copied stay out of the library.
 
+## Is it lossless?
+
+Yes, for every format. Nothing is resampled, reduced in bit depth or downmixed,
+and no audio goes through a lossy codec: 24-bit/192 kHz stays 24-bit/192 kHz,
+DSD stays DSD, 5.1 stays 5.1, and every path is checked to produce the same
+samples as the source.
+
+| Source                                               | Served as      | What happens to the audio |
+|------------------------------------------------------|----------------|---------------------------|
+| FLAC image + CUE                                     | FLAC tracks    | The source's frames are copied as they are; only the frames at the track boundaries are rewritten, uncompressed. |
+| APE, WavPack, TTA, TAK, WAV, AIFF, ALAC (integer)    | FLAC tracks    | Decoded and encoded to FLAC at the same rate and bit depth (up to 32-bit). Each track carries the MD5 of its audio, so `flac -t` proves it matches. |
+| 32-bit float WavPack                                 | WavPack tracks | Stays float. The image's own blocks are copied; only the track edges are encoded again, losslessly. |
+| SACD ISO, plain DSD or DST                           | DSF tracks     | Stays 1-bit DSD, never converted to PCM. DST is lossless compression and is decoded back to the original DSD bits. |
+| MP3, M4A (AAC or ALAC), FLAC, DSF                    | the same file  | Audio bytes untouched; only the tag area changes. |
+
+Two things can look like a change but aren't:
+
+- **File sizes.** APE compresses harder than FLAC, so APE tracks served as FLAC
+  are usually a little larger than the APE file. DSF has no compression, so DST
+  discs come out larger than the ISO. In both cases the decoded audio is the
+  same.
+- **Cover art.** The only thing ever scaled down is a picture you add with
+  `_cover`: images over 1024 px or 2 MB are resized once. Pictures already
+  inside your files are passed through as they are.
+
 ## Quick start with Docker
 
 This is a complete stack: WaveMorphFS mounts your music,
@@ -539,6 +564,11 @@ on every change.
 - Linux only.
 - Variable-blocksize FLAC images can't be cut by copying frames; their tracks
   are encoded on the fly like APE.
+- Floating-point WAV and AIFF images are not split yet (float WavPack is); they
+  stay visible as their original files.
+- Hybrid WavPack (a lossy `.wv` plus a `.wvc` correction file): the correction
+  file isn't used, so integer hybrid files are served from the lossy `.wv` part,
+  and float hybrid files are left as they are.
 - Fragmented MP4 files aren't retagged, and `_cover` leaves M4A files alone.
 - Sidecar tags apply to FLAC, MP3, M4A, DSF and WavPack. Ogg, Opus and
   standalone WAV or AIFF files are passed through as they are.
