@@ -4,6 +4,7 @@
 #include <wavpack/wavpack.h>
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
 
 #include "apetag.hpp"
@@ -25,6 +26,8 @@ constexpr size_t H_SIZE = 4, H_VERSION = 8, H_INDEX_HI = 10, H_TOTAL_HI = 11, H_
 constexpr uint16_t MIN_VERSION = 0x402, MAX_VERSION = 0x410;
 /// samples decoded per call while verifying
 constexpr uint32_t CHUNK = 1 << 16;
+/// bump when plan() or encode() change what a track's head and tail are
+constexpr int LAYOUT_VERSION = 1;
 /// copied blocks kept per track while it is read (~1 MB of 192 kHz stereo float)
 constexpr size_t CACHE_BLOCKS = 8;
 
@@ -122,14 +125,23 @@ void WvImage::read_settings() {
     mode_ = WavpackGetMode(c.w);
     WM_ENSURE(!(mode_ & MODE_HYBRID), "{}: hybrid (lossy) WavPack", path.string());
     WM_ENSURE(!(qmode & QMODE_DSD_AUDIO), "{}: DSD WavPack", path.string());
+    // integer WavPack fits FLAC and is served as FLAC (AvImage)
+    WM_ENSURE(mode_ & MODE_FLOAT, "{}: not floating-point WavPack", path.string());
     sample_rate = WavpackGetSampleRate(c.w);
     channels = uint32_t(WavpackGetNumChannels(c.w));
     bits_ = WavpackGetBitsPerSample(c.w);
     bytes_ = WavpackGetBytesPerSample(c.w);
-    float_ = mode_ & MODE_FLOAT;
     norm_exp_ = WavpackGetFloatNormExp(c.w);
     channel_mask_ = WavpackGetChannelMask(c.w);
     qmode_ = qmode & 0xFF;  // the bits stored in the file
+    // Identities of the channels the mask does not cover (it covers the first
+    // ones). libwavpack stores them in the first block only, so re-encoded track
+    // heads must be given them again; 0xFF (unassigned) is what it assumes anyway.
+    std::string ids(channels + 1, '\0');
+    WavpackGetChannelIdentities(c.w, reinterpret_cast<unsigned char*>(ids.data()));
+    ids.resize(std::strlen(ids.c_str()));
+    ids.erase(0, std::min<size_t>(ids.size(), size_t(std::popcount(uint32_t(channel_mask_)))));
+    if (ids.find_first_not_of('\xFF') != std::string::npos) chan_ids_ = ids;
 }
 
 std::shared_ptr<WvImage> WvImage::open(const fs::path& p, const Cache* cache) {
@@ -199,13 +211,13 @@ std::shared_ptr<WvImage> WvImage::open(const fs::path& p, const Cache* cache) {
         std::vector<int32_t> buf(size_t(CHUNK) * img->channels);
         uint64_t got = 0;
         while (uint32_t n = WavpackUnpackSamples(c.w, buf.data(), CHUNK)) {
-            if (img->float_) md5.update({reinterpret_cast<const uint8_t*>(buf.data()), size_t(n) * img->channels * 4});
+            md5.update({reinterpret_cast<const uint8_t*>(buf.data()), size_t(n) * img->channels * 4});
             got += n;
         }
         WM_ENSURE(WavpackGetNumErrors(c.w) == 0, "{} damaged blocks", WavpackGetNumErrors(c.w));
         WM_ENSURE(got == img->total, "decoded {} of {} samples", got, img->total);
         uint8_t want_md5[16];
-        if (img->float_ && WavpackGetMD5Sum(c.w, want_md5)) WM_ENSURE(md5.finish() == std::to_array(want_md5), "audio MD5 mismatch");
+        if (WavpackGetMD5Sum(c.w, want_md5)) WM_ENSURE(md5.finish() == std::to_array(want_md5), "audio MD5 mismatch");
     });
     WM_ENSURE(SrcKey::of(p) == key, "{} changed while indexing", p.string());
     if (cache) {
@@ -251,6 +263,7 @@ Bytes WvImage::encode(uint64_t s, uint64_t e, uint64_t out_first, uint64_t out_t
         return 1;
     };
     Context c(WavpackOpenFileOutput(sink, &out, nullptr));
+    WM_ENSURE(c.w, "libwavpack: cannot create an encoder");
     WavpackConfig cfg;
     std::memset(&cfg, 0, sizeof cfg);
     cfg.bits_per_sample = bits_;
@@ -258,7 +271,7 @@ Bytes WvImage::encode(uint64_t s, uint64_t e, uint64_t out_first, uint64_t out_t
     cfg.num_channels = int(channels);
     cfg.channel_mask = channel_mask_;
     cfg.sample_rate = int32_t(sample_rate);
-    cfg.float_norm_exp = float_ ? norm_exp_ : 0;
+    cfg.float_norm_exp = norm_exp_;
     cfg.qmode = qmode_;
     // the source's mode; one thread, so the output is the same every time
     if (mode_ & MODE_FAST) cfg.flags |= CONFIG_FAST_FLAG;
@@ -269,8 +282,9 @@ Bytes WvImage::encode(uint64_t s, uint64_t e, uint64_t out_first, uint64_t out_t
         cfg.xmode = (mode_ & MODE_XMODE) >> 12;
     }
     cfg.worker_threads = 0;
+    auto ids = chan_ids_.empty() ? nullptr : reinterpret_cast<const unsigned char*>(chan_ids_.c_str());
     uint64_t n = e - s;
-    WM_ENSURE(WavpackSetConfiguration64(c.w, &cfg, int64_t(n), nullptr) && WavpackPackInit(c.w) &&
+    WM_ENSURE(WavpackSetConfiguration64(c.w, &cfg, int64_t(n), ids) && WavpackPackInit(c.w) &&
                   WavpackPackSamples(c.w, pcm.data(), uint32_t(n)) && WavpackFlushSamples(c.w),
               "{}: encoding samples {}..{}: {}", path.string(), s, e, WavpackGetErrorMessage(c.w));
     // number the blocks for the track; without the WAV header libwavpack makes
@@ -352,8 +366,9 @@ Plan plan(const WvImage& img, uint64_t s, uint64_t e) {
 }  // namespace
 
 fs::path wv_layout_path(const WvImage& img, const std::vector<std::pair<uint64_t, uint64_t>>& ranges, const Cache& cache) {
-    // sizes depend on the encoder, so its version is part of the name
-    std::string extra = std::format("wavpack-tracks {}", WavpackGetLibraryVersionString());
+    // sizes depend on the encoder, so its version is part of the name, and so is
+    // LAYOUT_VERSION, for changes to how tracks are planned or encoded here
+    std::string extra = std::format("wavpack-tracks v{} {}", LAYOUT_VERSION, WavpackGetLibraryVersionString());
     for (auto& [s, e] : ranges) extra += std::format(" {}-{}", s, e);
     return cache.dir() / "flacidx" / (Cache::name_for(img.path, SrcKey::of(img.path), extra) + ".wvlayout");
 }

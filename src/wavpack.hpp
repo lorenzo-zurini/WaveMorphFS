@@ -61,7 +61,7 @@ public:
 private:
     // encoder settings taken from the source
     int bits_ = 0, bytes_ = 0, norm_exp_ = 0, channel_mask_ = 0, qmode_ = 0, mode_ = 0;
-    bool float_ = false;
+    std::string chan_ids_;  // identities of the channels beyond the mask, if any are assigned
     void read_settings();
 };
 
