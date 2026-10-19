@@ -17,6 +17,16 @@
 
 namespace wm {
 
+/// Each byte with its bit order reversed: DSD bytes are MSB-first on SACD (and
+/// in DST), LSB-first in DSF files.
+inline constexpr std::array<uint8_t, 256> BIT_REVERSE = [] {
+    std::array<uint8_t, 256> t{};
+    for (size_t i = 0; i < 256; i++)
+        for (size_t k = 0; k < 8; k++)
+            if (i >> k & 1) t[i] |= uint8_t(0x80 >> k);
+    return t;
+}();
+
 class DstDecoder {
 public:
     static constexpr size_t MAX_CHANNELS = 6;

@@ -15,23 +15,18 @@ namespace {
 
 constexpr uint64_t SECTOR = 2048;
 constexpr uint64_t MASTER_TOC = 510;
-constexpr uint64_t DSF_BLOCK = 4096;
+constexpr uint64_t DSF_BLOCK = 4096;  // bytes per channel per block
+// DSF chunks before the audio: "DSD " (28 bytes), "fmt " (52), "data" header (12)
+constexpr uint64_t DSF_DSD_CHUNK = 28, DSF_FMT_CHUNK = 52, DSF_DATA_HEADER = 12;
+constexpr uint64_t DSF_AUDIO_START = DSF_DSD_CHUNK + DSF_FMT_CHUNK + DSF_DATA_HEADER;
+static_assert(DstDecoder::SAMPLES_PER_FRAME == SACD_FRAME_BYTES * 8);
 constexpr uint8_t DATA_AUDIO = 2;
-/// decoded chunks kept per disc, and decoded ahead of the reader
+/// decoded chunks kept per disc (~17 s of audio)
 constexpr size_t CACHE_CHUNKS = 160;
-constexpr uint64_t AHEAD_CHUNKS = 48;  // ~5 s of audio, decoded in parallel
+/// chunks decoded ahead of a reader moving forward, in parallel (~5 s of audio)
+constexpr uint64_t AHEAD_CHUNKS = 48;
 const char IDX_MAGIC_V1[8] = {'W', 'M', 'S', 'A', 'C', 'D', '0', '1'};  // frame starts only
 const char IDX_MAGIC[8] = {'W', 'M', 'S', 'A', 'C', 'D', '0', '2'};     // frame starts + end marker
-
-const auto BITREV = [] {
-    std::array<uint8_t, 256> t{};
-    for (int i = 0; i < 256; i++) {
-        uint8_t b = uint8_t(i), r = 0;
-        for (int k = 0; k < 8; k++) r = uint8_t(r << 1 | ((b >> k) & 1));
-        t[size_t(i)] = r;
-    }
-    return t;
-}();
 
 uint64_t tc(const uint8_t* b) { return (uint64_t(b[0]) * 60 + b[1]) * 75 + b[2]; }
 
@@ -160,15 +155,12 @@ std::optional<SacdFrames> load_frames(const fs::path& p, uint64_t area_end) {
     bool v1 = std::memcmp(b, IDX_MAGIC_V1, 8) == 0;
     if (!v1 && std::memcmp(b, IDX_MAGIC, 8) != 0) return std::nullopt;
     uint64_t n = le64(b + 8);
-    if (m->bytes.size() != 16 + n * 6) return std::nullopt;
+    if (m->bytes.size() != 16 + n * SacdFrames::RECORD) return std::nullopt;
     if (!v1) return SacdFrames(std::move(*m), 16, size_t(n));
     // v1 caches were only written for discs whose area ends cleanly; they lack the end marker
     Frames fr;
     fr.reserve(size_t(n) + 1);
-    for (size_t i = 0; i < n; i++) {
-        const uint8_t* c = b + 16 + 6 * i;
-        fr.emplace_back(le32(c), uint16_t(c[4] | c[5] << 8));
-    }
+    for (size_t i = 0; i < n; i++) fr.push_back(SacdFrames::record(b + 16 + SacdFrames::RECORD * i));
     fr.emplace_back(uint32_t(area_end + 1), 0);
     // upgrade the cache file to the current format, which can be used in place
     try {
@@ -510,26 +502,26 @@ DsfTrack::DsfTrack(std::shared_ptr<const SacdDisc> disc, size_t track, const Tag
     bytes_per_ch_ = (t.end - t.start) * SACD_FRAME_BYTES;
     data_len_ = (bytes_per_ch_ + DSF_BLOCK - 1) / DSF_BLOCK * DSF_BLOCK * ch;
     id3_ = Segments(id3::build_segments(tags, cover));
-    uint64_t total = 28 + 52 + 12 + data_len_ + id3_.size();
     Bytes& h = header_;
     append(h, std::string_view("DSD "));
-    put_le64(h, 28);
-    put_le64(h, total);
-    put_le64(h, 28 + 52 + 12 + data_len_);  // metadata pointer
+    put_le64(h, DSF_DSD_CHUNK);
+    put_le64(h, DSF_AUDIO_START + data_len_ + id3_.size());
+    put_le64(h, DSF_AUDIO_START + data_len_);  // metadata pointer
     append(h, std::string_view("fmt "));
-    put_le64(h, 52);
+    put_le64(h, DSF_FMT_CHUNK);
     put_le32(h, 1);  // format version
     put_le32(h, 0);  // DSD raw
     uint32_t ch_type = ch <= 4 ? uint32_t(ch) : ch == 5 ? 6 : 7;
     put_le32(h, ch_type);
     put_le32(h, uint32_t(ch));
-    put_le32(h, 2'822'400);
+    put_le32(h, DSD64_RATE);
     put_le32(h, 1);                    // bits per sample: 1 = LSB first
     put_le64(h, bytes_per_ch_ * 8);    // sample count per channel
     put_le32(h, uint32_t(DSF_BLOCK));
     put_le32(h, 0);
     append(h, std::string_view("data"));
-    put_le64(h, 12 + data_len_);
+    put_le64(h, DSF_DATA_HEADER + data_len_);
+    WM_ENSURE(h.size() == DSF_AUDIO_START, "internal: DSF header of {} bytes", h.size());
 }
 
 void DsfTrack::read_data(uint64_t a, uint64_t b, Bytes& out) const {
@@ -560,7 +552,7 @@ void DsfTrack::read_data(uint64_t a, uint64_t b, Bytes& out) const {
             WM_ENSURE(off < src.size(), "internal: byte {} of a {}-byte chunk", off, src.size());
             uint64_t n = std::min({run, uint64_t(src.size()) - off, bytes_per_ch_ - jj});
             const uint8_t* s = src.data() + off;
-            for (uint64_t x = 0; x < n; x++) dst[x] = BITREV[s[x]];
+            for (uint64_t x = 0; x < n; x++) dst[x] = BIT_REVERSE[s[x]];
             dst += n, pos += n, jj += n, run -= n;
         }
     }
