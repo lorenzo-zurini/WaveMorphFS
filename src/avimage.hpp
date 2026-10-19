@@ -9,12 +9,11 @@
 #pragma once
 
 #include <array>
-#include <future>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <vector>
 
+#include "futurelru.hpp"
 #include "tags.hpp"
 #include "util.hpp"
 
@@ -49,12 +48,19 @@ public:
     struct Decoder;
 
 private:
+    /// decode this many samples beyond the one being read, in parallel (~30 s at 44.1 kHz)
+    static constexpr uint64_t READ_AHEAD_SAMPLES = 1'500'000;
+    /// decoded samples (per channel) kept per image while it is read: the read-ahead
+    /// plus as much again behind it (APE packets are up to 294912 samples each)
+    static constexpr uint64_t CACHE_SAMPLES = 2 * READ_AHEAD_SAMPLES;
+
     using Samples = std::shared_ptr<const std::vector<std::vector<int32_t>>>;
+    using Packets = FutureLru<size_t, Samples>;
     /// Samples of packet k, decoding it (and queueing read-ahead) if needed.
     Samples packet_samples(size_t k) const;
     /// Cached or in-flight packet k; otherwise queued on the pool, or with
     /// `claimed` handed to the caller to decode. mu_ held.
-    std::shared_future<Samples> start(size_t k, std::shared_ptr<std::promise<Samples>>* claimed) const;
+    Packets::Future start(size_t k, Packets::Promise* claimed) const;
     void fulfil(size_t k, std::promise<Samples>& promise) const;
     void prefetch_after(size_t k) const;
     Samples decode_packet(size_t k) const;
@@ -64,12 +70,7 @@ private:
     std::vector<Packet> packets_;
     mutable std::mutex mu_;
     mutable std::vector<std::unique_ptr<Decoder>> idle_;  // decoders not in use
-    struct Cached {
-        std::shared_future<Samples> samples;
-        uint64_t used;
-    };
-    mutable std::map<size_t, Cached> cache_;  // decoded (or decoding) packets
-    mutable uint64_t clock_ = 0;
+    mutable Packets cache_{CACHE_SAMPLES};  // decoded (or decoding) packets, cost = samples
     mutable size_t last_packet_ = SIZE_MAX;  // most recent packet a reader asked for (mu_)
 };
 

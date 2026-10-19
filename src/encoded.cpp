@@ -18,9 +18,9 @@ fs::path layout_path(const AvImage& img, const Ranges& ranges, const Cache& cach
 namespace {
 
 const char LAYOUT_MAGIC[8] = {'W', 'M', 'E', 'N', 'C', '0', '0', '1'};
-/// frames encoded per job, frames kept per track, frames encoded ahead of the reader
+/// frames encoded per job, frames encoded ahead of the reader (frames kept per
+/// track: EncodedTrack::CACHE_FRAMES)
 constexpr uint64_t JOB_FRAMES = 32;
-constexpr size_t CACHE_FRAMES = 512;
 constexpr uint64_t AHEAD_FRAMES = 256;  // ~24 s at 44.1 kHz
 /// frames decoded per batch while measuring
 constexpr uint64_t BATCH = 64;
@@ -126,31 +126,20 @@ EncodedTrack::EncodedTrack(std::shared_ptr<const AvImage> img, uint64_t start, u
 
 void EncodedTrack::drop_cached() const {
     std::lock_guard g(mu_);
-    std::erase_if(frames_, [](auto& kv) { return kv.second.frame.wait_for(std::chrono::seconds(0)) == std::future_status::ready; });
+    frames_.drop_ready();
     last_end_ = UINT64_MAX;
 }
 
-EncodedTrack::Promises EncodedTrack::claim(uint64_t a, uint64_t b) const {
+EncodedTrack::Promises EncodedTrack::claim(uint64_t a, uint64_t b, std::vector<Frames::Future>* need) const {
     Promises ps;
     for (uint64_t j = a; j < b; j++) {
-        if (auto it = frames_.find(j); it != frames_.end()) {
-            it->second.used = ++clock_;
-            continue;
-        }
-        auto p = std::make_shared<std::promise<Frame>>();
-        frames_[j] = {p->get_future().share(), ++clock_};
-        ps.emplace_back(j, std::move(p));
+        Frames::Promise p;
+        auto f = frames_.get(j, 1, &p);
+        if (need) need->push_back(std::move(f));
+        if (p) ps.emplace_back(j, std::move(p));
     }
-    // bounded: drop the least recently used finished frames
-    while (frames_.size() > CACHE_FRAMES) {
-        auto victim = frames_.end();
-        for (auto it = frames_.begin(); it != frames_.end(); ++it)
-            if (it->second.frame.wait_for(std::chrono::seconds(0)) == std::future_status::ready &&
-                (victim == frames_.end() || it->second.used < victim->second.used))
-                victim = it;
-        if (victim == frames_.end()) break;
-        frames_.erase(victim);
-    }
+    // the frames just claimed or touched are about to be used: evict others
+    frames_.trim([&](uint64_t j) { return j >= a && j < b; });
     return ps;
 }
 
@@ -173,9 +162,9 @@ void EncodedTrack::produce(const Promises& ps) const {
         for (auto& [j, p] : ps) {
             try {
                 p->set_exception(std::current_exception());
+                frames_.forget(j, p.get());  // let a later read retry
             } catch (const std::future_error&) {  // already fulfilled
             }
-            frames_.erase(j);
         }
     }
 }
@@ -197,22 +186,17 @@ Bytes EncodedTrack::read_at(uint64_t off, size_t len) const {
     auto self = weak_from_this().lock();
     touch(self);
     std::vector<Promises> jobs, ahead;
-    std::vector<std::shared_future<Frame>> need;
+    std::vector<Frames::Future> need;  // held: later claims (read-ahead) may evict finished frames
     {
         std::lock_guard g(mu_);
-        // take each needed frame's future right after claiming it: later claims
-        // (read-ahead) may evict finished frames from the cache
-        for (uint64_t s = j0; s < j1; s += JOB_FRAMES) {
-            uint64_t e = std::min(j1, s + JOB_FRAMES);
-            if (auto ps = claim(s, e); !ps.empty()) jobs.push_back(std::move(ps));
-            for (uint64_t j = s; j < e; j++) need.push_back(frames_.at(j).frame);
-        }
+        for (uint64_t s = j0; s < j1; s += JOB_FRAMES)
+            if (auto ps = claim(s, std::min(j1, s + JOB_FRAMES), &need); !ps.empty()) jobs.push_back(std::move(ps));
         // read-ahead only for a reader moving forward
         bool sequential = last_end_ != UINT64_MAX && j0 + 1 >= last_end_ && j0 <= last_end_;
         last_end_ = j1;
         if (self && sequential)
             for (uint64_t s = j1; s < std::min(nframes, j1 + AHEAD_FRAMES); s += JOB_FRAMES)
-                if (auto ps = claim(s, std::min(nframes, s + JOB_FRAMES)); !ps.empty()) ahead.push_back(std::move(ps));
+                if (auto ps = claim(s, std::min(nframes, s + JOB_FRAMES), nullptr); !ps.empty()) ahead.push_back(std::move(ps));
     }
     for (size_t i = 1; i < jobs.size(); i++) {
         if (self) submit([self, ps = std::move(jobs[i])] { self->produce(ps); }, Lane::Encode);

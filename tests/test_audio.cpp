@@ -161,3 +161,32 @@ TEST(decode_file_fails_on_a_bad_frame_before_the_end) {
     atomic_write(bad, file);
     CHECK_THROWS(count(bad));
 }
+
+// ---- shared helpers
+
+#include "futurelru.hpp"
+
+TEST(future_lru_evicts_finished_least_recent_and_spares_kept) {
+    FutureLru<int, int> c(3);
+    std::vector<FutureLru<int, int>::Promise> ps(6);
+    for (int k = 0; k < 4; k++) c.get(k, 1, &ps[size_t(k)]);
+    CHECK(c.total_cost() == 4);
+    c.trim([](int) { return false; });
+    CHECK(c.size() == 4);  // all in flight: nothing can go
+    for (int k = 0; k < 4; k++) ps[size_t(k)]->set_value(k * 10);
+    FutureLru<int, int>::Promise none;
+    CHECK(c.get(0, 1, &none).get() == 0 && !none);  // 0 is now the most recent
+    c.trim([](int k) { return k == 1; });           // 1 is spared, 2 (least recent then) goes
+    CHECK(c.size() == 3);
+    c.get(2, 1, &ps[4]);
+    CHECK(ps[4] != nullptr);  // was evicted: claimed anew
+    c.get(3, 1, &none);
+    CHECK(!none);
+    // a failed claim is forgotten only while the entry is still that claim
+    c.forget(2, ps[2].get());
+    CHECK(c.size() == 4);
+    c.forget(2, ps[4].get());
+    CHECK(c.size() == 3);
+    c.drop_ready();
+    CHECK(c.size() == 0 && c.total_cost() == 0);
+}
