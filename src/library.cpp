@@ -22,7 +22,9 @@ namespace {
 /// servers re-read them once. 2026-10-01 13:00 UTC: C++ rewrite (tag synonyms,
 /// SACD genres, kept tag spelling, APE served as encoded FLAC).
 /// 2026-10-01 16:00 UTC: padding in generated tag areas (editable mount).
-constexpr int64_t OUTPUT_EPOCH_NS = 1790954138LL * 1'000'000'000;
+/// 2026-10-19 13:00 UTC: ID3v2.4 tags written without unsynchronisation (covers
+/// reach such MP3s).
+constexpr int64_t OUTPUT_EPOCH_NS = 1792414876LL * 1'000'000'000;
 
 const std::vector<std::string_view> AUDIO_IMAGE_EXT = {"flac", "ape", "wv", "tta", "tak", "wav", "m4a", "aiff", "aif"};
 /// A file modified more recently than this is assumed to still be written.

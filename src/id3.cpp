@@ -254,11 +254,22 @@ std::pair<SourceTag, size_t> parse_tag(std::span<const uint8_t> b) {
             // ID3v2.3: compressed/encrypted/grouped frames have a different layout in 2.4
             if (f.flags[1] & 0xE0) continue;
             f.flags[0] = f.flags[1] = 0;
+        } else if ((hflags & 0x80) || (f.flags[1] & 0x02)) {
+            // ID3v2.4 unsynchronises per frame; the header flag means all of them
+            // (writers set it without flagging the frames). Frames are kept plain,
+            // so the tag is written without unsynchronisation and new frames and
+            // pictures can sit next to them.
+            size_t dli = (f.flags[1] & 0x01) ? 4 : 0;
+            if (f.data.size() >= dli) {
+                Bytes plain(f.data.begin(), f.data.begin() + ptrdiff_t(dli));
+                append(plain, deunsync(std::span(f.data).subspan(dli)));
+                f.data = std::move(plain);
+            }
+            f.flags[1] &= uint8_t(~0x02);
         }
         tag.frames.push_back(std::move(f));
     }
     if (major == 3) tag.frames = upgrade_v23(std::move(tag.frames));
-    tag.flags = major == 4 ? (hflags & 0x80) : 0;
     return {std::move(tag), total};
 }
 
@@ -321,7 +332,7 @@ void apply(std::vector<Frame>& frames, const Tags& overlay) {
     }
 }
 
-Bytes serialize(uint8_t flags, const std::vector<Frame>& frames) {
+Bytes serialize(const std::vector<Frame>& frames) {
     Bytes body;
     for (auto& f : frames) {
         body.insert(body.end(), f.id, f.id + 4);
@@ -331,7 +342,7 @@ Bytes serialize(uint8_t flags, const std::vector<Frame>& frames) {
         append(body, f.data);
     }
     body.insert(body.end(), 4096, 0);  // padding, so tag editors can save in place
-    Bytes out = {'I', 'D', '3', 4, 0, flags};
+    Bytes out = {'I', 'D', '3', 4, 0, 0};
     append(out, synchsafe(uint32_t(body.size())));
     append(out, body);
     return out;
@@ -399,12 +410,8 @@ Tags read_tags(std::span<const uint8_t> tag) {
 namespace {
 
 /// serialize(), with the pictures replaced by `cover` (referenced, not copied).
-std::vector<Seg> serialize_segments(uint8_t flags, std::vector<Frame> frames, const Cover* cover) {
-    if (!cover) return {serialize(flags, frames)};
-    if (flags & 0x80) {  // whole-tag unsynchronisation: raw image bytes cannot be inserted
-        warn("cover {}: not embedded in an unsynchronised ID3 tag", cover->path->string());
-        return {serialize(flags, frames)};
-    }
+std::vector<Seg> serialize_segments(std::vector<Frame> frames, const Cover* cover) {
+    if (!cover) return {serialize(frames)};
     std::erase_if(frames, [](const Frame& f) { return f.sid() == "APIC"; });
     Bytes body;
     for (auto& f : frames) {
@@ -422,7 +429,7 @@ std::vector<Seg> serialize_segments(uint8_t flags, std::vector<Frame> frames, co
     body.push_back(0);
     body.push_back(0);
     uint64_t total = body.size() + apic_len + 4096;
-    Bytes out = {'I', 'D', '3', 4, 0, flags};
+    Bytes out = {'I', 'D', '3', 4, 0, 0};
     append(out, synchsafe(uint32_t(total)));
     append(out, body);
     std::vector<Seg> segs = {std::move(out)};
@@ -436,13 +443,13 @@ std::vector<Seg> serialize_segments(uint8_t flags, std::vector<Frame> frames, co
 std::vector<Seg> build_segments(const Tags& tags, const Cover* cover) {
     std::vector<Frame> frames;
     apply(frames, tags);
-    return serialize_segments(0, std::move(frames), cover);
+    return serialize_segments(std::move(frames), cover);
 }
 
 Bytes build(const Tags& tags) {
     std::vector<Frame> frames;
     apply(frames, tags);
-    return serialize(0, frames);
+    return serialize(frames);
 }
 
 std::pair<std::vector<Seg>, uint64_t> retag_at(const File& f, uint64_t pos, const Tags& overlay, const Cover* cover) {
@@ -459,7 +466,7 @@ std::pair<std::vector<Seg>, uint64_t> retag_at(const File& f, uint64_t pos, cons
         len = l;
     }
     apply(src.frames, overlay);
-    return {serialize_segments(src.flags, std::move(src.frames), cover), len};
+    return {serialize_segments(std::move(src.frames), cover), len};
 }
 
 std::pair<Bytes, uint64_t> retag_at(const File& f, uint64_t pos, const Tags& overlay) {
@@ -476,7 +483,7 @@ std::pair<Bytes, uint64_t> retag_at(const File& f, uint64_t pos, const Tags& ove
         len = l;
     }
     apply(src.frames, overlay);
-    return {serialize(src.flags, src.frames), len};
+    return {serialize(src.frames), len};
 }
 
 std::pair<Bytes, uint64_t> retag_mp3(const fs::path& p, const Tags& overlay) { return retag_at(File(p), 0, overlay); }
