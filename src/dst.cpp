@@ -134,13 +134,7 @@ struct Ac {
     }
 };
 
-uint8_t reverse8(uint8_t b) {
-    b = uint8_t((b & 0xF0) >> 4 | (b & 0x0F) << 4);
-    b = uint8_t((b & 0xCC) >> 2 | (b & 0x33) << 2);
-    return uint8_t((b & 0xAA) >> 1 | (b & 0x55) << 1);
-}
-
-uint32_t prob_dst_x_bit(int32_t c) { return uint32_t(reverse8(uint8_t(c & 127)) >> 1) + 1; }
+uint32_t prob_dst_x_bit(int32_t c) { return uint32_t(BIT_REVERSE[size_t(c & 127)] >> 1) + 1; }
 
 }  // namespace
 

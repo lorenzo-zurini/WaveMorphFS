@@ -23,8 +23,10 @@ namespace wm {
 
 class Cache;
 
-/// bytes per channel per 1/75 s frame at 64 x 44.1 kHz
-constexpr uint64_t SACD_FRAME_BYTES = 2'822'400 / 8 / 75;  // 4704
+/// 64 x 44.1 kHz, the only rate on SACDs
+constexpr uint32_t DSD64_RATE = 2'822'400;
+/// bytes per channel per 1/75 s frame
+constexpr uint64_t SACD_FRAME_BYTES = DSD64_RATE / 8 / 75;  // 4704
 
 bool is_sacd(const fs::path& p);
 /// True if the frame table of this ISO area is cached (opening is then cheap).
@@ -42,14 +44,14 @@ class SacdFrames {
 public:
     using Frame = std::pair<uint32_t, uint16_t>;
     SacdFrames() = default;
+    /// a frame in the cache file: sector (LE32), offset (LE16)
+    static constexpr size_t RECORD = 6;
+    static Frame record(const uint8_t* r) { return {le32(r), uint16_t(r[4] | r[5] << 8)}; }
+
     explicit SacdFrames(std::vector<Frame> v) : vec_(std::make_shared<const std::vector<Frame>>(std::move(v))), n_(vec_->size()) {}
     SacdFrames(MappedFile m, size_t first, size_t n) : map_(std::move(m)), recs_(map_.bytes.data() + first), n_(n) {}
     size_t size() const { return n_; }
-    Frame operator[](size_t i) const {
-        if (vec_) return (*vec_)[i];
-        const uint8_t* c = recs_ + 6 * i;
-        return {le32(c), uint16_t(c[4] | c[5] << 8)};
-    }
+    Frame operator[](size_t i) const { return vec_ ? (*vec_)[i] : record(recs_ + RECORD * i); }
 
 private:
     std::shared_ptr<const std::vector<Frame>> vec_;
