@@ -30,6 +30,10 @@ constexpr uint32_t DSD64_RATE = 2'822'400;
 constexpr uint64_t SACD_FRAME_BYTES = DSD64_RATE / 8 / 75;  // 4704
 
 bool is_sacd(const fs::path& p);
+/// True if the ISO has an area to serve: its main one (stereo, or multichannel if
+/// that is the only one), or with `multichannel` a separate multichannel one.
+/// SacdDisc::open fails for an area this says is missing.
+bool sacd_has_area(const fs::path& p, bool multichannel);
 /// True if the frame table of this ISO area is cached (opening is then cheap).
 bool sacd_is_cached(const Cache& c, const fs::path& src, bool multichannel);
 

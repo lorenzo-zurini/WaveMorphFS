@@ -189,7 +189,24 @@ void store_frames(const fs::path& p, const Frames& fr) {
     atomic_write(p, b);
 }
 
+/// Sector of the area TOC to serve from a master TOC, 0 if there is none: the
+/// stereo area, falling back to multichannel if it is the only one. That one is
+/// then not offered again as the multichannel area: it is the disc's main area
+/// already, and would be listed (and scanned) twice.
+uint64_t area_toc(std::span<const uint8_t> master, bool multichannel) {
+    uint64_t stereo = be32(&master[64]), mc = be32(&master[72]);
+    return multichannel ? (stereo ? mc : 0) : stereo ? stereo : mc;
+}
+
 }  // namespace
+
+bool sacd_has_area(const fs::path& p, bool multichannel) {
+    File f(p);
+    Bytes m(SECTOR);
+    f.read_exact_at(m.data(), m.size(), MASTER_TOC * SECTOR);
+    WM_ENSURE(std::memcmp(m.data(), "SACDMTOC", 8) == 0, "{}: no SACD master TOC", p.string());
+    return area_toc(m, multichannel) != 0;
+}
 
 bool is_sacd(const fs::path& p) {
     try {
@@ -217,7 +234,6 @@ std::shared_ptr<SacdDisc> SacdDisc::open(const fs::path& path, const Cache* cach
     };
     Bytes m = sec(MASTER_TOC, 1);
     WM_ENSURE(std::memcmp(m.data(), "SACDMTOC", 8) == 0, "no SACD master TOC");
-    uint64_t area1 = be32(&m[64]), area2 = be32(&m[72]);
     auto catalog = cstr_at(std::span(m).first(40), 24, 0);  // 16 bytes, NUL- or space-padded
     uint16_t set_size = be16(&m[16]), set_seq = be16(&m[18]), year = be16(&m[120]);
     const char* genre = nullptr;
@@ -227,10 +243,7 @@ std::shared_ptr<SacdDisc> SacdDisc::open(const fs::path& path, const Cache* cach
     }
     uint8_t master_charset = m[138];  // first locale: [lang, lang, charset, reserved] at 136
 
-    // The stereo area, falling back to multichannel if it is the only one. That
-    // one is then not offered again as the multichannel area: it is the disc's
-    // main area already, and would be listed (and scanned) twice.
-    uint64_t area_start = multichannel ? (area1 ? area2 : 0) : area1 ? area1 : area2;
+    uint64_t area_start = area_toc(m, multichannel);
     WM_ENSURE(area_start != 0, "{}", multichannel ? "no multichannel area" : "no audio area");
     Bytes at = sec(area_start, 1);
     WM_ENSURE(std::memcmp(at.data(), "TWOCHTOC", 8) == 0 || std::memcmp(at.data(), "MULCHTOC", 8) == 0, "bad area TOC signature");
