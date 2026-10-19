@@ -297,3 +297,22 @@ TEST(sacd_track_list_not_ending_with_the_last_track) {
     auto disc = SacdDisc::open(iso, nullptr, false);
     for (size_t t = 0; t < 2; t++) check_dsf(disc, t, a, expected_dsf_audio(a.frames, a.tracks[t].first, a.tracks[t].second, 2));
 }
+
+TEST(sacd_multichannel_only_disc_is_served_once) {
+    Dir d;
+    Area mc;
+    mc.channels = 6;
+    mc.frames = dsd_frames(9, 6, 5);
+    mc.tracks = {{0, 9}};
+    fs::path iso = d.path / "disc.iso";
+    atomic_write(iso, make_iso(std::nullopt, mc));
+    auto disc = SacdDisc::open(iso, nullptr, false);  // the main area
+    CHECK(disc->channels == 6);
+    check_dsf(disc, 0, mc, expected_dsf_audio(mc.frames, 0, 9, 6));
+    try {
+        SacdDisc::open(iso, nullptr, true);
+        CHECK_MSG(false, "the multichannel area was offered a second time");
+    } catch (const Error& e) {
+        CHECK_MSG(std::string(e.what()).find("no multichannel area") != std::string::npos, "{}", e.what());
+    }
+}

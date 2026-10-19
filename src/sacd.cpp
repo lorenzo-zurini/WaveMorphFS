@@ -228,8 +228,10 @@ std::shared_ptr<SacdDisc> SacdDisc::open(const fs::path& path, const Cache* cach
     }
     uint8_t master_charset = m[138];  // first locale: [lang, lang, charset, reserved] at 136
 
-    // the stereo area, falling back to multichannel if it is the only one
-    uint64_t area_start = multichannel ? area2 : area1 ? area1 : area2;
+    // The stereo area, falling back to multichannel if it is the only one. That
+    // one is then not offered again as the multichannel area: it is the disc's
+    // main area already, and would be listed (and scanned) twice.
+    uint64_t area_start = multichannel ? (area1 ? area2 : 0) : area1 ? area1 : area2;
     WM_ENSURE(area_start != 0, "{}", multichannel ? "no multichannel area" : "no audio area");
     Bytes at = sec(area_start, 1);
     WM_ENSURE(std::memcmp(at.data(), "TWOCHTOC", 8) == 0 || std::memcmp(at.data(), "MULCHTOC", 8) == 0, "bad area TOC signature");
