@@ -20,6 +20,7 @@
 #include "fs.hpp"
 #include "library.hpp"
 #include "util.hpp"
+#include "version.hpp"
 
 using namespace wm;
 
@@ -28,6 +29,7 @@ namespace {
 const char* USAGE = R"USAGE(wavemorphfs - present pristine audio files as split, tagged tracks via FUSE
 
 usage: wavemorphfs [global options] <command> [arguments]
+       wavemorphfs --version | --help
 
 commands:
   mount <mountpoint>        mount the filesystem (runs in the foreground)
@@ -118,6 +120,9 @@ Cli parse_args(int argc, char** argv) {
         };
         if (arg == "-h" || arg == "--help" || arg == "help") {
             std::fputs(USAGE, stdout);
+            std::exit(0);
+        } else if (arg == "-V" || arg == "--version") {
+            std::printf("wavemorphfs %s\n", VERSION);
             std::exit(0);
         } else if (arg == "--root") {
             std::string v = value();
@@ -336,6 +341,7 @@ int main(int argc, char** argv) {
     try {
         if (cli.cmd == "mount") {
             if (cli.pos.size() != 1) usage_error("mount needs a mountpoint");
+            info("WaveMorphFS {}", VERSION);
             auto lib = library(cli, cli.workers);
             lib->start_workers();
             lib->refresh_placements(true);  // the tree is complete from the first request
