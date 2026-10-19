@@ -11,6 +11,8 @@ namespace {
 
 /// Blocks shorter than this are only legal as the last frame of a stream.
 constexpr uint64_t MIN_BLOCK = 16;
+/// Largest block a frame header can describe.
+constexpr uint64_t MAX_BLOCK = 65535;
 
 /// How a track is made: the partial source frames at its ends become VERBATIM
 /// head and tail blocks, source frames [k1, k2) are copied.
@@ -32,13 +34,20 @@ Plan plan(const FlacImage& img, uint64_t start, uint64_t end) {
     }
     if (start % bs) r.head = {start, std::min(r.k1 * bs, end)};
     if (end != total && end % bs) r.tail = {r.k2 * bs, end};
-    // avoid tiny non-final blocks: merge them with the neighbouring full frame
+    // A block shorter than MIN_BLOCK is only legal last: merge a short head or tail
+    // into the neighbouring frame, or a short head into the tail when no frame lies
+    // between them (as long as the block stays describable).
     auto len = [](const auto& p) { return p->second - p->first; };
-    if (r.head && len(r.head) < MIN_BLOCK && r.k1 < r.k2) {
-        r.head = {r.head->first, img.frame_end(r.k1)};
-        r.k1++;
+    if (r.head && len(r.head) < MIN_BLOCK) {
+        if (r.k1 < r.k2 && len(r.head) + (img.frame_end(r.k1) - r.k1 * bs) <= MAX_BLOCK) {
+            r.head = {r.head->first, img.frame_end(r.k1)};
+            r.k1++;
+        } else if (r.k1 == r.k2 && r.tail && len(r.head) + len(r.tail) <= MAX_BLOCK) {
+            r.head = {r.head->first, r.tail->second};
+            r.tail.reset();
+        }
     }
-    if (r.tail && len(r.tail) < MIN_BLOCK && r.k1 < r.k2) {
+    if (r.tail && len(r.tail) < MIN_BLOCK && r.k1 < r.k2 && len(r.tail) + bs <= MAX_BLOCK) {
         r.tail = {(r.k2 - 1) * bs, r.tail->second};
         r.k2--;
     }
