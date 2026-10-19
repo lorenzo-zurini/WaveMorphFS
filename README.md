@@ -8,7 +8,7 @@ is duplicated.
 | On disk (pristine)                         | What the mount shows                                   |
 |--------------------------------------------|--------------------------------------------------------|
 | `Album.cue` + `Album.flac` (image rip)     | `01 - Title.flac`, `02 - Title.flac`, …                |
-| `Album.cue` + `Album.ape` / `.wv` / `.wav` | same, encoded to FLAC on the fly from the decoded image |
+| `Album.cue` + an APE, WavPack, TTA, TAK, WAV, AIFF or ALAC image | same, encoded to FLAC on the fly from the decoded image |
 | `Album.cue` + 32-bit float `Album.wv`      | `01 - Title.wv`, … made of the image's own blocks       |
 | `Disc.iso` (SACD, plain DSD **or DST**)    | `01 - Title.dsf`, `02 - Title.dsf`, …                  |
 | `*.flac`, `*.mp3`, `*.m4a`, `*.dsf`        | the same file with sidecar tags applied                |
@@ -36,7 +36,7 @@ you control — never written into the source files.
   seen, one sequential pass checks every frame's CRC and numbering and records its
   offset (cached on disk). This also keeps files that are still being copied or
   are damaged out of the library.
-* **Non-FLAC images** (APE, WavPack, TTA, TAK, WAV, ALAC) cannot be cut without
+* **Non-FLAC images** (APE, WavPack, TTA, TAK, WAV, AIFF, ALAC) cannot be cut without
   re-encoding (APE frames are seconds long and must all be full length), so their
   tracks are served as compressed FLAC encoded on the fly. Nothing is stored but
   positions and sizes: the first time an image is seen it is decoded once with
@@ -86,13 +86,40 @@ Everything that produces audio is checked against independent references:
 
 ## Building
 
-Needs a C++20 compiler, CMake, libfuse3, libFLAC, libwavpack, FFmpeg's
-libavformat/libavcodec/libswscale and nlohmann/json; `flac` and `ffmpeg` are used by `verify`, `compare` and the tests.
+Linux only (FUSE 3). Needs GCC 13+ or Clang 17+, CMake 3.20+, pkg-config,
+libfuse3 3.12+, libFLAC, libwavpack 5, FFmpeg 5.1+ (libavformat, libavcodec,
+libavutil, libswscale) and nlohmann/json 3.10+. The tests, `verify` and
+`compare` also use the `flac`, `metaflac` and `ffmpeg` tools. On Debian/Ubuntu:
 
 ```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+sudo apt install g++ cmake ninja-build pkg-config libfuse3-dev libflac-dev libwavpack-dev \
+    nlohmann-json3-dev libavformat-dev libavcodec-dev libavutil-dev libswscale-dev flac ffmpeg fuse3
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-build/wavemorphfs-tests      # unit tests (need the flac tool)
+build/wavemorphfs-tests      # unit tests
+sudo cmake --install build   # /usr/local/bin/wavemorphfs
+```
+
+To run it without Docker, enable `user_allow_other` in `/etc/fuse.conf` if other
+users (e.g. a music server) should read the mount, and run `mount` as a service,
+for example with systemd:
+
+```ini
+# /etc/systemd/system/wavemorphfs.service
+[Unit]
+Description=WaveMorphFS
+After=local-fs.target
+
+[Service]
+User=music
+ExecStart=/usr/local/bin/wavemorphfs --root=Music=/srv/music \
+    --tags-dir=/srv/wavemorph/tags --cache-dir=/srv/wavemorph/cache \
+    mount /srv/wavemorph/mnt --allow-other
+ExecStopPost=-/usr/bin/fusermount3 -uz /srv/wavemorph/mnt
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
 ```
 
 The `Dockerfile` builds and tests it on Debian and runs the mount in a container;
@@ -114,11 +141,17 @@ music-stack/
 ├── wavemorph/
 │   ├── mnt/        the mount (created by the container)
 │   ├── tags/       sidecars — the only precious data, back it up
-│   └── cache/      frame/packet indexes, safe to delete
+│   ├── cache/      frame/packet indexes, safe to delete
+│   └── status.txt  which images are ready, still being processed, or failed
 ├── navidrome/      Navidrome's database
 └── beets/
     └── config.yaml
 ```
+
+Create the folders as the user that will own them before the first start
+(`mkdir -p wavemorph navidrome beets`); WaveMorphFS takes over `wavemorph/`
+itself, but Navidrome runs as `user: 1000:1000` and needs `navidrome/` to be
+writable.
 
 ```yaml
 # docker-compose.yml
@@ -228,7 +261,8 @@ Notes:
 * The image is healthy once the mount is up, which is what `depends_on:
   condition: service_healthy` waits for. Its paths can be changed with
   `WAVEMORPH_MOUNT`, `WAVEMORPH_TAGS_DIR` and `WAVEMORPH_CACHE_DIR`;
-  `WAVEMORPH_LOG=debug` logs more.
+  `WAVEMORPH_LOG=debug` logs more. For `"_cover"` images, bind their folder
+  read-only and point `WAVEMORPH_COVERS_DIR` at it.
 * Only the folder of the mountpoint is bound into the other containers, never the
   mountpoint itself — a bind of the mountpoint goes stale
   ("Transport endpoint is not connected") when wavemorphfs restarts.
@@ -245,15 +279,47 @@ wavemorphfs --root "Music=/srv/music" --root "Classical Music=/srv/classical" \
     --tags-dir /srv/wavemorph/tags --cache-dir /srv/wavemorph/cache \
     mount /srv/wavemorph/mnt --allow-other
 
-wavemorphfs ls <source dir>                  # what a folder looks like through the fs
-wavemorphfs verify <source dir>              # validate its virtual tracks with flac/ffmpeg
-wavemorphfs compare <source dir> <split dir> # PCM-compare virtual tracks with old split files
-wavemorphfs tags-init <source dir>           # write a sidecar pre-filled with current tags
+# the other commands take the same --root/--tags-dir/--cache-dir options and a
+# folder inside one of the roots
+R="--root Music=/srv/music --tags-dir /srv/wavemorph/tags --cache-dir /srv/wavemorph/cache"
+wavemorphfs $R ls /srv/music/Album              # what a folder looks like through the fs
+wavemorphfs $R verify /srv/music/Album          # validate its virtual tracks with flac/ffmpeg
+wavemorphfs $R compare /srv/music/Album <split> # PCM-compare virtual tracks with old split files
+wavemorphfs $R tags-init /srv/music/Album       # write a sidecar pre-filled with current tags
 ```
 
-`--allow-other` needs `user_allow_other` in `/etc/fuse.conf`. Containers that read
-the mount should bind the **parent** of the mountpoint with `bind-propagation=rslave`
-so they survive filesystem restarts. `WAVEMORPH_LOG=debug` for more logging.
+`wavemorphfs --help` lists every option (worker and FUSE thread counts, the
+prescan interval, SACD multichannel areas). `--allow-other` needs
+`user_allow_other` in `/etc/fuse.conf`. Containers that read the mount should bind
+the **parent** of the mountpoint with `bind-propagation=rslave` so they survive
+filesystem restarts. `WAVEMORPH_LOG=debug` for more logging.
+
+## Troubleshooting
+
+* **An album does not appear.** Images are verified and indexed before their
+  tracks are shown, and files modified in the last minute are left alone until
+  they settle. `status.txt` (next to the cache directory) lists every image as
+  ready, pending, settling or failed, with the error for failed ones; a failed
+  image stays visible as its original files.
+* **"Transport endpoint is not connected"** in another container: it bound the
+  mountpoint itself instead of its parent folder; see the Docker notes above.
+* **`fusermount3: option allow_other only allowed if 'user_allow_other' is set`**:
+  add `user_allow_other` to `/etc/fuse.conf` (the container image has it).
+* **The mount fails in a container** with "permission denied": the container needs
+  `/dev/fuse`, `CAP_SYS_ADMIN`, and an AppArmor profile that allows FUSE mounts
+  (`apparmor:unconfined` in the example); `dmesg` shows AppArmor denials.
+* **The first scan is slow**: every image is decoded once to verify it (and APE,
+  TTA, TAK images are encoded once to measure their tracks). The results are
+  cached, so later starts are fast.
+* `WAVEMORPH_LOG=debug` logs every listing, job and cache decision.
+
+## Security
+
+WaveMorphFS only reads the music; give it the music read-only. Its own data is the
+tags directory (sidecars: back it up) and the cache (safe to delete). The mount is
+writable only for tag edits, which become sidecar changes; files on the mount
+belong to the user running WaveMorphFS, and only that user (and root) may edit
+them. See [SECURITY.md](SECURITY.md) for reporting problems.
 
 ## Sidecar tags
 
@@ -292,7 +358,10 @@ Both are merged, the separate tree winning.
   and `"_hide": true` inside a `track` or `file` entry hides that one track or file.
   Hidden sheets and ISOs do not count as discs, so the rest is numbered as if they
   were not there.
-* Other top-level keys (e.g. `"_comment"`) are ignored; `//` comments are allowed.
+* Top-level keys starting with `_` are directives (`_hide`, and `_target` and
+  `_cover` below); other ones such as `"_comment"` are ignored. `//` comments are
+  allowed, but a sidecar in the tags tree is rewritten (without its comments)
+  when tags are edited on the mount.
 
 Edits are picked up within seconds. A `cover.jpg`/`cover.png` in the sidecar folder
 is shown in the album folder if it has no cover of its own.
@@ -336,7 +405,7 @@ folders, e.g. by work):
 ```json
 {
   "album": {"_cover": "Sibelius/Symphony 5.jpg"},
-  "track": {"7": {"_cover": "/srv/covers/Finlandia.jpg"}}
+  "track": {"7": {"_cover": "Sibelius/Finlandia.jpg"}}
 }
 ```
 
@@ -366,9 +435,14 @@ or deleted. Generated files carry tag padding, so editors save in place quickly.
 
 ## Limitations
 
+* Linux only (FUSE 3).
 * Variable-blocksize FLAC images cannot be split by copying frames; their tracks
   are encoded on the fly like non-FLAC images.
-* Fragmented MP4 files are not retagged (they are passed through).
+* Fragmented MP4 files are not retagged (they are passed through), and `"_cover"`
+  leaves M4A files unchanged.
+* Sidecar tags apply to FLAC, MP3, M4A, DSF and WavPack; other files (Ogg, Opus,
+  standalone WAV/AIFF) are passed through as they are.
+* FUSE gives music servers no change notifications: let them rescan on a timer.
 
 ## License
 
