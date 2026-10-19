@@ -12,6 +12,12 @@ namespace {
 
 using Type = std::array<uint8_t, 4>;
 
+/// Largest moov box handled: sample tables of hours of audio plus cover art fit
+/// easily; a larger size is a corrupt file, not a reason to allocate it.
+constexpr uint64_t MAX_MOOV = 64 << 20;
+/// Deepest box nesting followed (real files nest about 8 deep).
+constexpr int MAX_DEPTH = 32;
+
 Type T(const char* s) { return {uint8_t(s[0]), uint8_t(s[1]), uint8_t(s[2]), uint8_t(s[3])}; }
 
 struct Node {
@@ -76,7 +82,8 @@ bool is_container(const Type& t) {
 }
 
 /// Parse the boxes in `b` (no box crosses its end).
-std::vector<Node> parse(std::span<const uint8_t> b) {
+std::vector<Node> parse(std::span<const uint8_t> b, int depth = 0) {
+    WM_ENSURE(depth < MAX_DEPTH, "boxes nested too deeply");
     std::vector<Node> out;
     size_t pos = 0;
     while (pos + 8 <= b.size()) {
@@ -91,18 +98,47 @@ std::vector<Node> parse(std::span<const uint8_t> b) {
         } else if (size == 0) {
             size = b.size() - pos;
         }
-        WM_ENSURE(size >= hdr && pos + size <= b.size(), "box overruns parent");
+        // (compared with what is left: pos + size could wrap around for 64-bit sizes)
+        WM_ENSURE(size >= hdr && size <= b.size() - pos, "box overruns parent");
         auto payload = b.subspan(pos + hdr, size_t(size) - hdr);
         if (is_container(typ)) {
             // meta is a full box in ISO files but a plain container in some QuickTime files
             size_t pl = typ == T("meta") && payload.size() >= 8 && std::memcmp(&payload[4], "hdlr", 4) != 0 ? 4 : 0;
-            out.push_back(box(typ, parse(payload.subspan(pl)), Bytes(payload.begin(), payload.begin() + ptrdiff_t(pl))));
+            out.push_back(box(typ, parse(payload.subspan(pl), depth + 1), Bytes(payload.begin(), payload.begin() + ptrdiff_t(pl))));
         } else {
             out.push_back(leaf(typ, Bytes(payload.begin(), payload.end())));
         }
         pos += size_t(size);
     }
     return out;
+}
+
+/// Position and size of the top-level moov box. A last box running past the end
+/// (a truncated file) ends the scan; fragmented files are refused, as their moof
+/// boxes would need their offsets shifted too.
+std::pair<uint64_t, uint64_t> find_moov(const ByteReader& read, uint64_t size) {
+    std::optional<std::pair<uint64_t, uint64_t>> moov;
+    for (uint64_t pos = 0; pos + 8 <= size;) {
+        Bytes h = read(pos, 16);
+        WM_ENSURE(h.size() >= 8, "short read at {}", pos);
+        uint64_t sz = be32(h.data()), hdr = 8;
+        if (sz == 1) {
+            WM_ENSURE(h.size() >= 16, "short read at {}", pos);
+            sz = be64(&h[8]);
+            hdr = 16;
+        } else if (sz == 0) {
+            sz = size - pos;
+        }
+        WM_ENSURE(sz >= hdr, "bad box size {} at {}", sz, pos);
+        // (compared with what is left: a bogus 64-bit size could wrap pos around)
+        if (sz > size - pos) break;
+        WM_ENSURE(std::memcmp(&h[4], "moof", 4) != 0, "fragmented MP4");
+        if (std::memcmp(&h[4], "moov", 4) == 0) moov = {pos, sz};
+        pos += sz;
+    }
+    WM_ENSURE(moov.has_value(), "no moov box");
+    WM_ENSURE(moov->second <= MAX_MOOV, "moov box of {} bytes", moov->second);
+    return *moov;
 }
 
 enum class Kind { Text, Pair, U8, U16 };
@@ -340,7 +376,7 @@ void shift_offsets(Node& n, uint64_t from, int64_t delta) {
         size_t p = 8 + i * w;
         uint64_t v = wide ? be64(&d[p]) : be32(&d[p]);
         if (v < from) continue;
-        uint64_t nv = uint64_t(int64_t(v) + delta);
+        uint64_t nv = v + uint64_t(delta);  // (two's complement: also moves down)
         Bytes b;
         if (wide) put_be64(b, nv);
         else {
@@ -363,21 +399,14 @@ Tags read_tags(const ByteReader& read, uint64_t size) {
         {"cpil", "COMPILATION"}, {"pgap", "GAPLESS_PLAYBACK"}, {"stik", "MEDIA_TYPE"}, {"rtng", "RATING"}, {"tmpo", "BPM"},
     };
     Tags t;
-    // find moov among the top-level boxes
-    std::optional<std::pair<uint64_t, uint64_t>> moov;
-    for (uint64_t pos = 0; pos + 8 <= size;) {
-        Bytes h = read(pos, 16);
-        if (h.size() < 8) break;
-        uint64_t sz = be32(h.data());
-        if (sz == 1 && h.size() >= 16) sz = be64(&h[8]);
-        else if (sz == 0) sz = size - pos;
-        if (sz < 8) break;
-        if (std::memcmp(&h[4], "moov", 4) == 0) moov = {pos, sz};
-        pos += sz;
+    std::vector<Node> top;
+    try {
+        auto [pos, len] = find_moov(read, size);
+        top = parse(read(pos, size_t(len)));
+    } catch (const std::exception& e) {
+        debug("MP4 tags: {}", e.what());
+        return t;
     }
-    if (!moov || moov->second > (64u << 20)) return t;
-    Bytes raw = read(moov->first, size_t(moov->second));
-    auto top = parse(raw);
     if (top.empty()) return t;
     Node* udta = top.back().child(T("udta"));
     Node* meta = udta ? udta->child(T("meta")) : nullptr;
@@ -430,25 +459,7 @@ Tags read_tags(const ByteReader& read, uint64_t size) {
 
 Retagged retag_m4a(const fs::path& p, const Tags& overlay) {
     File f(p);
-    uint64_t flen = f.size(), pos = 0;
-    std::optional<std::pair<uint64_t, uint64_t>> moov;
-    while (pos + 8 <= flen) {
-        uint8_t h[16];
-        f.read_exact_at(h, 8, pos);
-        uint64_t size = be32(h);
-        if (size == 1) {
-            f.read_exact_at(h + 8, 8, pos + 8);
-            size = be64(h + 8);
-        } else if (size == 0) {
-            size = flen - pos;
-        }
-        WM_ENSURE(size >= 8, "bad box at {}", pos);
-        WM_ENSURE(std::memcmp(h + 4, "moof", 4) != 0, "fragmented MP4");
-        if (std::memcmp(h + 4, "moov", 4) == 0) moov = {pos, size};
-        pos += size;
-    }
-    WM_ENSURE(moov.has_value(), "no moov box");
-    auto [mpos, mlen] = *moov;
+    auto [mpos, mlen] = find_moov([&](uint64_t off, size_t len) { return f.read_vec(off, len); }, f.size());
     Bytes raw(static_cast<size_t>(mlen));
     f.read_exact_at(raw.data(), raw.size(), mpos);
     auto top = parse(raw);

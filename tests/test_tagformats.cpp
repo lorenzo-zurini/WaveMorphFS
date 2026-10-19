@@ -4,6 +4,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "mp4.hpp"
 #include "test.hpp"
 #include "util.hpp"
 
@@ -17,6 +18,40 @@ fs::path scratch(const char* name) {
     fs::remove_all(d);
     fs::create_directories(d);
     return d;
+}
+
+Bytes cat(std::initializer_list<Bytes> parts) {
+    Bytes o;
+    for (auto& p : parts) append(o, p);
+    return o;
+}
+
+/// An MP4 box (32-bit size) around `parts`.
+Bytes box(std::string_view type, std::initializer_list<Bytes> parts = {}) {
+    Bytes payload = cat(parts), b;
+    put_be32(b, uint32_t(payload.size() + 8));
+    append(b, type);
+    append(b, payload);
+    return b;
+}
+
+/// Just the header of a box with a 64-bit size.
+Bytes box64(std::string_view type, uint64_t size) {
+    Bytes b;
+    put_be32(b, 1);
+    append(b, type);
+    put_be64(b, size);
+    return b;
+}
+
+/// A reader over `f` that fails instead of looping forever.
+ByteReader reader_of(const Bytes& f) {
+    auto calls = std::make_shared<int>(0);
+    return [&f, calls](uint64_t off, size_t len) -> Bytes {
+        WM_ENSURE(++*calls < 1000, "read {} times", *calls);
+        if (off >= f.size()) return {};
+        return Bytes(f.begin() + ptrdiff_t(off), f.begin() + ptrdiff_t(std::min<uint64_t>(f.size(), off + len)));
+    };
 }
 
 }  // namespace
@@ -48,5 +83,29 @@ TEST(atomic_write_replaces_and_keeps_permissions) {
     CHECK(*try_read_text(p) == "two");
     CHECK(std::distance(fs::directory_iterator(d), fs::directory_iterator()) == 1);  // no temp file left
     CHECK_THROWS(atomic_write(d / "missing-dir" / "x", "y"sv));
+    fs::remove_all(d);
+}
+
+TEST(mp4_box_sizes_beyond_their_parent_are_refused) {
+    auto d = scratch("mp4-sizes");
+    auto refused = [&](const char* name, Bytes file) {
+        CHECK_MSG(mp4::read_tags(reader_of(file), file.size()).empty(), "{}: no tags", name);
+        atomic_write(d / name, file);
+        CHECK_THROWS(mp4::retag_m4a(d / name, Tags::from_pairs({{"TITLE", "x"}})));
+    };
+    // a 64-bit size that wraps the position around to the start of the file
+    Bytes wrap = cat({box("free", {Bytes(8, 0)}), box64("junk", ~uint64_t(0) - 15)});
+    wrap.resize(64);
+    refused("wrap.m4a", wrap);
+    // the same inside moov
+    refused("inner.m4a", box("moov", {box("free"), box64("junk", ~uint64_t(0) - 7)}));
+    // a moov claiming more than the file holds (no allocation of it)
+    Bytes huge = box64("moov", uint64_t(1) << 40);
+    huge.resize(64);
+    refused("huge.m4a", huge);
+    // boxes nested far deeper than any real file
+    Bytes deep = box("ilst");
+    for (int i = 0; i < 40; i++) deep = box("udta", {deep});
+    refused("deep.m4a", box("moov", {deep}));
     fs::remove_all(d);
 }
