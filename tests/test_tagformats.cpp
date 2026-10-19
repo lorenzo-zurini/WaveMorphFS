@@ -6,6 +6,7 @@
 
 #include "apetag.hpp"
 #include "charset.hpp"
+#include "cue.hpp"
 #include "id3.hpp"
 #include "mp4.hpp"
 #include "test.hpp"
@@ -423,4 +424,31 @@ TEST(charset_y_diaeresis_is_french) {
     // Ÿ (0x9F in windows-1252) counted as Ź, so windows-1250's ź won
     auto d = decode_text(B("L'HA\x9F-LES-ROSES"));
     CHECK_MSG(d.encoding == "windows-1252" && d.text == "L'HA\u0178-LES-ROSES", "{} {}", d.encoding, d.text);
+}
+
+TEST(cue_sheets_with_mac_line_ends_and_data_tracks) {
+    std::string cue = "FILE \"a.flac\" WAVE\r  TRACK 01 MODE1/2352\r    INDEX 01 00:00:00\r"
+                      "  TRACK 02 AUDIO\r    REM __NONAUDIO x\r    TITLE \"Two\"\r    INDEX 01 00:10:00\r"
+                      "  TRACK 03 AUDIO\r    TITLE \"Three\"\r    INDEX 01 01:00:00\r";
+    auto sheet = CueSheet::parse(cue);
+    CHECK(sheet.files.size() == 1 && sheet.tracks.size() == 2 && sheet.tracks[0].number == 2 && sheet.tracks[0].fields.at("TITLE") == "Two");
+    CHECK(sheet.tracks[1].index01 == 75 * 60);
+}
+
+TEST(cue_parser_survives_any_prefix_and_byte_noise) {
+    std::string cue = "REM DATE 1991\nPERFORMER \"P\"\nTITLE \"T\"\nFILE \"image.wav\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"One\"\n"
+                      "    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 00 01:00:00\n    INDEX 01 01:02:03\n";
+    uint32_t x = 12345;
+    for (size_t n = 0; n <= cue.size(); n++) {
+        std::string variant = cue.substr(0, n);
+        if (n % 7 == 3) {
+            x = x * 1103515245 + 12345;
+            if (!variant.empty()) variant[x % variant.size()] = char(x >> 16);
+        }
+        try {
+            auto sheet = CueSheet::parse_bytes(bytes_of(variant));
+            CHECK(!sheet.tracks.empty());
+        } catch (const Error&) {
+        }
+    }
 }
