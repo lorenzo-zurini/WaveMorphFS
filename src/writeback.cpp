@@ -44,12 +44,10 @@ Tags read_file_tags(const std::string& ext, const ByteReader& read, uint64_t siz
     };
     // an ID3v2 tag at `pos` that ends within the file
     auto id3_at = [&](uint64_t pos) {
-        Bytes h = read(pos, 10);
-        WM_ENSURE(h.size() == 10 && std::memcmp(h.data(), "ID3", 3) == 0, "no ID3 tag at {}", pos);
-        uint64_t sz = 0;
-        for (int i = 6; i < 10; i++) sz = sz << 7 | (h[size_t(i)] & 0x7F);
-        WM_ENSURE(pos + 10 + sz <= size, "ID3 tag runs past the end of the file");
-        return id3::read_tags(read(pos, size_t(10 + sz)));
+        auto len = id3::tag_length(read(pos, 10));
+        WM_ENSURE(len.has_value(), "no ID3 tag at {}", pos);
+        WM_ENSURE(*len <= size && pos <= size - *len, "ID3 tag runs past the end of the file");
+        return id3::read_tags(read(pos, size_t(*len)));
     };
     if (ext == "flac") {
         WM_ENSURE(magic(0, "fLaC"), "not a FLAC file");
