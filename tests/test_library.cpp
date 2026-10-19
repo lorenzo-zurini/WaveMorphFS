@@ -114,3 +114,18 @@ TEST(edit_drops_its_own_file_table_field) {
     CHECK(doc["track"]["1"]["TITLE"] == "new");
     CHECK(!doc["file"]["01 - a.flac"].contains("TITLE") && doc["file"]["01 - a.flac"]["MOOD"] == "m");
 }
+
+TEST(md5s_are_stored_for_the_version_they_were_read_from) {
+    // a file replaced while its MD5s were computed must not get the old ones
+    Scratch s("md5-key");
+    fs::path f = s.src / "img.flac";
+    atomic_write(f, std::string_view("version one"));
+    auto old_key = SrcKey::of(f);
+    Cache cache(s.dir / "cache");
+    Md5Map m;
+    m[{0, 10}] = {1};
+    atomic_write(f, std::string_view("version two, longer"));
+    cache.store_md5s(f, old_key, m);
+    CHECK_MSG(cache.load_md5s(f).empty(), "nothing for the current version");
+    CHECK(fs::exists(cache.md5_path(f, old_key)));
+}
