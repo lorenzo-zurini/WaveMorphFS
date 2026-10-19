@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include "apetag.hpp"
+#include "charset.hpp"
 #include "id3.hpp"
 #include "mp4.hpp"
 #include "test.hpp"
@@ -408,4 +409,18 @@ TEST(ape_track_numbers_are_read_once) {
     CHECK(!t.get("DISCNUMBER") && value(t, "DISCTOTAL") == "2");
     auto b = flat(ape::build(Tags::from_pairs({{"TRACKNUMBER", "3"}, {"TOTALTRACKS", "12"}}), nullptr, std::nullopt));
     CHECK(std::string(b.begin(), b.end()).find(std::string("Track\0" "3/12", 10)) != std::string::npos);
+}
+
+TEST(charset_utf16_stays_aligned_after_a_bad_unit) {
+    Bytes le = {0xFF, 0xFE, 'A', 0, 0x00, 0xD8, 'B', 0, 'C', 0};  // a lone surrogate between A and B
+    CHECK(decode_text(le).text == "A\uFFFDBC");
+    Bytes be = {0xFE, 0xFF, 0, 'A', 0xDC, 0x00, 0, 'B'};
+    CHECK(decode_text(be).text == "A\uFFFDB");
+    CHECK(*decode_as(Bytes{'x', 0, 0x00, 0xDC, 'y', 0}, "UTF-16LE") == "x\uFFFDy");
+}
+
+TEST(charset_y_diaeresis_is_french) {
+    // Ÿ (0x9F in windows-1252) counted as Ź, so windows-1250's ź won
+    auto d = decode_text(B("L'HA\x9F-LES-ROSES"));
+    CHECK_MSG(d.encoding == "windows-1252" && d.text == "L'HA\u0178-LES-ROSES", "{} {}", d.encoding, d.text);
 }
