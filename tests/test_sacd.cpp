@@ -4,8 +4,10 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cstring>
+#include <thread>
 
 #include "cache.hpp"
 #include "dst.hpp"
@@ -491,4 +493,50 @@ TEST(sacd_dst_area_and_a_final_frame_cut_short) {
         if (broken) std::fill(dsd.back().begin(), dsd.back().end(), 0x69);
         for (size_t t = 0; t < 2; t++) check_dsf(disc, t, a, expected_dsf_audio(dsd, a.tracks[t].first, a.tracks[t].second, 2));
     }
+}
+
+TEST(sacd_concurrent_readers_share_read_ahead) {
+    // several readers of one disc (two tracks read forward, one seeking around):
+    // read-ahead is shared and taken over, and every byte is right
+    Dir d;
+    Area a;
+    a.dst = true;
+    uint32_t seed = 11;
+    for (int i = 0; i < 300; i++) a.frames.push_back(dst_frame(2, seed, 700));
+    a.tracks = {{0, 140}, {140, 300}};
+    fs::path iso = d.path / "disc.iso";
+    atomic_write(iso, make_iso(&a, nullptr));
+    auto disc = SacdDisc::open(iso, nullptr, false);
+    std::vector<Bytes> dsd;
+    DstDecoder dec(2);
+    for (auto& f : a.frames) dec.decode(f, dsd.emplace_back(SACD_FRAME_BYTES * 2));
+    std::vector<std::shared_ptr<DsfTrack>> tracks;
+    std::vector<Bytes> want;
+    for (size_t t = 0; t < 2; t++) {
+        tracks.push_back(std::make_shared<DsfTrack>(disc, t, disc->track_tags(t)));
+        want.push_back(expected_dsf_audio(dsd, a.tracks[t].first, a.tracks[t].second, 2));
+    }
+    std::atomic<int> bad{0};
+    auto forward = [&](size_t t) {
+        for (uint64_t o = 92; o < 92 + want[t].size(); o += 65536) {
+            size_t n = size_t(std::min<uint64_t>(65536, 92 + want[t].size() - o));
+            if (tracks[t]->read_at(o, n) != Bytes(want[t].begin() + ptrdiff_t(o - 92), want[t].begin() + ptrdiff_t(o - 92 + n))) bad++;
+        }
+    };
+    auto seeking = [&] {
+        uint32_t s = 5;
+        for (int i = 0; i < 40; i++) {
+            size_t t = lcg_next(s) % 2;
+            uint64_t o = 92 + lcg_next(s) % (want[t].size() - 5000);
+            if (tracks[t]->read_at(o, 5000) != Bytes(want[t].begin() + ptrdiff_t(o - 92), want[t].begin() + ptrdiff_t(o - 92 + 5000))) bad++;
+        }
+    };
+    std::thread r1(forward, 0), r2(forward, 1), r3(seeking);
+    r1.join();
+    r2.join();
+    r3.join();
+    CHECK_MSG(bad == 0, "{} reads differ", bad.load());
+    disc->drop_cached();
+    forward(1);
+    CHECK(bad == 0);
 }
