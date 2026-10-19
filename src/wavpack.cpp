@@ -16,7 +16,13 @@ namespace {
 
 const char INDEX_MAGIC[8] = {'W', 'M', 'W', 'V', 'I', 'X', '0', '1'};
 const char LAYOUT_MAGIC[8] = {'W', 'M', 'W', 'V', 'L', 'Y', '0', '1'};
+// Block header (WavpackHeader in wavpack.h), little-endian: byte offsets of the
+// fields read or rewritten here. Sample numbers are 40 bits: a low 32-bit word
+// plus a high byte.
 constexpr size_t HEADER = 32;
+constexpr size_t H_SIZE = 4, H_VERSION = 8, H_INDEX_HI = 10, H_TOTAL_HI = 11, H_TOTAL = 12, H_INDEX = 16, H_COUNT = 20, H_FLAGS = 24;
+// the stream versions libwavpack decodes (its MIN_STREAM_VERS..MAX_STREAM_VERS)
+constexpr uint16_t MIN_VERSION = 0x402, MAX_VERSION = 0x410;
 /// samples decoded per call while verifying
 constexpr uint32_t CHUNK = 1 << 16;
 /// copied blocks kept per track while it is read (~1 MB of 192 kHz stereo float)
@@ -58,18 +64,20 @@ void sub_blocks(std::span<const uint8_t> b, F&& f) {
 
 struct Header {
     uint32_t size;  // whole block
-    uint64_t index, total;
+    uint64_t index;
     uint32_t count, flags;
 };
 
 std::optional<Header> parse_header(std::span<const uint8_t> h) {
     if (h.size() < HEADER || std::memcmp(h.data(), "wvpk", 4) != 0) return std::nullopt;
+    // the version check keeps a stray "wvpk" (e.g. in an ID3v2 tag before the audio) from passing as a block
+    uint16_t version = uint16_t(h[H_VERSION] | h[H_VERSION + 1] << 8);
+    if (version < MIN_VERSION || version > MAX_VERSION) return std::nullopt;
     Header r;
-    r.size = le32(&h[4]) + 8;
-    r.total = uint64_t(h[11]) << 32 | le32(&h[12]);
-    r.index = uint64_t(h[10]) << 32 | le32(&h[16]);
-    r.count = le32(&h[20]);
-    r.flags = le32(&h[24]);
+    r.size = le32(&h[H_SIZE]) + 8;  // wraps to < HEADER for a corrupt size
+    r.index = uint64_t(h[H_INDEX_HI]) << 32 | le32(&h[H_INDEX]);
+    r.count = le32(&h[H_COUNT]);
+    r.flags = le32(&h[H_FLAGS]);
     if (r.size < HEADER) return std::nullopt;
     return r;
 }
@@ -284,15 +292,18 @@ Bytes rebuild_block(std::span<const uint8_t> block, uint64_t index, uint64_t tot
     sub_blocks(block, [&](size_t p, size_t len, uint8_t id) {
         if (!(strip && file_level(id))) append(out, block.subspan(p, len));
     });
-    Bytes size;
-    put_le32(size, uint32_t(out.size() - 8));
-    std::copy(size.begin(), size.end(), out.begin() + 4);
-    out[10] = uint8_t(index >> 32);
-    out[11] = uint8_t(total >> 32);
-    for (int i = 0; i < 4; i++) {
-        out[size_t(12 + i)] = uint8_t(total >> (8 * i));
-        out[size_t(16 + i)] = uint8_t(index >> (8 * i));
-    }
+    auto put32 = [&](size_t at, uint32_t v) {
+        for (size_t i = 0; i < 4; i++) out[at + i] = uint8_t(v >> (8 * i));
+    };
+    put32(H_SIZE, uint32_t(out.size() - 8));
+    out[H_INDEX_HI] = uint8_t(index >> 32);
+    put32(H_INDEX, uint32_t(index));
+    // as libwavpack's SET_TOTAL_SAMPLES: all ones in the low word means "unknown
+    // length", so from 2^32 - 1 samples on the value is stored shifted up by one
+    // per 2^32 - 1 (GET_TOTAL_SAMPLES subtracts the high byte again)
+    uint64_t stored_total = total + total / 0xFFFFFFFF;
+    out[H_TOTAL_HI] = uint8_t(stored_total >> 32);
+    put32(H_TOTAL, uint32_t(stored_total));
     // the block checksum covers everything before it, header included
     sub_blocks(out, [&](size_t p, size_t len, uint8_t id) {
         if ((id & ID_UNIQUE) != ID_BLOCK_CHECKSUM || (id & ID_LARGE)) return;
