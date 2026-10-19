@@ -61,9 +61,10 @@ private:
         uint64_t out_sample;  // first sample number in the output stream
         uint64_t size;
     };
-    using Shared = std::shared_ptr<const Bytes>;
     Bytes verbatim(const VSeg& seg) const;
-    Shared seg_bytes(Shared& cell, const VSeg& seg) const;
+    /// Size of source frame k as copied: its header carries the track-relative
+    /// sample number, whose coded length may differ from the frame number's.
+    uint64_t copied_size(uint64_t k) const;
     std::shared_ptr<const std::vector<uint64_t>> vstarts() const;
     void read_copy(uint64_t off, size_t len, Bytes& out) const;
 
@@ -74,9 +75,9 @@ private:
     uint64_t k1_ = 0, k2_ = 0;  // copied source frames [k1, k2)
     uint64_t copy_size_ = 0;
     uint64_t size_ = 0;
+    LazyBytes head_bytes_, tail_bytes_;
     mutable std::mutex mu_;
-    mutable Shared head_bytes_, tail_bytes_;
-    /// virtual start offset (relative to the copy region) of each copied frame, + end
+    /// virtual start offset (relative to the copy region) of each copied frame, + end (mu_)
     mutable std::shared_ptr<const std::vector<uint64_t>> vstarts_;
 };
 

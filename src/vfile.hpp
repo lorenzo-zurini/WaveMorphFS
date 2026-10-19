@@ -3,8 +3,11 @@
 // an exact size known up front and random-access reads.
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
+#include <mutex>
+#include <span>
 #include <string>
 #include <variant>
 #include <vector>
@@ -41,6 +44,55 @@ private:
 /// Copy the part of `seg` (starting at virtual offset `seg_start`) that overlaps
 /// the request [off, off+len) into `out`.
 void copy_overlap(Bytes& out, std::span<const uint8_t> seg, uint64_t seg_start, uint64_t off, size_t len);
+
+/// One part of a generated file for `stitch`: `size` bytes, of which
+/// `read(rel_off, n, out)` appends [rel_off, rel_off + n) to `out`.
+template <class Read>
+struct Piece {
+    uint64_t size;
+    Read read;
+};
+template <class Read>
+Piece(uint64_t, Read) -> Piece<Read>;
+
+/// Lay `pieces` end to end from offset 0 and append to `out` what each covers of
+/// the request [off, off+len); pieces the request misses are not read.
+template <class... Read>
+void stitch(Bytes& out, uint64_t off, size_t len, const Piece<Read>&... pieces) {
+    uint64_t pos = 0, end = off + len;
+    auto one = [&](const auto& p) {
+        uint64_t a = std::max(off, pos), b = std::min(end, pos + p.size);
+        if (a < b) p.read(a - pos, size_t(b - a), out);
+        pos += p.size;
+    };
+    (one(pieces), ...);
+}
+
+/// Bytes made on first use and shared by later readers (e.g. a track's re-encoded
+/// boundary frames). Two first readers may both make them; one result is kept.
+class LazyBytes {
+public:
+    using Shared = std::shared_ptr<const Bytes>;
+    template <class Make>
+    Shared get(Make make) const {
+        {
+            std::lock_guard g(mu_);
+            if (bytes_) return bytes_;
+        }
+        auto b = std::make_shared<const Bytes>(make());  // outside the lock: may take long
+        std::lock_guard g(mu_);
+        if (!bytes_) bytes_ = std::move(b);
+        return bytes_;
+    }
+    void reset() const {
+        std::lock_guard g(mu_);
+        bytes_.reset();
+    }
+
+private:
+    mutable std::mutex mu_;
+    mutable Shared bytes_;
+};
 
 /// A piece of generated output: bytes in memory, (offset, length) of a source
 /// file, or zeros. Large parts that already exist in the source (cover art,
