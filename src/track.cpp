@@ -18,6 +18,19 @@ std::shared_ptr<FlacImage> FlacImage::open(fs::path p, flac::FlacMeta meta, flac
     WM_ENSURE(hdr.has_value(), "first frame header");
     size_t ex = 4 + hdr->number_len;
     size_t bs_extra = hdr->bs_code == 6 ? 1 : hdr->bs_code == 7 ? 2 : 0;
+    // Indexes built before the last frame's end was searched from the front may
+    // have taken a trailing tag whose own CRC-16 is 0 for audio. Checking that end
+    // again is cheap (the last frame and what follows it), unlike re-indexing.
+    uint64_t nf = index.nframes();
+    auto last_end = flac::last_frame_end(f, index.offsets[nf - 1]);
+    WM_ENSURE(last_end.has_value(), "last frame: no valid end followed by EOF or a tag (changed since it was indexed?)");
+    if (*last_end != index.offsets[nf]) {
+        warn("{}: cached frame index ends the audio at byte {}, but it ends at {}; using the latter", p.string(), index.offsets[nf], *last_end);
+        auto fixed = std::make_shared<std::vector<uint64_t>>(index.offsets.begin(), index.offsets.end());
+        (*fixed)[nf] = *last_end;
+        index.offsets = *fixed;
+        index.storage = std::move(fixed);
+    }
     auto img = std::make_shared<FlacImage>();
     img->path = std::move(p);
     img->meta = std::move(meta);
