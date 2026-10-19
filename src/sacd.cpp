@@ -447,14 +447,35 @@ std::vector<Bytes> SacdDisc::read_frames(uint64_t f0, uint64_t f1) const {
     return out;
 }
 
+bool SacdDisc::note_reader(uint64_t c) const {
+    Reader* oldest = &readers_[0];
+    for (auto& r : readers_) {
+        if (r.used && c + AHEAD_CHUNKS >= r.pos && c <= r.pos + AHEAD_CHUNKS) {
+            r.pos = std::max(r.pos, c);
+            r.used = ++clock_;
+            return true;
+        }
+        if (r.used < oldest->used) oldest = &r;
+    }
+    *oldest = {c, ++clock_};
+    return false;
+}
+
+bool SacdDisc::near_reader(uint64_t c) const {
+    return std::any_of(readers_.begin(), readers_.end(), [&](const Reader& r) { return r.used && c + AHEAD_CHUNKS >= r.pos && c <= r.pos + AHEAD_CHUNKS + 1; });
+}
+
 std::shared_future<SacdDisc::Chunk> SacdDisc::start(uint64_t c, std::shared_ptr<std::promise<Chunk>>* claimed) const {
     if (auto it = chunks_.find(c); it != chunks_.end()) {
         it->second.used = ++clock_;
+        // read-ahead the pool has not got to yet: the reader decodes it now
+        // instead of waiting for its turn
+        if (claimed && it->second.todo) *claimed = std::move(it->second.todo);
         return it->second.data;
     }
     auto p = std::make_shared<std::promise<Chunk>>();
     std::shared_future<Chunk> f = p->get_future().share();
-    chunks_[c] = {f, ++clock_};
+    chunks_[c] = {f, claimed ? nullptr : p, ++clock_};
     while (chunks_.size() > CACHE_CHUNKS) {
         auto victim = chunks_.end();
         for (auto it = chunks_.begin(); it != chunks_.end(); ++it)
@@ -464,23 +485,26 @@ std::shared_future<SacdDisc::Chunk> SacdDisc::start(uint64_t c, std::shared_ptr<
         if (victim == chunks_.end()) break;
         chunks_.erase(victim);
     }
-    if (claimed) {
-        *claimed = p;
-    } else {
-        submit([self = shared_from_this(), c, p] {
-            {
-                // read-ahead nobody is near any more (the reader seeked away): skip it
-                std::lock_guard g(self->mu_);
-                if (c + 1 < self->last_wanted_ || c > self->last_wanted_ + AHEAD_CHUNKS + 1) {
-                    self->chunks_.erase(c);
-                    p->set_exception(std::make_exception_ptr(Error("cancelled read-ahead")));
-                    return;
-                }
-            }
-            self->fulfil(c, *p);
-        }, Lane::Decode);
-    }
+    if (claimed) *claimed = p;
+    else submit([self = shared_from_this(), c] { self->decode_ahead(c); }, Lane::Decode);
     return f;
+}
+
+void SacdDisc::decode_ahead(uint64_t c) const {
+    std::shared_ptr<std::promise<Chunk>> p;
+    {
+        std::lock_guard g(mu_);
+        auto it = chunks_.find(c);
+        if (it == chunks_.end() || !it->second.todo) return;  // a reader took it on (or it was dropped)
+        // No reader is near it any more (one seeked away or stopped): skip it.
+        // Nobody waits for it either: a reader wanting it would have taken it on.
+        if (!near_reader(c)) {
+            chunks_.erase(it);
+            return;
+        }
+        p = std::move(it->second.todo);
+    }
+    fulfil(c, *p);
 }
 
 void SacdDisc::fulfil(uint64_t c, std::promise<Chunk>& p) const {
@@ -489,42 +513,40 @@ void SacdDisc::fulfil(uint64_t c, std::promise<Chunk>& p) const {
         WM_ENSURE(f0 < f1, "internal: chunk {} is past the area's {} frames", c, frames_.size() - 1);
         p.set_value(std::make_shared<const std::vector<Bytes>>(read_frames(f0, f1)));
     } catch (...) {
+        {
+            // so that a later read tries again; the entry is still this one: one
+            // being decoded is neither evicted nor replaced
+            std::lock_guard g(mu_);
+            chunks_.erase(c);
+        }
         p.set_exception(std::current_exception());
-        std::lock_guard g(mu_);
-        chunks_.erase(c);
     }
 }
 
 void SacdDisc::drop_cached() const {
     std::lock_guard g(mu_);
-    std::erase_if(chunks_, [](auto& kv) { return kv.second.data.wait_for(std::chrono::seconds(0)) == std::future_status::ready; });
+    // decoded chunks, and read-ahead not started (its jobs find nothing to do)
+    std::erase_if(chunks_, [](auto& kv) { return kv.second.todo || kv.second.data.wait_for(std::chrono::seconds(0)) == std::future_status::ready; });
+    readers_ = {};
 }
 
 SacdDisc::Chunk SacdDisc::chunk(uint64_t c) const {
-    touch(weak_from_this().lock());
-  for (int attempt = 0;; attempt++) {
+    auto self = weak_from_this().lock();  // background work needs a shared owner
+    touch(self);
     std::shared_future<Chunk> f;
     std::shared_ptr<std::promise<Chunk>> mine;
-    bool shared = !weak_from_this().expired();
     {
         std::lock_guard g(mu_);
-        // read-ahead only for a reader moving forward (not for one-off reads such as
-        // a music server's tag scan, or random seeks)
-        bool sequential = c == last_wanted_ + 1 || (c == last_wanted_ && c > 0);
-        last_wanted_ = c;
+        // read-ahead only for a reader moving forward (not for one-off reads such
+        // as a music server's tag scan, or the first read after a seek)
+        bool forward = note_reader(c);
         f = start(c, &mine);
-        // read-ahead: DST decoding is the slow part, and chunks decode in parallel
-        if (shared && sequential)
+        // DST decoding is the slow part, and chunks decode in parallel
+        if (self && forward)
             for (uint64_t k = c + 1; k < std::min(nchunks(), c + 1 + AHEAD_CHUNKS); k++) start(k, nullptr);
     }
     if (mine) fulfil(c, *mine);
-    try {
-        return f.get();
-    } catch (const Error& e) {
-        // a read-ahead job for this chunk was cancelled before the reader came back to it
-        if (attempt > 2 || std::string(e.what()) != "cancelled read-ahead") throw;
-    }
-  }
+    return f.get();
 }
 
 DsfTrack::DsfTrack(std::shared_ptr<const SacdDisc> disc, size_t track, const Tags& tags, const Cover* cover) : disc_(std::move(disc)) {
