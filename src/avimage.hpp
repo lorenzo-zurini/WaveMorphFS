@@ -12,11 +12,14 @@
 #include <array>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <string>
 #include <vector>
 
 #include "futurelru.hpp"
 #include "tags.hpp"
 #include "util.hpp"
+#include "vfile.hpp"
 
 namespace wm {
 
@@ -29,10 +32,18 @@ public:
     ~AvImage();
 
     fs::path path;
+    /// the file's identity when it was opened: what is cached from this image
+    /// (index, track layouts) is filed under it, not under whatever is there later
+    SrcKey key;
     uint32_t sample_rate = 0, channels = 0, bps = 0;
     uint64_t total = 0;
     /// the container's own tags (APEv2 etc.), names as stored
     Tags tags;
+    /// the file's own front cover (an APEv2 "Cover Art (Front)" image), as the
+    /// range of the file holding the image, and its type (image/jpeg, image/png);
+    /// see flac::picture_body
+    std::optional<SrcRange> front_cover;
+    std::string front_cover_mime;
 
     /// Decode samples [s, e) per channel.
     std::vector<std::vector<int32_t>> decode_range(uint64_t s, uint64_t e) const;
@@ -55,6 +66,7 @@ private:
 
     using Samples = std::shared_ptr<const std::vector<std::vector<int32_t>>>;
     using Packets = FutureLru<size_t, Samples>;
+    void find_front_cover();
     /// Samples of packet k, decoding it (and queueing read-ahead) if needed.
     Samples packet_samples(size_t k) const;
     /// Cached or in-flight packet k; otherwise queued on the pool, or with

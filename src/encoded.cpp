@@ -15,7 +15,7 @@ namespace wm {
 fs::path layout_path(const AvImage& img, const Ranges& ranges, const Cache& cache) {
     std::string extra = "flac-encoded";
     for (auto& [s, e] : ranges) extra += std::format(" {}-{}", s, e);
-    return cache.dir() / "flacidx" / (Cache::name_for(img.path, SrcKey::of(img.path), extra) + ".encidx");
+    return cache.dir() / "flacidx" / (Cache::name_for(img.path, img.key, extra) + ".encidx");
 }
 
 namespace {

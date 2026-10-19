@@ -366,6 +366,17 @@ std::vector<Seg> header_segments(const std::array<uint8_t, 34>& si, const std::v
     return out;
 }
 
+std::vector<Seg> picture_body(std::string_view mime, SrcRange image) {
+    Bytes b;
+    put_be32(b, 3);  // front cover
+    put_be32(b, uint32_t(mime.size()));
+    append(b, mime);
+    put_be32(b, 0);  // description
+    for (int i = 0; i < 4; i++) put_be32(b, 0);  // width, height, depth, colours: unknown
+    put_be32(b, uint32_t(image.len));
+    return {std::move(b), image};
+}
+
 // ------------------------------------------------------------------ frame index
 
 namespace {

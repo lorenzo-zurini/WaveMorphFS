@@ -12,6 +12,7 @@ extern "C" {
 #include <cstring>
 #include <functional>
 
+#include "apetag.hpp"
 #include "cache.hpp"
 
 namespace wm {
@@ -177,10 +178,35 @@ struct AvImage::Decoder {
 
 AvImage::~AvImage() = default;
 
+void AvImage::find_front_cover() {
+    File f(path);
+    auto tag = ape::read([&](uint64_t o, size_t l) { return f.read_vec(o, l); }, f.size());
+    if (!tag || !tag->front_cover) return;
+    // the item's value is a file name, NUL, then the image
+    auto v = *tag->front_cover;
+    Bytes head = f.read_vec(v.off, size_t(std::min<uint64_t>(v.len, 1024)));
+    auto nul = std::find(head.begin(), head.end(), uint8_t(0));
+    if (nul == head.end()) return;
+    uint64_t skip = uint64_t(nul - head.begin()) + 1;
+    std::span<const uint8_t> img(head.data() + skip, head.size() - size_t(skip));
+    std::string mime = img.size() >= 8 && std::memcmp(img.data(), "\x89PNG\r\n\x1a\n", 8) == 0 ? "image/png"
+                       : img.size() >= 3 && img[0] == 0xFF && img[1] == 0xD8 && img[2] == 0xFF ? "image/jpeg"
+                                                                                                  : "";
+    // (a PICTURE block holds less than 16 MiB)
+    if (mime.empty() || v.len - skip >= (1u << 24) - 1024) {
+        debug("{}: front cover in the APEv2 tag is not a usable JPEG or PNG image", path.string());
+        return;
+    }
+    front_cover = SrcRange{v.off + skip, v.len - skip};
+    front_cover_mime = std::move(mime);
+}
+
 std::shared_ptr<AvImage> AvImage::open(const fs::path& p, const Cache* cache) {
     auto key = SrcKey::of(p);
     auto img = std::make_shared<AvImage>();
     img->path = p;
+    img->key = key;
+    img->find_front_cover();
     auto d = std::make_unique<Decoder>(p);
     img->sample_rate = uint32_t(d->codec->sample_rate);
     img->channels = d->channels();
