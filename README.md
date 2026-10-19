@@ -10,9 +10,10 @@ it belongs. Point Navidrome or any other music server at the mount and the whole
 collection is ready to stream.
 
 Nothing on disk changes. Files are not moved, renamed, converted or rewritten, so
-rip logs and checksums keep matching. The tags, track names and folder layout live
-in small JSON sidecar files, written by you, by Picard or by beets, and every track
-is assembled from the original file at the moment it is read.
+rip logs and checksums keep matching. You tag the tracks on the mount with Picard,
+beets or any tag editor, as you would any other files; WaveMorphFS keeps what you
+change in small sidecar files of its own, and assembles every track from the
+original file at the moment it is read.
 
 ```
 On disk, as it came                          Mounted at /srv/library
@@ -48,15 +49,16 @@ The main use is turning a messy collection into a clean one without touching it:
    sees, or one you share over the network. CUE images are split into
    tracks, APE-style files are served as FLAC, SACD ISOs as DSF, and files that are
    still being copied or are damaged are kept out.
-2. **Tag it.** Run beets or Picard against the mount (with moving and renaming
-   files turned off: the mount decides names and places), or write sidecars by
-   hand. Tag editors save to the mount as they would to any file; WaveMorphFS stores
-   their changes in sidecars and serves them straight back. Tags already in the
-   files, the CUE sheet and the SACD text are used as a starting point.
-3. **Organize it.** A sidecar can place a folder, a disc or a single track anywhere
-   in the mount, so the tree follows artist, composer or work rather than whatever
-   the folders on disk are called. Junk can be hidden, and a front cover set per
-   album or per work.
+2. **Tag it.** Run beets, Picard or any tag editor on the mounted files, with
+   moving and renaming files turned off (the mount decides names and places).
+   Editors save as they would to any file; WaveMorphFS writes the changes to its
+   sidecar files and serves them straight back, so there is nothing to manage by
+   hand. Tags already in the files, the CUE sheet and the SACD text are the
+   starting point.
+3. **Organize it.** A line in a folder's sidecar places that folder, a disc or a
+   single track anywhere in the mount, so the tree follows artist, composer or work
+   rather than whatever the folders on disk are called. The same way, junk can be
+   hidden and a front cover set per album or per work.
 4. **Stream it.** The music server sees an ordinary, tidy folder of tagged tracks,
    and rescans it like any other.
 
@@ -92,8 +94,8 @@ Beyond splitting and converting:
   mount, and any folder, disc or track can be placed anywhere in it. Folders
   emptied by moves disappear, and new ones are created as needed.
 - **Complete tags.** Tags come from the file itself, the CUE sheet or SACD text,
-  and your sidecars, in that order, and every track is served with all of them.
-  Tag names are kept exactly as you write them, so Picard's
+  and the edits you make on the mount, in that order, and every track is served
+  with all of them. Tag names are kept exactly as given, so Picard's
   `MusicBrainz Album Id`, ffprobe's `album_artist` and plain Vorbis names all work
   and are never renamed.
 - **Edit tags on the mount.** Open a track in Picard, Kid3, beets or any other
@@ -344,10 +346,13 @@ refuses one that holds `_` settings. `wavemorphfs --version` prints the version.
 
 ## Sidecar files
 
-A sidecar is a `wavemorph.json` file. It can sit next to the music, or, to keep
-the source folders untouched, in a separate tree:
-`<tags-dir>/<root name>/<path relative to the root>/wavemorph.json`. When both
-exist they are merged, and the separate tree wins.
+A sidecar is a `wavemorph.json` file. WaveMorphFS writes one whenever tags are
+edited on the mount, in a separate tree that keeps the source folders untouched:
+`<tags-dir>/<root name>/<path relative to the root>/wavemorph.json`. For tags you
+never need to open it. You edit it yourself only for what a tag editor can't
+express (moving folders, covers, hiding files, below), or to set tags in bulk. A
+sidecar can also sit next to the music; when both exist they are merged, and the
+one in the tags tree wins.
 
 ```json
 {
