@@ -79,6 +79,66 @@ Tags tags_of(const VFile& vf, const std::string& ext) {
 
 }  // namespace
 
+TEST(placement_emptied_folder_hidden_next_to_similar_names) {
+    // "A B" sorts between "A" and "A/...": the emptied "A" must still be found to have moves below
+    Fixture f("emptied");
+    f.file("A/sub1/x.txt");
+    f.file("A B/y.txt");
+    f.sidecar("A/sub1", R"({"_target": "Lib/Moved"})");
+    f.sidecar("A B", R"({"_target": "Lib/Other"})");
+    f.open();
+    CHECK((f.names("Lib") == Names{"Moved", "Other"}));
+}
+
+TEST(placement_top_level_targets_that_place_nothing_hidden) {
+    Fixture f("ghost");
+    f.file("A/x.txt");
+    // a folder that does not exist, a file key that matches nothing, and the root's own target
+    f.sidecar("Gone", R"({"_target": "Ghost/Typo"})");
+    f.sidecar("A", R"({"file": {"missing.txt": {"_target": "Ghost2/X"}}})");
+    f.sidecar("", R"({"_target": "Elsewhere/Lib"})");
+    f.open();
+    CHECK_MSG((f.names("") == Names{"Lib"}), "got {} entries", f.names("").size());
+    CHECK((f.names("Lib") == Names{"A"}));
+}
+
+TEST(placement_first_scan_dates_directories_by_their_sidecars) {
+    // directories shaped by targets keep their mtime across restarts, so music
+    // servers do not rescan every moved folder after each start
+    Fixture f("stamp");
+    f.file("A/x.txt");
+    f.sidecar("A", R"({"_target": "Lib/Sorted/A"})");
+    int64_t written = 1'700'000'000LL * 1'000'000'000;
+    timespec t[2] = {{1'700'000'000, 0}, {1'700'000'000, 0}};
+    CHECK(::utimensat(AT_FDCWD, (f.tags / "A" / SIDECAR_NAME).c_str(), t, 0) == 0);
+    auto& lib = f.open();
+    CHECK(lib.list_vdir("Lib/Sorted")->mtime == written);
+    CHECK(lib.list_vdir("")->mtime == written);
+    // later changes are dated when they are seen
+    f.sidecar("A", R"({"_target": "Lib/Sorted/B"})");
+    int64_t before = now_ns();
+    lib.refresh_placements(true);
+    CHECK(lib.list_vdir("Lib/Sorted")->mtime >= before);
+}
+
+TEST(placement_unreadable_sidecar_read_again) {
+    Fixture f("unreadable");
+    f.file("A/x.txt");
+    f.sidecar("A", R"({"_target": "Lib/Moved"})");
+    fs::path sc = f.tags / "A" / SIDECAR_NAME;
+    fs::permissions(sc, fs::perms::none);
+    if (try_read_text(sc)) {
+        std::printf("      (skipped: running as a user that reads anything)\n");
+        return;
+    }
+    f.open();
+    CHECK((f.names("Lib") == Names{"A"}));
+    // readable again with the same mtime: the targets must not have been forgotten
+    fs::permissions(sc, fs::perms::owner_read | fs::perms::owner_write);
+    f.lib->refresh_placements(true);
+    CHECK((f.names("Lib") == Names{"Moved"}));
+}
+
 TEST(placement_numbered_clash_keeps_source_name) {
     // tag edits of a file numbered in the mount are stored under its own name
     Fixture f("clash");
