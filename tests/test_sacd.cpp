@@ -174,8 +174,16 @@ Bytes make_iso(const Area* stereo, const Area* mc) {
         sectors.emplace_back(SECTOR, 0);  // stands for the area's backup TOC
         return toc;
     };
-    if (stereo) put_be32_at(sectors[510], 64, add_area(*stereo, false));
-    if (mc) put_be32_at(sectors[510], 72, add_area(*mc, true));
+    // add_area grows `sectors`: take the master TOC's reference only afterwards
+    // (argument evaluation order is unspecified)
+    if (stereo) {
+        uint32_t toc = add_area(*stereo, false);
+        put_be32_at(sectors[510], 64, toc);
+    }
+    if (mc) {
+        uint32_t toc = add_area(*mc, true);
+        put_be32_at(sectors[510], 72, toc);
+    }
     Bytes iso;
     for (auto& s : sectors) append(iso, s);
     return iso;
