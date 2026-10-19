@@ -135,3 +135,29 @@ TEST(index_accepts_headerless_ape_tag_and_id3v1) {
     auto idx = flac::FrameIndex::build(img, flac::FlacMeta::read(img));
     CHECK(idx.offsets.back() == audio_end);
 }
+
+// ---- whole-file decoding (track MD5s)
+
+TEST(decode_file_fails_on_a_bad_frame_before_the_end) {
+    TmpDir dir("badframe");
+    fs::path img = dir.path / "img.flac";
+    size_t total = 4096 * 8;
+    make_flac(img, 44100, 2, 16, 4096, total);
+    auto count = [&](const fs::path& p) {
+        uint64_t n = 0;
+        flac::decode_file(p, total, [&](uint64_t, const std::vector<std::span<const int32_t>>& ch) { n += ch[0].size(); });
+        return n;
+    };
+    // junk after the audio is ignored
+    Bytes file = read_file(img);
+    Bytes junk = file;
+    for (int i = 0; i < 300; i++) junk.push_back(uint8_t(i * 37 + 11));
+    fs::path tail = dir.path / "tail.flac";
+    atomic_write(tail, junk);
+    CHECK(count(tail) >= total);
+    // a damaged frame in the middle: libFLAC delivers it as silence, which must not pass
+    file[file.size() / 2] ^= 0x55;
+    fs::path bad = dir.path / "bad.flac";
+    atomic_write(bad, file);
+    CHECK_THROWS(count(bad));
+}
