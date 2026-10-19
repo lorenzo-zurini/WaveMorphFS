@@ -15,7 +15,7 @@ if [ "$(id -u)" = 0 ]; then
     PUID="${PUID:-1000}" PGID="${PGID:-1000}"
     [ "$PUID" != 0 ] || { echo "PUID=0 is not supported: run as an unprivileged user" >&2; exit 1; }
     groupmod -o -g "$PGID" wavemorph
-    usermod -o -u "$PUID" -g "$PGID" wavemorph 2>/dev/null || true  # "no changes" when they already match
+    usermod -o -u "$PUID" -g "$PGID" wavemorph >/dev/null 2>&1 || true  # "no changes" when they already match
     as_user() { setpriv --reuid="$PUID" --regid="$PGID" --init-groups -- "$@"; }
     # compose creates missing bind sources as root: hand our own directories (not
     # their contents, never the music) to the user the filesystem runs as
@@ -36,15 +36,18 @@ fi
 as_user mkdir -p "$MNT"
 # lazy unmount on shutdown: a plain unmount fails while readers (Navidrome,
 # beets) have files open, which would leave a dead mount behind
-trap 'fusermount3 -uz "$MNT" 2>/dev/null; kill -TERM "$pid" 2>/dev/null' TERM INT
+stopping=
+trap 'stopping=1; fusermount3 -uz "$MNT" 2>/dev/null; kill -TERM "$pid" 2>/dev/null' TERM INT
 as_user wavemorphfs "$@" mount "$MNT" --allow-other &
 pid=$!
 # a trapped signal interrupts wait: then wait again for the filesystem to exit
 set +e
 wait "$pid"
 status=$?
-if [ "$status" -gt 128 ] && kill -0 "$pid" 2>/dev/null; then
+while [ -n "$stopping" ] && kill -0 "$pid" 2>/dev/null; do
     wait "$pid"
     status=$?
-fi
+done
+# a stop we were asked for is a clean exit
+[ -n "$stopping" ] && [ "$status" -gt 128 ] && status=0
 exit "$status"

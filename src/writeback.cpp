@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "writeback.hpp"
 
-#include <fcntl.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 
 #include "apetag.hpp"
@@ -15,41 +15,75 @@
 
 namespace wm {
 
+namespace {
+
+/// The top-level MP4 boxes include moov and none runs past the end (a file cut
+/// short while being written has one that does).
+bool mp4_complete(const ByteReader& read, uint64_t size) {
+    bool moov = false;
+    uint64_t pos = 0;
+    while (pos + 8 <= size) {
+        Bytes h = read(pos, 16);
+        if (h.size() < 8) return false;
+        uint64_t sz = be32(h.data());
+        if (sz == 1) sz = h.size() >= 16 ? be64(&h[8]) : 0;
+        else if (sz == 0) sz = size - pos;  // extends to the end
+        if (sz < 8 || sz > size - pos) return false;
+        moov |= std::memcmp(&h[4], "moov", 4) == 0;
+        pos += sz;
+    }
+    return moov;
+}
+
+}  // namespace
+
 Tags read_file_tags(const std::string& ext, const ByteReader& read, uint64_t size) {
-    Tags t;
+    auto magic = [&](uint64_t pos, std::string_view m) {
+        Bytes h = read(pos, m.size());
+        return h.size() == m.size() && std::memcmp(h.data(), m.data(), m.size()) == 0;
+    };
+    // an ID3v2 tag at `pos` that ends within the file
+    auto id3_at = [&](uint64_t pos) {
+        auto len = id3::tag_length(read(pos, 10));
+        WM_ENSURE(len.has_value(), "no ID3 tag at {}", pos);
+        WM_ENSURE(*len <= size && pos <= size - *len, "ID3 tag runs past the end of the file");
+        return id3::read_tags(read(pos, size_t(*len)));
+    };
     if (ext == "flac") {
-        Bytes h = read(0, 4);
-        if (h.size() < 4 || std::memcmp(h.data(), "fLaC", 4) != 0) return t;
-        uint64_t pos = 4;
-        while (pos + 4 <= size) {
+        WM_ENSURE(magic(0, "fLaC"), "not a FLAC file");
+        Tags t;
+        for (uint64_t pos = 4;;) {
             Bytes bh = read(pos, 4);
-            if (bh.size() < 4) break;
+            WM_ENSURE(bh.size() == 4, "FLAC metadata cut short");
             bool last = bh[0] & 0x80;
             size_t len = size_t(bh[1]) << 16 | size_t(bh[2]) << 8 | bh[3];
+            WM_ENSURE(pos + 4 + len <= size, "FLAC metadata cut short");
             if ((bh[0] & 0x7F) == flac::BLOCK_VORBIS)
                 for (auto& [k, v] : flac::parse_vorbis(read(pos + 4, len))) t.add(k, v);
             pos += 4 + len;
-            if (last) break;
+            if (last) return t;
         }
-        return t;
     }
-    auto id3_at = [&](uint64_t pos) {
-        auto len = id3::tag_length(read(pos, 10));
-        return len ? id3::read_tags(read(pos, size_t(*len))) : Tags{};
-    };
     if (ext == "dsf") {
         Bytes h = read(0, 28);
-        if (h.size() < 28 || std::memcmp(h.data(), "DSD ", 4) != 0) return t;
+        WM_ENSURE(h.size() == 28 && std::memcmp(h.data(), "DSD ", 4) == 0, "not a DSF file");
         uint64_t meta = le64(&h[20]);
-        return meta ? id3_at(meta) : t;
+        return meta ? id3_at(meta) : Tags{};  // no metadata chunk: every tag removed
     }
-    if (ext == "mp3") return id3_at(0);
-    if (ext == "m4a") return mp4::read_tags(read, size);
+    if (ext == "mp3") {
+        WM_ENSURE(size > 0, "empty file");
+        return magic(0, "ID3") ? id3_at(0) : Tags{};  // no tag: every tag removed
+    }
+    if (ext == "m4a") {
+        WM_ENSURE(mp4_complete(read, size), "not a complete MP4 file");
+        return mp4::read_tags(read, size);
+    }
     if (ext == "wv") {
+        WM_ENSURE(magic(0, "wvpk"), "not a WavPack file");
         auto a = ape::read(read, size);
-        return a ? a->tags : t;
+        return a ? a->tags : Tags{};
     }
-    return t;
+    fail("no tag reader for .{} files", ext);
 }
 
 Tags tag_changes(const Tags& before, const Tags& after) {
@@ -124,14 +158,19 @@ uint64_t WriteSession::size() const {
     return size_;
 }
 
-bool WriteSession::dirty() const {
+uint64_t WriteSession::changes() const {
     std::lock_guard g(mu_);
-    return dirty_;
+    return changes_;
 }
 
-void WriteSession::mark_clean() {
+void WriteSession::mark_stored(uint64_t changes) {
     std::lock_guard g(mu_);
-    dirty_ = false;
+    stored_ = std::max(stored_, changes);
+}
+
+bool WriteSession::dirty() const {
+    std::lock_guard g(mu_);
+    return changes_ != stored_;
 }
 
 Bytes WriteSession::read(uint64_t off, size_t len) const {
@@ -153,8 +192,13 @@ Bytes WriteSession::read_locked(uint64_t off, size_t len) const {
             uint64_t stop = std::min(end, w->second);
             size_t n = size_t(stop - pos), old = out.size();
             out.resize(old + n);
-            ssize_t r = ::pread(fd_, out.data() + old, n, off_t(pos));
-            if (r != ssize_t(n)) fail("scratch read: {}", std::strerror(errno));
+            for (size_t done = 0; done < n;) {
+                ssize_t r = ::pread(fd_, out.data() + old + done, n - done, off_t(pos + done));
+                if (r < 0 && errno == EINTR) continue;
+                if (r < 0) fail("scratch read: {}", std::strerror(errno));
+                WM_ENSURE(r > 0, "scratch read: unexpected end of file");
+                done += size_t(r);
+            }
             pos = stop;
             continue;
         }
@@ -197,7 +241,7 @@ void WriteSession::write(uint64_t off, std::span<const uint8_t> data) {
     }
     written_[s] = e;
     size_ = std::max(size_, e);
-    dirty_ = true;
+    changes_++;
 }
 
 void WriteSession::truncate(uint64_t n) {
@@ -213,7 +257,7 @@ void WriteSession::truncate(uint64_t n) {
     original_limit_ = std::min(original_limit_, n);
     if (::ftruncate(fd_, off_t(n)) != 0) fail("scratch truncate: {}", std::strerror(errno));
     size_ = n;
-    dirty_ = true;
+    changes_++;
 }
 
 }  // namespace wm
