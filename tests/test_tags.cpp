@@ -2,6 +2,7 @@
 // Tag model and JSON sidecars.
 #include <unistd.h>
 
+#include <atomic>
 #include <thread>
 
 #include "id3.hpp"
@@ -277,7 +278,7 @@ TEST(targets_place_folders_and_files) {
     CHECK_MSG((names("Lib/Sorted/Composer/ Work (1990) ") == std::vector<std::string>{"CD1", "cover.jpg", "song.txt"}), "folder, subfolder and file");
     CHECK((names("Lib/Sorted/Composer/ Work (1990) /CD1") == std::vector<std::string>{"a.txt"}));
     CHECK_MSG((names("Lib/Misc") == std::vector<std::string>{"keep.txt"}), "invalid target ignored");
-    auto* moved = lib->list_vdir("Lib/Sorted/Composer/ Work (1990) ")->find("song.txt");
+    auto moved = lib->lookup("Lib/Sorted/Composer/ Work (1990) ", "song.txt");
     CHECK_MSG(moved && moved->src_dir == lib_root / "Misc", "edits still go to the source folder");
     // a file placed next to one with the same name
     atomic_write(lib_root / "Misc/b.txt", std::string_view("y"));
@@ -292,6 +293,38 @@ TEST(targets_place_folders_and_files) {
     lib->refresh_placements(true);
     CHECK_MSG((names("Lib") == std::vector<std::string>{"Misc", "Sorted"}), "emptied folders hidden");
     CHECK((names("Lib/Sorted") == std::vector<std::string>{"Composer", "Other"}));
+    fs::remove_all(dir);
+}
+
+TEST(lookups_survive_listing_rebuilds) {
+    // mount listings are rebuilt every 1.5 s and the old one is freed while other
+    // FUSE threads may still be resolving paths through it (production saw
+    // std::bad_alloc from copying a freed path in getattr)
+    fs::path dir = fs::temp_directory_path() / std::format("wm-lookup-{}", ::getpid());
+    fs::path lib_root = dir / "lib";
+    for (int a = 0; a < 8; a++)
+        for (int b = 0; b < 8; b++) fs::create_directories(lib_root / std::format("Artist {}", a) / std::format("Album with a long name {}", b));
+    Config cfg;
+    cfg.roots = {{"Lib", lib_root}};
+    cfg.tags_dir = dir / "tags";
+    cfg.cache_dir = dir / "cache";
+    cfg.workers = 0;
+    auto lib = Library::create(std::move(cfg));
+    std::atomic<size_t> bad = 0, done = 0;
+    auto stop = Clock::now() + std::chrono::milliseconds(2500);
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 8; t++)
+        threads.emplace_back([&, t] {
+            for (size_t i = t; Clock::now() < stop; i++) {
+                auto artist = std::format("Artist {}", i % 8), album = std::format("Album with a long name {}", i / 8 % 8);
+                auto ve = lib->lookup("Lib/" + artist, album);
+                if (!ve || !ve->e.is_dir || ve->e.dir != lib_root / artist / album) bad++;
+                done++;
+            }
+        });
+    for (auto& t : threads) t.join();
+    CHECK(done > 0);
+    CHECK_MSG(bad == 0, "{} of {} lookups wrong", bad.load(), done.load());
     fs::remove_all(dir);
 }
 
