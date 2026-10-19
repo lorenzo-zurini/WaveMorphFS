@@ -64,26 +64,28 @@ static bool is_ws_cp(char32_t c) {
            c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F || c == 0x3000;
 }
 
-// decode one UTF-8 sequence at s[i]; returns code point (0xFFFD on error) and its length
-static char32_t utf8_at(std::string_view s, size_t i, size_t& len) {
+char32_t utf8_at(std::string_view s, size_t i, size_t& len) {
     auto b = uint8_t(s[i]);
     len = 1;
     if (b < 0x80) return b;
-    int n = b >= 0xF0 ? 4 : b >= 0xE0 ? 3 : b >= 0xC0 ? 2 : 0;
+    // C0/C1 can only start overlong forms, F5.. only code points beyond U+10FFFF
+    size_t n = b >= 0xC2 && b <= 0xDF ? 2 : b >= 0xE0 && b <= 0xEF ? 3 : b >= 0xF0 && b <= 0xF4 ? 4 : 0;
     if (n == 0 || i + n > s.size()) return 0xFFFD;
     char32_t c = b & (0x3F >> (n - 1));
-    for (int k = 1; k < n; k++) {
+    for (size_t k = 1; k < n; k++) {
         auto x = uint8_t(s[i + k]);
         if ((x & 0xC0) != 0x80) return 0xFFFD;
         c = c << 6 | (x & 0x3F);
     }
+    static constexpr char32_t min_of[5] = {0, 0, 0x80, 0x800, 0x10000};
+    if (c < min_of[n] || (c >= 0xD800 && c < 0xE000) || c > 0x10FFFF) return 0xFFFD;
     len = n;
     return c;
 }
 
 bool ws_at(std::string_view s, size_t i, size_t& len) { return is_ws_cp(utf8_at(s, i, len)); }
 
-std::string trim_end(std::string_view s) {
+static std::string trim_end(std::string_view s) {
     size_t end = s.size();
     while (end > 0) {
         size_t st = end - 1;
@@ -175,8 +177,6 @@ std::string ext_lower(const fs::path& p) {
     return e.empty() ? std::string() : lower(e.substr(1));
 }
 
-std::string path_str(const fs::path& p) { return p.string(); }
-
 // ---------------------------------------------------------------- files
 
 File::File(const fs::path& p) : name_(p.string()) {
@@ -237,7 +237,8 @@ std::optional<std::string> try_read_text(const fs::path& p) {
     return std::string(b->begin(), b->end());
 }
 
-fs::path unique_tmp(const fs::path& p) {
+// a temp path next to `p`, unique to this process and thread
+static fs::path unique_tmp(const fs::path& p) {
     auto tid = std::hash<std::thread::id>{}(std::this_thread::get_id());
     auto name = p.filename().string() + std::format(".tmp.{}.{}", ::getpid(), tid);
     return p.parent_path() / name;
@@ -247,23 +248,36 @@ void atomic_write(const fs::path& p, std::span<const uint8_t> data) {
     auto tmp = unique_tmp(p);
     int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd < 0) fail("write {}: {}", tmp.string(), std::strerror(errno));
+    auto give_up = [&](const char* what, int e) {
+        if (fd >= 0) ::close(fd);
+        ::unlink(tmp.c_str());
+        fail("{} {}: {}", what, tmp.string(), std::strerror(e));
+    };
+    // a sidecar someone made group-writable stays so after an edit
+    if (struct stat st; ::stat(p.c_str(), &st) == 0) ::fchmod(fd, st.st_mode & 07777);
     size_t done = 0;
     while (done < data.size()) {
         ssize_t n = ::write(fd, data.data() + done, data.size() - done);
         if (n < 0) {
             if (errno == EINTR) continue;
-            int e = errno;
-            ::close(fd);
-            ::unlink(tmp.c_str());
-            fail("write {}: {}", tmp.string(), std::strerror(e));
+            give_up("write", errno);
         }
         done += size_t(n);
     }
-    ::close(fd);
-    if (::rename(tmp.c_str(), p.c_str()) != 0) {
-        int e = errno;
-        ::unlink(tmp.c_str());
-        fail("rename {}: {}", p.string(), std::strerror(e));
+    // Without the sync, a crash soon after the rename can leave an empty file on
+    // file systems that do not order data before renames (XFS, ext4 without
+    // auto_da_alloc): sidecars hold the user's tag edits. close() can report
+    // deferred write errors (NFS, quotas).
+    if (::fsync(fd) != 0 && errno != EINVAL) give_up("sync", errno);
+    int rc = ::close(fd);
+    fd = -1;
+    if (rc != 0) give_up("write", errno);
+    if (::rename(tmp.c_str(), p.c_str()) != 0) give_up("rename", errno);
+    // make the rename itself durable (not every file system can sync a directory)
+    fs::path dir = p.parent_path().empty() ? fs::path(".") : p.parent_path();
+    if (int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC); dfd >= 0) {
+        ::fsync(dfd);
+        ::close(dfd);
     }
 }
 
@@ -316,7 +330,7 @@ struct Pool {
             }).detach();
     }
 };
-Pool& pool(Lane lane = Lane::Decode) {
+Pool& pool(Lane lane) {
     // never destroyed: workers wait on it until the process ends (destroying a
     // condition variable with waiters blocks exit)
     static Pool* decode = new Pool;
@@ -333,8 +347,6 @@ void submit(std::function<void()> task, Lane lane) {
     }
     p.cv.notify_one();
 }
-
-size_t pool_size() { return pool().n; }
 
 // idle objects are trimmed after this long; the sweeper looks this often
 constexpr auto TRIM_IDLE = std::chrono::seconds(15);
@@ -517,13 +529,6 @@ ProcResult run(const std::vector<std::string>& argv) {
         if (f.fd >= 0) ::close(f.fd);
     r.status = wait_status(pid);
     return r;
-}
-
-int run_inherit(const std::vector<std::string>& argv) {
-    pid_t pid;
-    auto av = cargv(argv);
-    if (posix_spawnp(&pid, av[0], nullptr, nullptr, av.data(), environ) != 0) return -1;
-    return wait_status(pid);
 }
 
 }  // namespace wm
