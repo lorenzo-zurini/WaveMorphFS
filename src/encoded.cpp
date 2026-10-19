@@ -152,7 +152,7 @@ EncodedTrack::EncodedTrack(std::shared_ptr<const AvImage> img, uint64_t start, u
     si.total_samples = len;
     si.md5 = layout.md5;
     auto [mn, mx] = std::minmax_element(layout.frame_sizes.begin(), layout.frame_sizes.end());
-    std::vector<flac::HeaderBlock> meta = {{flac::BLOCK_VORBIS, flac::build_vorbis("WaveMorphFS", tags.to_pairs())}};
+    std::vector<flac::HeaderBlock> meta = {{flac::BLOCK_VORBIS, flac::build_vorbis("WaveMorphFS", vorbis_comments(tags))}};
     meta.insert(meta.end(), pictures.begin(), pictures.end());
     meta.push_back({flac::BLOCK_PADDING, Zeros{flac::EDIT_PADDING}});
     header_ = Segments(flac::header_segments(si.encode(*mn, *mx), meta));
