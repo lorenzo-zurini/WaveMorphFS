@@ -203,13 +203,20 @@ private:
     };
     struct Md5Job {
         std::shared_ptr<const FlacImage> image;
-        std::vector<std::pair<uint64_t, uint64_t>> ranges;
+        SrcKey key;  // the version of the image the listing saw
+        Ranges ranges;
         fs::path dir;
     };
     struct EncodeJob {  // measure the encoded tracks of a decoded image
         std::shared_ptr<const AvImage> image;
         Ranges ranges;
         fs::path dir;
+    };
+    /// A background step that failed for a version of a source file: not retried
+    /// until the file changes (each try reads the whole image).
+    struct JobFailure {
+        SrcKey key;
+        std::string err;
     };
     using Job = std::variant<ImageJob, SacdJob, Md5Job, EncodeJob>;
 
@@ -218,6 +225,14 @@ private:
     bool enqueue(Job job);
     void bump(const fs::path& dir);
     void walk(const fs::path& dir, size_t& n);
+    /// Forget state of source files and folders that no longer exist.
+    void prune();
+    /// Store the outcome of processing version `key` of a file, unless a newer
+    /// version has been seen meanwhile (its own state must stay).
+    template <class K, class T>
+    void settle_work(WorkMap<K, T>& states, const K& k, const SrcKey& key, Work<T> st);
+    /// The error recorded in `failures` for the current version of `src`, if any.
+    std::optional<std::string> failure_of(const std::map<fs::path, JobFailure>& failures, const fs::path& src) const;
     /// Verify and index an image.
     ReadyImage process_image(const fs::path& src) const;
     /// Human-readable summary of processing state, written next to the cache dir.
@@ -278,11 +293,13 @@ private:
     std::map<fs::path, std::pair<uint64_t, int64_t>> generations_;  // per source folder: generation, time of the last bump
     std::map<fs::path, std::shared_ptr<std::mutex>> dir_locks_;
     std::set<fs::path> md5_queued_, encode_queued_;
+    std::map<fs::path, JobFailure> md5_failed_, encode_failed_;
 
     std::mutex jobs_mu_;
     std::condition_variable jobs_cv_;
     std::deque<Job> jobs_;
     bool has_workers_ = false;
+    mutable std::atomic<Clock::time_point> status_written_{};  // when status.txt was last written
 };
 
 }  // namespace wm

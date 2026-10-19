@@ -424,7 +424,14 @@ void Library::worker_loop() {
         } catch (const std::exception& e) {
             warn("worker: {}", e.what());
         }
-        write_status();
+        // status.txt lists every source file: rewrite it at most once a second
+        // while jobs keep finishing, and when the queue runs empty
+        bool idle;
+        {
+            std::lock_guard g(jobs_mu_);
+            idle = jobs_.empty();
+        }
+        if (idle || Clock::now() - status_written_.load() >= std::chrono::seconds(1)) write_status();
     }
 }
 
@@ -435,6 +442,7 @@ void Library::start_prescan(std::chrono::seconds every) {
             size_t n = 0;
             for (auto& r : self->cfg.roots) self->walk(r.path, n);
             info("prescan: {} directories in {:.1f}s", n, std::chrono::duration<double>(Clock::now() - t).count());
+            self->prune();
             trim_heap();  // building listings reads (and frees) every image's metadata and pictures
             self->write_status();
             std::this_thread::sleep_for(every);
@@ -455,43 +463,68 @@ void Library::walk(const fs::path& dir, size_t& n) {
         if (e.is_dir) walk(e.dir, n);
 }
 
+template <class K, class T>
+void Library::settle_work(WorkMap<K, T>& states, const K& k, const SrcKey& key, Work<T> st) {
+    std::lock_guard g(mu_);
+    if (auto it = states.find(k); it != states.end() && it->second.first != key) return;
+    states[k] = {key, std::move(st)};
+}
+
+std::optional<std::string> Library::failure_of(const std::map<fs::path, JobFailure>& failures, const fs::path& src) const {
+    auto key = SrcKey::try_of(src);
+    std::lock_guard g(mu_);
+    if (auto it = failures.find(src); it != failures.end() && key == it->second.key) return it->second.err;
+    return std::nullopt;
+}
+
 void Library::run_job(Job job) {
     if (auto* j = std::get_if<ImageJob>(&job)) {
         auto key = SrcKey::try_of(j->src);
         auto st = attempt<ReadyImage>([&] { return std::make_shared<const ReadyImage>(process_image(j->src)); });
         if (st.st == Work<ReadyImage>::Ready) info("image ready: {}", j->src.string());
         else warn("image failed: {}: {}", j->src.string(), st.err);
-        if (key) {
-            std::lock_guard g(mu_);
-            images_[j->src] = {*key, st};
-        }
+        if (key) settle_work(images_, j->src, *key, std::move(st));
         bump(j->dir);
     } else if (auto* j = std::get_if<Md5Job>(&job)) {
+        const fs::path& path = j->image->path;
+        // the frames are read through the path: the image must still be the
+        // version the listing saw, before and after, or the MD5s describe another
+        auto unchanged = [&] { return SrcKey::try_of(path) == j->key; };
         try {
-            auto d = track_md5s(*j->image, j->ranges);
-            Md5Map m;
-            for (size_t i = 0; i < d.size(); i++) m[j->ranges[i]] = d[i];
-            cache.store_md5s(j->image->path, m);
-            info("track MD5s ready: {}", j->image->path.string());
+            if (unchanged()) {
+                auto d = track_md5s(*j->image, j->ranges);
+                Md5Map m;
+                for (size_t i = 0; i < d.size(); i++) m[j->ranges[i]] = d[i];
+                if (unchanged()) {
+                    cache.store_md5s(path, j->key, m);
+                    info("track MD5s ready: {}", path.string());
+                }
+            }
         } catch (const std::exception& e) {
-            warn("MD5 of {}: {}", j->image->path.string(), e.what());
+            warn("MD5 of {}: {}", path.string(), e.what());
+            std::lock_guard g(mu_);
+            md5_failed_[path] = {j->key, e.what()};
         }
         {
             std::lock_guard g(mu_);
-            md5_queued_.erase(j->image->path);
+            md5_queued_.erase(path);
         }
         bump(j->dir);
     } else if (auto* j = std::get_if<EncodeJob>(&job)) {
+        const fs::path& path = j->image->path;
+        auto key = SrcKey::try_of(path);
         try {
             auto t = Clock::now();
             build_layout(*j->image, j->ranges, &cache);
-            info("tracks measured: {} ({:.0f}s)", j->image->path.string(), std::chrono::duration<double>(Clock::now() - t).count());
+            info("tracks measured: {} ({:.0f}s)", path.string(), std::chrono::duration<double>(Clock::now() - t).count());
         } catch (const std::exception& e) {
-            warn("measuring tracks of {}: {}", j->image->path.string(), e.what());
+            warn("measuring tracks of {}: {}", path.string(), e.what());
+            std::lock_guard g(mu_);
+            if (key) encode_failed_[path] = {*key, e.what()};
         }
         {
             std::lock_guard g(mu_);
-            encode_queued_.erase(j->image->path);
+            encode_queued_.erase(path);
         }
         bump(j->dir);
     } else if (auto* j = std::get_if<SacdJob>(&job)) {
@@ -502,11 +535,39 @@ void Library::run_job(Job job) {
             info("SACD {} area ready: {} ({} tracks, {} ch{})", area, j->src.string(), st.ready->tracks.size(), st.ready->channels, st.ready->dst ? ", DST" : "");
         else if (st.err.find("no multichannel area") != std::string::npos) debug("{}: {}", j->src.string(), st.err);
         else warn("SACD {} area failed: {}: {}", area, j->src.string(), st.err);
-        if (key) {
-            std::lock_guard g(mu_);
-            sacds_[{j->src, j->mc}] = {*key, st};
-        }
+        if (key) settle_work(sacds_, std::pair{j->src, j->mc}, *key, std::move(st));
         bump(j->dir);
+    }
+}
+
+void Library::prune() {
+    std::set<fs::path> files, dirs;
+    {
+        std::lock_guard g(mu_);
+        for (auto& [p, ks] : images_) files.insert(p);
+        for (auto& [pk, ks] : sacds_) files.insert(pk.first);
+        for (auto* failures : {&md5_failed_, &encode_failed_})
+            for (auto& [p, f] : *failures) files.insert(p);
+        for (auto& [d, l] : listings_) dirs.insert(d);
+    }
+    std::map<fs::path, std::optional<SrcKey>> keys;
+    for (auto& f : files) keys[f] = SrcKey::try_of(f);
+    std::set<fs::path> gone_dirs;
+    for (auto& d : dirs) {
+        std::error_code ec;
+        if (!fs::is_directory(d, ec)) gone_dirs.insert(d);
+    }
+    std::lock_guard g(mu_);
+    auto gone = [&](const fs::path& p) { return keys.contains(p) && !keys[p]; };
+    std::erase_if(images_, [&](auto& kv) { return gone(kv.first); });
+    std::erase_if(sacds_, [&](auto& kv) { return gone(kv.first.first); });
+    // a failure is about one version of the file
+    for (auto* failures : {&md5_failed_, &encode_failed_})
+        std::erase_if(*failures, [&](auto& kv) { return keys.contains(kv.first) && keys[kv.first] != kv.second.key; });
+    for (auto& d : gone_dirs) {
+        listings_.erase(d);
+        dir_locks_.erase(d);  // a list_dir() holding it keeps its own reference
+        generations_.erase(d);
     }
 }
 
@@ -569,6 +630,8 @@ void Library::write_status() const {
             }
             sections[status_section(st)].push_back(std::move(label));
         }
+        for (auto [what, failures] : {std::pair{"MD5s   ", &md5_failed_}, std::pair{"tracks ", &encode_failed_}})
+            for (auto& [p, f] : *failures) sections[3].push_back(std::format("{}{}\n         {}", what, p.string(), f.err));
     }
     static const char* titles[4] = {"ready", "pending", "settling (still being written)", "FAILED"};
     std::string out = std::format("WaveMorphFS status (unix time {})\n\n", now_ns() / 1'000'000'000);
@@ -579,6 +642,7 @@ void Library::write_status() const {
             for (auto& s : sections[i]) out += "   " + s + "\n";
         out += "\n";
     }
+    status_written_ = Clock::now();
     fs::path parent = cfg.cache_dir.parent_path();
     try {
         atomic_write((parent.empty() ? cfg.cache_dir : parent) / "status.txt", out);
@@ -730,8 +794,7 @@ Library::Work<T> Library::work_state(WorkMap<K, T>& states, const K& k, const fs
     }
     if (!inline_ok && enqueue(std::move(job))) return {};
     auto st = attempt<T>(open);
-    std::lock_guard g(mu_);
-    states[k] = {*key, st};
+    settle_work(states, k, *key, st);
     return st;
 }
 
@@ -973,6 +1036,9 @@ bool Library::add_standalone(ListingBuild& b, const DirItem& n) {
 
 std::optional<std::vector<TrackLayout>> Library::track_layouts(const std::shared_ptr<const AvImage>& av, const Ranges& ranges, const fs::path& dir) {
     if (auto layout = load_layout(*av, ranges, cache)) return layout;
+    // measuring this version failed before: fail again rather than decode it all
+    // again on every rebuild (and leave the image visible as it is)
+    if (auto err = failure_of(encode_failed_, av->path)) fail("measuring tracks failed before: {}", *err);
     bool fresh;
     {
         std::lock_guard g(mu_);
@@ -981,11 +1047,13 @@ std::optional<std::vector<TrackLayout>> Library::track_layouts(const std::shared
     if (!fresh) return std::nullopt;
     if (enqueue(EncodeJob{av, ranges, dir})) return std::nullopt;
     std::optional<std::vector<TrackLayout>> layout;
+    auto key = SrcKey::try_of(av->path);
     try {
         layout = build_layout(*av, ranges, &cache);
-    } catch (...) {
+    } catch (const std::exception& e) {
         std::lock_guard g(mu_);
         encode_queued_.erase(av->path);
+        if (key) encode_failed_[av->path] = {*key, e.what()};
         throw;
     }
     std::lock_guard g(mu_);
@@ -1054,13 +1122,14 @@ std::optional<std::vector<Entry>> Library::image_tracks(ListingBuild& b, const C
     if (ready.wv) wv_layout = wv_layouts(*ready.wv, ranges, &cache);  // a few blocks per track: quick
     Md5Map md5s = img ? cache.load_md5s(img->path) : Md5Map{};
     bool missing = img && std::any_of(ranges.begin(), ranges.end(), [&](auto& r) { return !md5s.contains(r); });
-    if (missing) {
+    auto key = img ? SrcKey::try_of(img->path) : std::nullopt;
+    if (missing && key && !failure_of(md5_failed_, img->path)) {
         bool fresh;
         {
             std::lock_guard g(mu_);
             fresh = md5_queued_.insert(img->path).second;
         }
-        if (fresh && !enqueue(Md5Job{img, ranges, b.dir})) {
+        if (fresh && !enqueue(Md5Job{img, *key, ranges, b.dir})) {
             std::lock_guard g(mu_);
             md5_queued_.erase(img->path);
         }

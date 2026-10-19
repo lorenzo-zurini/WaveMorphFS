@@ -44,7 +44,9 @@ public:
     bool image_is_cached(const fs::path& src) const;
 
     Md5Map load_md5s(const fs::path& flac) const;
-    void store_md5s(const fs::path& flac, const Md5Map& entries) const;
+    /// Add MD5s computed from version `key` of `flac` (the version they were read
+    /// from, which may no longer be the current one).
+    void store_md5s(const fs::path& flac, const SrcKey& key, const Md5Map& entries) const;
 
     fs::path sacd_frames_path(const fs::path& src, const SrcKey& key, bool multichannel) const;
     fs::path idx_path(const fs::path& src, const SrcKey& key) const;
