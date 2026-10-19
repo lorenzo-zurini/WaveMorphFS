@@ -15,6 +15,7 @@
 //  * cover image from the sidecar tree     -> exposed as cover.jpg/png if the folder has none
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -54,16 +55,27 @@ struct Config {
     bool sacd_multichannel = false;
 };
 
+/// Sidecar sections that tag edits made on the mount are stored in.
+inline constexpr std::string_view EDIT_TRACK = "track", EDIT_FILE = "file";
+
 struct Entry {
     std::string name;
     bool is_dir = false;
     fs::path dir;   // source path (directories)
     VFilePtr file;  // contents (files)
+    /// files: the mtime they report. Directories report the mtime of their own
+    /// listing instead (Library::list_vdir); here it is the source folder's.
     int64_t mtime = 0;
-    /// where tag edits of this file are stored: sidecar section ("track" or
-    /// "file") and key, and the file's tag format (flac, dsf, mp3, m4a); empty
-    /// section = not editable
+    /// where tag edits of this file are stored: sidecar section (EDIT_TRACK or
+    /// EDIT_FILE) and key, and the file's tag format (flac, dsf, mp3, m4a, wv);
+    /// empty section = not editable
     std::string tag_section, tag_key, tag_ext;
+
+    static Entry make_dir(std::string name, fs::path dir, int64_t mtime);
+    /// A file that cannot be edited through the mount.
+    static Entry make_file(std::string name, VFilePtr file, int64_t mtime);
+    /// A file whose tag edits are stored under `section`/`key` of its folder's sidecar.
+    static Entry make_tagged(std::string name, VFilePtr file, int64_t mtime, std::string_view section, std::string key, std::string ext);
 };
 
 struct Sig {
@@ -76,13 +88,15 @@ struct Listing {
     std::vector<Entry> entries;
     int64_t mtime = 0;
     Sig sig;
-    mutable std::mutex mu;
-    mutable Clock::time_point checked;
+    /// when `sig` was last found current (re-checked at most every 1.5 s)
+    mutable std::atomic<Clock::time_point> checked;
     /// rebuild after this instant even if nothing changed (files still settling)
     std::optional<Clock::time_point> retry_at;
     /// cover images used, with their mtime then: the listing is rebuilt when one changes
     std::vector<std::pair<fs::path, std::optional<int64_t>>> covers;
 
+    /// The entry called `name`. The pointer is only valid while the caller holds
+    /// this listing: list_dir() may replace it at any moment.
     const Entry* find(std::string_view name) const;
 };
 
@@ -118,17 +132,13 @@ struct Placements {
     std::set<std::string> sources;                           // source folders with any placement (as strings)
 };
 
-/// A processed image: a FLAC image (split by copying frames), a floating-point
-/// WavPack image (split by copying blocks) or a decoded one (tracks encoded on
-/// the fly), plus the source's own tags.
-struct ReadyImage {
-    std::shared_ptr<const FlacImage> flac;
-    std::shared_ptr<const WvImage> wv;
-    std::shared_ptr<const AvImage> av;
-    Tags source_tags;
-    std::vector<flac::HeaderBlock> pictures;  // referenced in the image file, not held
-};
+namespace detail {
+// state of one Library::build_listing call, defined in library.cpp
+struct DirItem;
+struct ListingBuild;
+struct DiscSlot;
 
+/// Processing state of a source file (image or SACD area).
 template <class T>
 struct Work {
     enum State { Pending, Settling, Ready, Failed } st = Pending;
@@ -136,6 +146,7 @@ struct Work {
     std::shared_ptr<const T> ready;
     std::string err;
 };
+}  // namespace detail
 
 class Library : public std::enable_shared_from_this<Library> {
 public:
@@ -161,16 +172,28 @@ public:
     /// Root this source path belongs to and the path relative to it.
     std::optional<std::pair<const Root*, fs::path>> root_of(const fs::path& p) const;
     std::optional<fs::path> overlay_dir(const fs::path& dir) const;
-    /// Verify and index an image.
-    ReadyImage process_image(const fs::path& src) const;
-    /// Human-readable summary of processing state, written next to the cache dir.
-    void write_status() const;
     /// Store tag changes made to file `file_name` of source folder `dir` in the
     /// folder's sidecar, under `section`/`key`. Existing spellings are kept.
     void apply_edit(const fs::path& dir, const std::string& file_name, const std::string& section, const std::string& key, const Tags& changes);
 
 private:
     explicit Library(Config cfg);
+
+    /// A processed image: a FLAC image (split by copying frames), a floating-point
+    /// WavPack image (split by copying blocks) or a decoded one (tracks encoded on
+    /// the fly), plus the source's own tags.
+    struct ReadyImage {
+        std::shared_ptr<const FlacImage> flac;
+        std::shared_ptr<const WvImage> wv;
+        std::shared_ptr<const AvImage> av;
+        Tags source_tags;
+        std::vector<flac::HeaderBlock> pictures;  // referenced in the image file, not held
+    };
+    template <class T>
+    using Work = detail::Work<T>;
+    template <class K, class T>
+    using WorkMap = std::map<K, std::pair<SrcKey, Work<T>>>;
+
     struct ImageJob {
         fs::path src, dir;
     };
@@ -195,29 +218,40 @@ private:
     bool enqueue(Job job);
     void bump(const fs::path& dir);
     void walk(const fs::path& dir, size_t& n);
+    /// Verify and index an image.
+    ReadyImage process_image(const fs::path& src) const;
+    /// Human-readable summary of processing state, written next to the cache dir.
+    void write_status() const;
+
+    /// Processing state of `src` (entry `k` of `states`): known, else settling while
+    /// the file is still being written, else processed by `job` in the background,
+    /// or by `open` inline when there are no workers or `cached()` says it is cheap.
+    template <class K, class T, class Cached, class Open>
+    Work<T> work_state(WorkMap<K, T>& states, const K& k, const fs::path& src, Cached cached, Open open, Job job);
     Work<ReadyImage> image_state(const fs::path& src, const fs::path& dir);
     Work<SacdDisc> sacd_state(const fs::path& src, const fs::path& dir, bool mc);
+
     Sig signature(const fs::path& dir) const;
     std::shared_ptr<Listing> build_listing(const fs::path& dir, const Sig& sig);
-    /// nullopt while the tracks are still being measured
-    /// Sidecar "_cover"s resolved while building one listing (loaded once each).
-    struct CoverSet {
-        const fs::path& covers_dir;
-        const fs::path& cache_dir;  // scaled-down copies of large images
-        std::map<std::string, std::optional<Cover>> loaded;
-        std::vector<std::pair<fs::path, std::optional<int64_t>>> used;  // for Listing::covers
-        const Cover* get(const std::string* spec);
-    };
-    std::optional<std::vector<Entry>> image_tracks(const fs::path& dir, const CueSheet& cue, const ReadyImage& ready, std::optional<uint32_t> disc, bool multi,
-                                    size_t ndiscs, const Sidecar* sidecar, int64_t mtime, CoverSet& covers);
+    void add_image_groups(detail::ListingBuild& b);
+    void add_sacd_isos(detail::ListingBuild& b);
+    void add_source_file(detail::ListingBuild& b, const detail::DirItem& n);
+    /// A standalone APE/WavPack/...: true if it was dealt with (listed in its
+    /// served form, or hidden while processing); false to show it as it is.
+    bool add_standalone(detail::ListingBuild& b, const detail::DirItem& n);
+    /// Tracks of an image; nullopt while the tracks are still being measured.
+    std::optional<std::vector<Entry>> image_tracks(detail::ListingBuild& b, const CueSheet& cue, const ReadyImage& ready, const detail::DiscSlot& disc,
+                                                   int64_t mtime);
     /// A standalone APE/WavPack/... file as one FLAC track ("<stem>.flac", edits go to
     /// file."<stem>.flac"); nullopt while being measured.
-    std::optional<Entry> standalone_track(const fs::path& dir, const std::string& src_name, const ReadyImage& ready, const Sidecar* sidecar, int64_t mt,
-                                          CoverSet& covers);
+    std::optional<Entry> standalone_track(detail::ListingBuild& b, const std::string& src_name, const ReadyImage& ready, int64_t mt);
+    std::vector<Entry> sacd_tracks(detail::ListingBuild& b, const std::shared_ptr<const SacdDisc>& sacd, const detail::DiscSlot& disc, int64_t mtime,
+                                   bool mc);
     /// Encoded-track layouts of `ranges` of a decoded image; nullopt while being measured.
     std::optional<std::vector<TrackLayout>> track_layouts(const std::shared_ptr<const AvImage>& av, const Ranges& ranges, const fs::path& dir);
-    std::vector<Entry> sacd_tracks(const std::shared_ptr<const SacdDisc>& disc, std::optional<uint32_t> disc_no, size_t ndiscs, const Sidecar* sidecar,
-                                   int64_t mtime, bool mc, CoverSet& covers);
+    /// Newest of the cache files holding processing results the tracks of `ready`
+    /// are made from (indexes, layouts, MD5s).
+    int64_t results_mtime(const ReadyImage& ready, const Ranges& ranges) const;
 
     std::optional<std::string> vpath_of(const Placements& p, const fs::path& dir) const;
     std::optional<std::string> entry_target(const Placements& p, const fs::path& dir, const Entry& e) const;
@@ -238,10 +272,10 @@ private:
 
     std::mutex edit_mu_;     // serializes sidecar writes
     mutable std::mutex mu_;  // guards the maps below
-    std::map<fs::path, std::pair<SrcKey, Work<ReadyImage>>> images_;
-    std::map<std::pair<fs::path, bool>, std::pair<SrcKey, Work<SacdDisc>>> sacds_;
+    WorkMap<fs::path, ReadyImage> images_;
+    WorkMap<std::pair<fs::path, bool>, SacdDisc> sacds_;
     std::map<fs::path, std::shared_ptr<Listing>> listings_;
-    std::map<fs::path, std::pair<uint64_t, int64_t>> generations_;
+    std::map<fs::path, std::pair<uint64_t, int64_t>> generations_;  // per source folder: generation, time of the last bump
     std::map<fs::path, std::shared_ptr<std::mutex>> dir_locks_;
     std::set<fs::path> md5_queued_, encode_queued_;
 

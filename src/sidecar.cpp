@@ -56,6 +56,8 @@ std::optional<std::string> canonical_track_key(std::string_view k) {
     return std::format("{}-{:02}", *d, *n);
 }
 
+std::string track_key(std::optional<uint32_t> disc, uint32_t n) { return disc ? std::format("{}-{:02}", *disc, n) : std::to_string(n); }
+
 Sidecar Sidecar::parse(const std::string& text) {
     json doc = json::parse(text, nullptr, true, /*ignore_comments=*/true);
     WM_ENSURE(doc.is_object(), "sidecar is not a JSON object");
@@ -125,14 +127,11 @@ std::optional<Sidecar> Sidecar::load(const fs::path& src_dir, const std::optiona
         for (auto& [k, v] : sc.track_names) out->track_names[k] = v;
         out->hidden.insert(sc.hidden.begin(), sc.hidden.end());
         out->hidden_tracks.insert(sc.hidden_tracks.begin(), sc.hidden_tracks.end());
-        if (sc.target) out->target = sc.target;
-        for (auto& [k, v] : sc.track_targets) out->track_targets[k] = v;
-        for (auto& [k, v] : sc.file_targets) out->file_targets[k] = v;
+        // "_target"s are not merged: they are read from the tags tree only (placement.cpp)
         if (sc.cover) out->cover = sc.cover;
         for (auto& [k, v] : sc.track_covers) out->track_covers[k] = v;
         for (auto& [k, v] : sc.file_covers) out->file_covers[k] = v;
         out->mtime = std::max(out->mtime.value_or(*m), *m);
-        out->sources.push_back(p);
     }
     return out;
 }

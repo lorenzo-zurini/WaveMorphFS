@@ -55,6 +55,8 @@ inline constexpr const char* SIDECAR_NAME = "wavemorph.json";
 std::optional<std::string> normalize_target(std::string_view p);
 /// Track key as the listing spells it: "2-05", "2.5", "2-5" -> "2-05"; "05" -> "5".
 std::optional<std::string> canonical_track_key(std::string_view k);
+/// The canonical key of track `n` of disc `disc` ("5", or "2-05" in folders of several discs).
+std::string track_key(std::optional<uint32_t> disc, uint32_t n);
 
 struct Sidecar {
     Tags album;
@@ -63,6 +65,7 @@ struct Sidecar {
     std::map<std::string, std::string> track_names;  // pinned file names ("_name")
     std::set<std::string> hidden;                     // "_hide": names, and file tables with "_hide": true
     std::set<std::string> hidden_tracks;              // track tables with "_hide": true
+    // "_target"s, from parse() only: load() leaves them out (placements come from the tags tree)
     std::optional<std::string> target;                // "_target" of the folder (normalized)
     std::map<std::string, std::string> track_targets;  // canonical track key -> "_target"
     std::map<std::string, std::string> file_targets;   // file name -> "_target"
@@ -73,7 +76,6 @@ struct Sidecar {
     const std::string* cover_for(const std::string& name, const std::string* track_key) const;
     /// newest mtime among the sidecar files that contributed
     std::optional<int64_t> mtime;
-    std::vector<fs::path> sources;
 
     static Sidecar parse(const std::string& text);
     /// Merge the sidecars that apply to `src_dir`; nullopt if there are none.
