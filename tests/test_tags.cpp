@@ -85,7 +85,8 @@ TEST(sidecar_parse_and_lookup) {
 
 TEST(sidecar_removals_survive_layering) {
     // in-source sidecar sets fields; the tags-dir sidecar removes some of them per track
-    fs::path dir = fs::temp_directory_path() / std::format("wm-layer-{}", ::getpid());
+    wmtest::TempDir tmp("wm-layer");
+    fs::path dir = tmp.path();
     fs::create_directories(dir / "src");
     fs::create_directories(dir / "tags");
     atomic_write(dir / "src" / SIDECAR_NAME, R"({"album": {"MUSICBRAINZ_ALBUMID": "a", "DISCTOTAL": "2", "COMMENT": "x"},
@@ -108,12 +109,12 @@ TEST(sidecar_removals_survive_layering) {
     CHECK(tg.get("DISCTOTAL") == nullptr && tg.get("COMMENT") == nullptr);
     CHECK(*tg.get("TITLE") == "t");
     for (auto& [k, v] : tg.m) CHECK_MSG(!v.empty(), "empty field {} would be emitted", k);
-    fs::remove_all(dir);
 }
 
 TEST(sidecar_removes_tags_of_regular_files) {
     // a FLAC file's own tags are removed by album and file entries of the tags-dir sidecar
-    fs::path dir = fs::temp_directory_path() / std::format("wm-rm-{}", ::getpid());
+    wmtest::TempDir tmp("wm-rm");
+    fs::path dir = tmp.path();
     fs::path src = dir / "lib" / "Album";
     fs::create_directories(src);
     fs::create_directories(dir / "tags" / "Lib" / "Album");
@@ -141,12 +142,12 @@ TEST(sidecar_removes_tags_of_regular_files) {
     CHECK_MSG(tags.get("MUSICBRAINZ_ALBUMID") == nullptr, "file removal applied to the source's tag");
     CHECK_MSG(tags.get("ALBUMARTISTSORT") == nullptr, "removal under another spelling applied");
     CHECK_MSG(tags.get("ORIGINALDATE") == nullptr, "album removal applied");
-    fs::remove_all(dir);
 }
 
 TEST(sidecar_retags_regular_dsf) {
     // a DSF file's own ID3 tag is rebuilt with the sidecar applied; audio bytes stay
-    fs::path dir = fs::temp_directory_path() / std::format("wm-dsf-{}", ::getpid());
+    wmtest::TempDir tmp("wm-dsf");
+    fs::path dir = tmp.path();
     fs::path src = dir / "lib" / "Album";
     fs::create_directories(src);
     fs::create_directories(dir / "tags" / "Lib" / "Album");
@@ -195,11 +196,11 @@ TEST(sidecar_retags_regular_dsf) {
     auto at = tail.find("APIC");
     CHECK(at != std::string_view::npos && tail.find("APIC", at + 1) == std::string_view::npos);
     CHECK_MSG(tail.find(std::string_view(reinterpret_cast<const char*>(jpg.data()), jpg.size())) != std::string_view::npos, "image bytes embedded");
-    fs::remove_all(dir);
 }
 
 TEST(duplicate_cues_and_hidden_files) {
-    fs::path dir = fs::temp_directory_path() / std::format("wm-dup-{}", ::getpid());
+    wmtest::TempDir tmp("wm-dup");
+    fs::path dir = tmp.path();
     fs::path src = dir / "lib" / "Album";
     fs::create_directories(src);
     fs::create_directories(dir / "tags" / "Lib" / "Album");
@@ -244,11 +245,11 @@ TEST(duplicate_cues_and_hidden_files) {
     // hiding the image hides everything made from it
     set_sidecar(R"({"_hide": ["Album.flac"]})");
     CHECK(names().empty());
-    fs::remove_all(dir);
 }
 
 TEST(targets_place_folders_and_files) {
-    fs::path dir = fs::temp_directory_path() / std::format("wm-target-{}", ::getpid());
+    wmtest::TempDir tmp("wm-target");
+    fs::path dir = tmp.path();
     fs::path lib_root = dir / "lib", tags = dir / "tags" / "Lib";
     for (auto d : {"Artist/Album/CD1", "Artist/Other", "Misc"}) fs::create_directories(lib_root / d);
     for (auto d : {"Artist/Album", "Misc"}) fs::create_directories(tags / d);
@@ -297,14 +298,14 @@ TEST(targets_place_folders_and_files) {
     lib->refresh_placements(true);
     CHECK_MSG((names("Lib") == std::vector<std::string>{"Misc", "Sorted"}), "emptied folders hidden");
     CHECK((names("Lib/Sorted") == std::vector<std::string>{"Composer", "Other"}));
-    fs::remove_all(dir);
 }
 
 TEST(lookups_survive_listing_rebuilds) {
     // mount listings are rebuilt every 1.5 s and the old one is freed while other
     // FUSE threads may still be resolving paths through it (production saw
     // std::bad_alloc from copying a freed path in getattr)
-    fs::path dir = fs::temp_directory_path() / std::format("wm-lookup-{}", ::getpid());
+    wmtest::TempDir tmp("wm-lookup");
+    fs::path dir = tmp.path();
     fs::path lib_root = dir / "lib";
     for (int a = 0; a < 8; a++)
         for (int b = 0; b < 8; b++) fs::create_directories(lib_root / std::format("Artist {}", a) / std::format("Album with a long name {}", b));
@@ -330,11 +331,11 @@ TEST(lookups_survive_listing_rebuilds) {
     for (auto& t : threads) t.join();
     CHECK(done > 0);
     CHECK_MSG(bad == 0, "{} of {} lookups wrong", bad.load(), done.load());
-    fs::remove_all(dir);
 }
 
 TEST(standalone_wavpack_served_as_flac) {
-    fs::path dir = fs::temp_directory_path() / std::format("wm-loose-{}", ::getpid());
+    wmtest::TempDir tmp("wm-loose");
+    fs::path dir = tmp.path();
     fs::path src = dir / "lib" / "Album";
     fs::create_directories(src);
     fs::create_directories(dir / "tags" / "Lib" / "Album");
@@ -364,7 +365,6 @@ TEST(standalone_wavpack_served_as_flac) {
     auto tags = read_file_tags("flac", [&](uint64_t off, size_t len) { return e.file->read_at(off, len); }, e.file->size());
     CHECK(tags.get("TITLE") && *tags.get("TITLE") == "I. Allegro");
     CHECK_MSG(tags.get("ARTIST") == nullptr, "source tag removed by the sidecar");
-    fs::remove_all(dir);
 }
 
 namespace {
@@ -390,7 +390,8 @@ std::vector<std::pair<uint32_t, Bytes>> flac_pictures(const VFile& vf) {
 }  // namespace
 
 TEST(sidecar_cover_embedded_by_reference) {
-    fs::path dir = fs::temp_directory_path() / std::format("wm-cover-{}", ::getpid());
+    wmtest::TempDir tmp("wm-cover");
+    fs::path dir = tmp.path();
     fs::path src = dir / "lib" / "Album", covers = dir / "covers";
     fs::create_directories(src);
     fs::create_directories(covers);
@@ -441,14 +442,13 @@ TEST(sidecar_cover_embedded_by_reference) {
         return c ? *try_read_file(*c->path) : Bytes{};
     };
     Bytes scaled = big();
-    fs::path tmp = dir / "scaled.jpg";
-    atomic_write(tmp, scaled);
-    auto probe = load_cover(tmp);
+    fs::path scaled_path = dir / "scaled.jpg";
+    atomic_write(scaled_path, scaled);
+    auto probe = load_cover(scaled_path);
     CHECK_MSG(probe && probe->mime == "image/jpeg" && probe->width == COVER_EDGE && probe->height == 682, "scaled to {}x{}",
               probe ? probe->width : 0, probe ? probe->height : 0);
     fs::remove_all(dir / "cache" / "covers");
     CHECK_MSG(big() == scaled, "scaling is deterministic");
-    fs::remove_all(dir);
 }
 
 TEST(sidecar_pinned_track_names) {
