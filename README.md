@@ -9,9 +9,11 @@ is duplicated.
 |--------------------------------------------|--------------------------------------------------------|
 | `Album.cue` + `Album.flac` (image rip)     | `01 - Title.flac`, `02 - Title.flac`, …                |
 | `Album.cue` + `Album.ape` / `.wv` / `.wav` | same, encoded to FLAC on the fly from the decoded image |
+| `Album.cue` + 32-bit float `Album.wv`      | `01 - Title.wv`, … made of the image's own blocks       |
 | `Disc.iso` (SACD, plain DSD **or DST**)    | `01 - Title.dsf`, `02 - Title.dsf`, …                  |
 | `*.flac`, `*.mp3`, `*.m4a`, `*.dsf`        | the same file with sidecar tags applied                |
 | `Track.ape` / `.wv` / `.tta` / `.tak`      | `Track.flac`, encoded on the fly (sidecar tags apply)  |
+| 32-bit float `Track.wv`                    | the same file with sidecar tags applied                |
 | any other file                             | passed through untouched                               |
 | incomplete files (`*.parts`), dotfiles     | hidden                                                 |
 
@@ -42,6 +44,17 @@ you control — never written into the source files.
   to learn its size, so file sizes are exact. Reads then decode just the packets
   they need and encode just those frames; FLAC frames are independent, so a frame
   re-encoded later is byte-identical.
+* **Floating-point WavPack** (e.g. 32-bit float vinyl rips) is beyond FLAC, so
+  those images become WavPack tracks, split like FLAC images: WavPack blocks are
+  self-contained, and every block inside a track is copied byte-for-byte except
+  its header (track-relative sample numbers) and its block checksum. File-level
+  data (the original WAV header, the whole-file MD5) stays out of the tracks.
+  Only the samples before a track's first whole block and after its last are
+  encoded again, with libwavpack in the image's own mode; their sizes are measured
+  once. The image is verified first by decoding it with every block CRC (and its
+  MD5, if it has one). Tags are written as APEv2 (`Track`, `Disc`, `Year` and
+  `Album Artist` in APEv2 spelling, every other name as given). Standalone float
+  `.wv` files keep all their blocks and only get a new APEv2 tag.
 * **SACD ISOs** (Scarlet Book) are parsed for track lists and text; the stereo area
   is exposed as DSF. With `--sacd-multichannel` the multichannel area is exposed too,
   as `MC NN - Title.dsf` tagged `<album> (Multichannel)`. Plain DSD is only
@@ -73,8 +86,8 @@ Everything that produces audio is checked against independent references:
 
 ## Building
 
-Needs a C++20 compiler, CMake, libfuse3, libFLAC, FFmpeg's libavformat/libavcodec
-and nlohmann/json; `flac` and `ffmpeg` are used by `verify`, `compare` and the tests.
+Needs a C++20 compiler, CMake, libfuse3, libFLAC, libwavpack, FFmpeg's
+libavformat/libavcodec/libswscale and nlohmann/json; `flac` and `ffmpeg` are used by `verify`, `compare` and the tests.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -335,13 +348,13 @@ folders, e.g. by work):
   artwork can be referenced directly. A missing or unusable image is logged and
   the track keeps its own pictures.
 * FLAC (split, encoded and retagged) gets a PICTURE block, DSF and MP3 an APIC
-  frame; M4A files are not changed. The image is read from its file whenever a
+  frame, WavPack a "Cover Art (Front)" item; M4A files are not changed. The image is read from its file whenever a
   player reads that part of a track, so it costs no memory per track. Replacing
   the image file updates the tracks (and their mtime) within seconds.
 
 ### Editing tags on the mount
 
-FLAC, DSF, MP3 and M4A files on the mount can be edited in place with any tag
+FLAC, DSF, MP3, M4A and WavPack files on the mount can be edited in place with any tag
 editor (Picard, Kid3, Mp3tag, mutagen...). The edit never reaches the source file:
 writes go to a scratch overlay, and when the editor closes the file the tags are
 read back from it, compared field by field with what the mount generated, and

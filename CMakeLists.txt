@@ -12,6 +12,7 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(FUSE3 REQUIRED IMPORTED_TARGET fuse3)
 pkg_check_modules(FLAC REQUIRED IMPORTED_TARGET flac)
 pkg_check_modules(LIBAV REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale)
+pkg_check_modules(WAVPACK REQUIRED IMPORTED_TARGET wavpack)
 find_package(nlohmann_json 3.10 REQUIRED)
 find_package(Threads REQUIRED)
 
@@ -28,6 +29,8 @@ add_library(wmcore STATIC
   src/track.cpp
   src/avimage.cpp
   src/encoded.cpp
+  src/wavpack.cpp
+  src/apetag.cpp
   src/vfile.cpp
   src/retag.cpp
   src/id3.cpp
@@ -44,7 +47,7 @@ add_library(wmcore STATIC
 )
 target_include_directories(wmcore PUBLIC src)
 target_compile_definitions(wmcore PUBLIC FUSE_USE_VERSION=312)
-target_link_libraries(wmcore PUBLIC PkgConfig::FUSE3 PkgConfig::FLAC PkgConfig::LIBAV nlohmann_json::nlohmann_json Threads::Threads)
+target_link_libraries(wmcore PUBLIC PkgConfig::FUSE3 PkgConfig::FLAC PkgConfig::LIBAV PkgConfig::WAVPACK nlohmann_json::nlohmann_json Threads::Threads)
 
 add_executable(wavemorphfs src/main.cpp)
 target_link_libraries(wavemorphfs PRIVATE wmcore)
@@ -53,7 +56,7 @@ install(TARGETS wavemorphfs RUNTIME DESTINATION bin)
 option(WAVEMORPH_TESTS "Build the test program" ON)
 if(WAVEMORPH_TESTS)
   enable_testing()
-  add_executable(wavemorphfs-tests tests/main.cpp tests/test_flac.cpp tests/test_formats.cpp tests/test_tags.cpp)
+  add_executable(wavemorphfs-tests tests/main.cpp tests/test_flac.cpp tests/test_formats.cpp tests/test_tags.cpp tests/test_wavpack.cpp)
   target_link_libraries(wavemorphfs-tests PRIVATE wmcore)
   add_test(NAME unit COMMAND wavemorphfs-tests)
 endif()

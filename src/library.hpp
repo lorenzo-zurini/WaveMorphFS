@@ -6,9 +6,11 @@
 //
 // Rules per source directory:
 //  * X.cue + existing single-file image   -> virtual per-track FLAC files; cue and image hidden
-//    (the image stays hidden while it is incomplete or being processed)
+//    (the image stays hidden while it is incomplete or being processed); floating-point
+//    WavPack images, which FLAC cannot hold, give per-track WavPack files instead
 //  * *.iso with an SACD master TOC         -> virtual per-track DSF files; ISO hidden
-//  * other files                           -> passthrough (FLAC/MP3/M4A/DSF retagged if a sidecar applies)
+//  * other files                           -> passthrough (FLAC/MP3/M4A/DSF retagged if a sidecar applies;
+//                                             APE/WV/TTA/TAK as encoded FLAC, floating-point WV retagged)
 //  * partial files, dotfiles, sidecars     -> hidden
 //  * cover image from the sidecar tree     -> exposed as cover.jpg/png if the folder has none
 #pragma once
@@ -31,6 +33,7 @@
 #include "sidecar.hpp"
 #include "track.hpp"
 #include "vfile.hpp"
+#include "wavpack.hpp"
 
 namespace wm {
 
@@ -115,10 +118,12 @@ struct Placements {
     std::set<std::string> sources;                           // source folders with any placement (as strings)
 };
 
-/// A processed image: a FLAC image (split by copying frames) or a decoded one
-/// (tracks encoded on the fly), plus the source's own tags.
+/// A processed image: a FLAC image (split by copying frames), a floating-point
+/// WavPack image (split by copying blocks) or a decoded one (tracks encoded on
+/// the fly), plus the source's own tags.
 struct ReadyImage {
     std::shared_ptr<const FlacImage> flac;
+    std::shared_ptr<const WvImage> wv;
     std::shared_ptr<const AvImage> av;
     Tags source_tags;
     std::vector<flac::HeaderBlock> pictures;  // referenced in the image file, not held

@@ -35,6 +35,9 @@ src/
   track.cpp      FlacTrack: split track of a fixed-blocksize FLAC image (frames copied, headers rewritten)
   avimage.cpp    AvImage: non-FLAC images (APE/WV/TTA/...) decoded with libav; packet index; parallel read-ahead
   encoded.cpp    EncodedTrack: tracks of an AvImage as compressed FLAC encoded per frame on the fly (layout index)
+  wavpack.cpp    float WavPack (FLAC can't hold it): WvImage block index (libwavpack verify), WvTrack = copied blocks
+                 (header + block checksum rewritten, WAV header/MD5 sub-blocks dropped) + re-encoded head/tail; retag_wavpack
+  apetag.cpp     APEv2 reader/writer (WavPack tags; Track/Disc/Year/Album Artist mapped, other names as given)
   sacd.cpp       SACD ISO parsing, DSF tracks, chunked parallel DST decode
   dst.cpp        DST decoder (port of FFmpeg dstdec.c, LGPL-2.1+ used under GPL)
   id3.cpp mp4.cpp  ID3v2.4 writer/reader (DSF + MP3 retag), MP4 ilst rewrite/reader (stco/co64 shift)
@@ -67,6 +70,12 @@ file, mtime, tag_section/tag_key/tag_ext for edit routing).
   `build_layout` encodes every track frame once (libFLAC level 5, loose mid-side
   OFF so frames are independent/deterministic) to record sizes + track MD5.
   Reads re-encode only the frames needed; each must match its recorded size.
+- **Float WavPack** (32-bit float, e.g. vinyl rips): served as WavPack, not FLAC.
+  Blocks are self-contained: tracks copy them, rewriting header sample numbers and
+  the optional block checksum (it covers the header). A track's first block is
+  always re-encoded (it carries the stream config), as is a partial last block;
+  libwavpack in the source's mode, single-threaded, so deterministic; sizes cached
+  per libwavpack version. Integer WavPack still goes the AvImage/FLAC route.
 - **SACD**: master/area TOC, one scan records where each 1/75 s frame starts
   (cache .sacdidx). DSF output = byte de-interleave + bit reversal; DST decoded in
   8-frame chunks in parallel. Multichannel area optional (`--sacd-multichannel`).
@@ -99,7 +108,7 @@ file, mtime, tag_section/tag_key/tag_ext for edit routing).
 cmake -S . -B build -G Ninja && cmake --build build -j
 build/wavemorphfs-tests            # all; or a substring filter: build/wavemorphfs-tests decoded
 ```
-Deps: libfuse3, libFLAC, libavformat/libavcodec/libavutil, nlohmann-json; `flac`
+Deps: libfuse3, libFLAC, libwavpack, libavformat/libavcodec/libavutil/libswscale, nlohmann-json; `flac`
 and `ffmpeg` binaries for tests/verify. Warnings must stay at zero.
 
 ## Verifying changes (do this, not just unit tests)

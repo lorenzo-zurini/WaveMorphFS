@@ -261,6 +261,12 @@ void Library::run_job(Job job) {
 
 ReadyImage Library::process_image(const fs::path& src) const {
     ReadyImage r;
+    if (ext_lower(src) == "wv" && WvImage::is_float(src)) {
+        auto wv = WvImage::open(src, &cache);
+        r.source_tags = wv->tags;
+        r.wv = wv;
+        return r;
+    }
     if (ext_lower(src) != "flac") {
         auto av = AvImage::open(src, &cache);
         r.source_tags = av->tags;
@@ -707,6 +713,19 @@ std::shared_ptr<Listing> Library::build_listing(const fs::path& dir, const Sig& 
                 note_settle(st.until);
                 continue;
             }
+            if (st.st == Work<ReadyImage>::Ready && st.ready->wv) {
+                // floating-point WavPack: served as it is, with the sidecar's tags
+                auto& wv = *st.ready->wv;
+                Tags tg = st.ready->source_tags;
+                if (sc) {
+                    tg.overlay(sc->album);
+                    if (auto f = sc->file(n.name)) tg.overlay(*f);
+                }
+                const Cover* cv = sc ? covers.get(sc->cover_for(n.name, nullptr)) : nullptr;
+                int64_t mt = std::max({n.mtime, sidecar_mtime.value_or(0), OUTPUT_EPOCH_NS, cv ? cv->mtime : 0});
+                entries.push_back({n.name, false, {}, retag_wavpack(wv, tg, cv), mt, "file", n.name, "wv"});
+                continue;
+            }
             if (st.st == Work<ReadyImage>::Ready && st.ready->av) {
                 try {
                     if (auto e = standalone_track(dir, n.name, *st.ready, sc, max_mtime({n.mtime, sidecar_mtime}), covers)) virtuals.push_back(std::move(*e));
@@ -853,8 +872,8 @@ std::optional<std::vector<Entry>> Library::image_tracks(const fs::path& dir, con
                                                         std::optional<uint32_t> disc, bool multi, size_t ndiscs, const Sidecar* sidecar, int64_t mt,
                                                         CoverSet& covers) {
     auto& img = ready.flac;
-    uint32_t rate = img ? img->si().sample_rate : ready.av->sample_rate;
-    uint64_t total = img ? img->si().total_samples : ready.av->total;
+    uint32_t rate = img ? img->si().sample_rate : ready.wv ? ready.wv->sample_rate : ready.av->sample_rate;
+    uint64_t total = img ? img->si().total_samples : ready.wv ? ready.wv->total : ready.av->total;
     WM_ENSURE(rate % 75 == 0, "sample rate {} is not a multiple of 75 (cue frames)", rate);
     uint64_t spf = rate / 75;
     Tags base = ready.source_tags.without_track_specific();
@@ -870,6 +889,8 @@ std::optional<std::vector<Entry>> Library::image_tracks(const fs::path& dir, con
         layout = track_layouts(ready.av, ranges, dir);
         if (!layout) return std::nullopt;
     }
+    std::vector<WvLayout> wv_layout;
+    if (ready.wv) wv_layout = wv_layouts(*ready.wv, ranges, &cache);  // a few blocks per track: quick
     Md5Map md5s = img ? cache.load_md5s(img->path) : Md5Map{};
     bool missing = img && std::any_of(ranges.begin(), ranges.end(), [&](auto& r) { return !md5s.contains(r); });
     if (missing) {
@@ -888,6 +909,9 @@ std::optional<std::vector<Entry>> Library::image_tracks(const fs::path& dir, con
     if (ready.av) {
         auto k = SrcKey::of(ready.av->path);
         mt = std::max({mt, mtime_ns(cache.av_index_path(ready.av->path, k)).value_or(0), mtime_ns(layout_path(*ready.av, ranges, cache)).value_or(0)});
+    } else if (ready.wv) {
+        auto k = SrcKey::of(ready.wv->path);
+        mt = std::max({mt, mtime_ns(cache.wv_index_path(ready.wv->path, k)).value_or(0), mtime_ns(wv_layout_path(*ready.wv, ranges, cache)).value_or(0)});
     } else if (auto k = SrcKey::try_of(img->path)) {
         mt = std::max({mt, mtime_ns(cache.idx_path(img->path, *k)).value_or(0), mtime_ns(cache.md5_path(img->path, *k)).value_or(0)});
     }
@@ -914,7 +938,8 @@ std::optional<std::vector<Entry>> Library::image_tracks(const fs::path& dir, con
         }
         auto title_v = tg.get("TITLE");
         std::string title = title_v ? sanitize_name(*title_v) : std::format("Track {:02}", t.number);
-        std::string name = multi && disc ? std::format("{}-{:02} - {}.flac", *disc, t.number, title) : std::format("{:02} - {}.flac", t.number, title);
+        std::string ext = ready.wv ? "wv" : "flac";
+        std::string name = multi && disc ? std::format("{}-{:02} - {}.{}", *disc, t.number, title, ext) : std::format("{:02} - {}.{}", t.number, title, ext);
         if (sidecar)
             if (auto pinned = sidecar->track_name(multi ? disc : std::nullopt, t.number)) name = *pinned;
         if (sidecar)
@@ -922,9 +947,13 @@ std::optional<std::vector<Entry>> Library::image_tracks(const fs::path& dir, con
         std::string key = multi && disc ? std::format("{}-{:02}", *disc, t.number) : std::to_string(t.number);
         // a sidecar cover replaces the image's picture
         const Cover* cv = sidecar ? covers.get(sidecar->cover_for(name, &key)) : nullptr;
+        int64_t tmt = cv ? std::max(mt, cv->mtime) : mt;
+        if (ready.wv) {
+            out.push_back({name, false, {}, std::make_shared<WvTrack>(ready.wv, s, e, tg, wv_layout[i], cv), tmt, "track", key, "wv"});
+            continue;
+        }
         std::vector<flac::HeaderBlock> cover_block;
         if (cv) cover_block.push_back({flac::BLOCK_PICTURE, flac_picture(*cv)});
-        int64_t tmt = cv ? std::max(mt, cv->mtime) : mt;
         if (ready.av) {
             out.push_back({name, false, {}, std::make_shared<EncodedTrack>(ready.av, s, e, tg, (*layout)[i], cover_block), tmt, "track", key, "flac"});
             continue;
