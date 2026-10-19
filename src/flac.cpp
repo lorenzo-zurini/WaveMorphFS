@@ -43,6 +43,35 @@ uint16_t crc16_update(uint16_t crc, std::span<const uint8_t> data) {
     return crc;
 }
 
+namespace {
+
+/// a * b mod P in GF(2)[x], P = x^16 + x^15 + x^2 + 1 (the CRC-16 polynomial);
+/// a CRC state is such a residue, and a zero byte multiplies it by x^8
+uint16_t mulmod(uint16_t a, uint16_t b) {
+    uint16_t r = 0;
+    for (int i = 15; i >= 0; i--) {
+        r = (r & 0x8000) ? uint16_t(r << 1 ^ 0x8005) : uint16_t(r << 1);
+        if (b >> i & 1) r ^= a;
+    }
+    return r;
+}
+
+/// X8N[i] = x^(8 * 2^i) mod P: the effect of 2^i zero bytes
+const auto X8N = [] {
+    std::array<uint16_t, 64> t{};
+    t[0] = 0x0100;
+    for (size_t i = 1; i < t.size(); i++) t[i] = mulmod(t[i - 1], t[i - 1]);
+    return t;
+}();
+
+}  // namespace
+
+uint16_t crc16_shift(uint16_t crc, uint64_t n) {
+    for (size_t i = 0; n; i++, n >>= 1)
+        if (n & 1) crc = mulmod(crc, X8N[i]);
+    return crc;
+}
+
 // ------------------------------------------------------------------ numbers
 
 size_t coded_len(uint64_t v) {
@@ -55,17 +84,23 @@ size_t coded_len(uint64_t v) {
     return 7;
 }
 
-void encode_number(uint64_t v, Bytes& out) {
+void encode_number(uint64_t v, uint8_t* out) {
     size_t n = coded_len(v);
     if (n == 1) {
-        out.push_back(uint8_t(v));
+        out[0] = uint8_t(v);
         return;
     }
     static const uint8_t lead[8] = {0, 0, 0xC0, 0xE0, 0xF0, 0xF8, 0xFC, 0xFE};
     size_t rest = n - 1;
     uint8_t first = n == 7 ? 0 : uint8_t(v >> (6 * rest));
-    out.push_back(lead[n] | first);
-    for (size_t i = rest; i-- > 0;) out.push_back(uint8_t(0x80 | ((v >> (6 * i)) & 0x3F)));
+    out[0] = lead[n] | first;
+    for (size_t i = 1; i < n; i++) out[i] = uint8_t(0x80 | ((v >> (6 * (rest - i))) & 0x3F));
+}
+
+void encode_number(uint64_t v, Bytes& out) {
+    size_t old = out.size();
+    out.resize(old + coded_len(v));
+    encode_number(v, out.data() + old);
 }
 
 std::optional<std::pair<uint64_t, size_t>> decode_number(std::span<const uint8_t> b) {
@@ -126,18 +161,36 @@ std::optional<FrameHeader> FrameHeader::parse(std::span<const uint8_t> b) {
     return h;
 }
 
-Bytes rewrite_header(std::span<const uint8_t> orig, const FrameHeader& h, uint64_t sample_number, std::optional<uint8_t> bps_code) {
-    Bytes out;
-    out.reserve(h.len + 2);
-    out.push_back(0xFF);
-    out.push_back(0xF9);
-    out.push_back(orig[2]);
-    out.push_back(bps_code ? uint8_t((orig[3] & 0xF1) | (*bps_code << 1)) : orig[3]);
-    encode_number(sample_number, out);
-    size_t es = 4 + h.number_len;
-    out.insert(out.end(), orig.begin() + es, orig.begin() + es + h.extra_len);
-    out.push_back(crc8(out));
-    return out;
+HeaderFields FrameHeader::fields(std::span<const uint8_t> b) const {
+    size_t es = 4 + number_len, bl = bs_bytes_len();
+    return {variable, bs_code, sr_code, ch_code, bps_code, number, b.subspan(es, bl), b.subspan(es + bl, extra_len - bl)};
+}
+
+HeaderBytes write_header(const HeaderFields& f) {
+    WM_ENSURE(f.bs_bytes.size() <= 2 && f.sr_bytes.size() <= 2, "bad frame header fields");
+    HeaderBytes h;
+    auto& b = h.b;
+    b[0] = 0xFF;
+    b[1] = f.variable ? 0xF9 : 0xF8;
+    b[2] = uint8_t(f.bs_code << 4 | f.sr_code);
+    b[3] = uint8_t(f.ch_code << 4 | f.bps_code << 1);
+    size_t p = 4;
+    encode_number(f.number, &b[p]);
+    p += coded_len(f.number);
+    for (auto part : {f.bs_bytes, f.sr_bytes}) {
+        std::copy(part.begin(), part.end(), &b[p]);
+        p += part.size();
+    }
+    b[p] = crc8(std::span(b).subspan(0, p));
+    h.len = p + 1;
+    return h;
+}
+
+HeaderBytes rewrite_header(std::span<const uint8_t> orig, const FrameHeader& h, uint64_t sample_number) {
+    auto f = h.fields(orig);
+    f.variable = true;
+    f.number = sample_number;
+    return write_header(f);
 }
 
 uint8_t bps_code_for(uint32_t bps) {
@@ -502,16 +555,14 @@ Bytes encode_verbatim(const std::vector<std::span<const int32_t>>& chans, uint32
                       std::span<const uint8_t> sr_extra) {
     size_t n = chans[0].size();
     WM_ENSURE(n >= 1 && n <= 65535, "FLAC block size must be 1..=65535");
-    Bytes h = {0xFF, 0xF9};
-    uint8_t bs_code = n <= 256 ? 6 : 7;
-    h.push_back(uint8_t(bs_code << 4 | sr_code));
-    h.push_back(uint8_t((chans.size() - 1) << 4 | bps_code_for(bps) << 1));
-    encode_number(sample_number, h);
-    if (bs_code == 6) h.push_back(uint8_t(n - 1));
-    else put_be16(h, uint16_t(n - 1));
-    append(h, sr_extra);
-    h.push_back(crc8(h));
-    BitWriter w{std::move(h)};
+    // explicit block size: 8 bits up to 256 samples, else 16 bits
+    uint8_t bs_bytes[2] = {uint8_t((n - 1) >> 8), uint8_t(n - 1)};
+    bool small = n <= 256;
+    auto h = write_header({true, uint8_t(small ? 6 : 7), sr_code, uint8_t(chans.size() - 1), bps_code_for(bps), sample_number,
+                           std::span<const uint8_t>(bs_bytes).subspan(small ? 1 : 0), sr_extra});
+    BitWriter w;
+    w.buf.reserve(size_t(verbatim_size(uint32_t(n), uint32_t(chans.size()), bps, sample_number, sr_extra.size())));
+    append(w.buf, h.span());
     for (auto& ch : chans) {
         w.put(0b00000010, 8);  // zero pad bit, SUBFRAME_VERBATIM, no wasted bits
         for (int32_t s : ch) w.put(uint32_t(s), bps);
@@ -619,25 +670,24 @@ std::vector<std::vector<int32_t>> decode_frame(std::span<const uint8_t> frame, u
     Bytes owned;
     // libFLAC needs STREAMINFO for headers that defer to it: write explicit codes instead
     if (h->bps_code == 0 || h->sr_code == 0) {
-        uint8_t bps_code = h->bps_code ? h->bps_code : bps_code_for(bps);
-        WM_ENSURE(bps_code != 0, "unsupported bits per sample {}", bps);
-        uint8_t sr_code = h->sr_code;
-        Bytes sr_bytes;
-        size_t es = 4 + h->number_len;
-        size_t bs_extra = h->bs_code == 6 ? 1 : h->bs_code == 7 ? 2 : 0;
-        if (sr_code == 0) {
-            if (sample_rate <= 65535) sr_code = 13, put_be16(sr_bytes, uint16_t(sample_rate));
-            else if (sample_rate % 10 == 0 && sample_rate / 10 <= 65535) sr_code = 14, put_be16(sr_bytes, uint16_t(sample_rate / 10));
+        auto f = h->fields(frame);
+        if (f.bps_code == 0) f.bps_code = bps_code_for(bps);
+        WM_ENSURE(f.bps_code != 0, "unsupported bits per sample {}", bps);
+        uint32_t coded_rate = sample_rate;  // in Hz (code 13) or tens of Hz (code 14)
+        if (f.sr_code == 0) {
+            if (sample_rate <= 65535) f.sr_code = 13;
+            else if (sample_rate % 10 == 0 && sample_rate / 10 <= 65535) f.sr_code = 14, coded_rate = sample_rate / 10;
             else fail("unsupported sample rate {}", sample_rate);
-        } else {
-            sr_bytes.assign(frame.begin() + es + bs_extra, frame.begin() + es + h->extra_len);
         }
-        owned = {0xFF, frame[1], uint8_t(h->bs_code << 4 | sr_code), uint8_t((frame[3] & 0xF1) | bps_code << 1)};
-        owned.insert(owned.end(), frame.begin() + 4, frame.begin() + es + bs_extra);
-        append(owned, sr_bytes);
-        owned.push_back(crc8(owned));
-        owned.insert(owned.end(), frame.begin() + h->len, frame.end() - 2);
-        put_be16(owned, crc16(owned));
+        uint8_t sr_bytes[2] = {uint8_t(coded_rate >> 8), uint8_t(coded_rate)};
+        if (h->sr_code == 0) f.sr_bytes = sr_bytes;
+        auto hdr = write_header(f);
+        std::span<const uint8_t> body = frame.subspan(h->len, frame.size() - h->len - 2);
+        uint16_t crc = crc16_update(crc16(hdr.span()), body);
+        owned.reserve(hdr.len + body.size() + 2);
+        append(owned, hdr.span());
+        append(owned, body);
+        put_be16(owned, crc);
         frame = owned;
     }
     Decoder dec;
@@ -647,7 +697,9 @@ std::vector<std::vector<int32_t>> decode_frame(std::span<const uint8_t> frame, u
     if (FLAC__stream_decoder_init_stream(dec.d, mem_read, nullptr, nullptr, nullptr, nullptr, mem_write, nullptr, on_error, &src) !=
         FLAC__STREAM_DECODER_INIT_STATUS_OK)
         fail("FLAC decoder init failed");
-    for (int i = 0; i < 8 && src.out.empty(); i++) {
+    // a few steps: libFLAC looks for metadata first, then finds the frame's sync code
+    constexpr int MAX_STEPS = 8;
+    for (int i = 0; i < MAX_STEPS && src.out.empty(); i++) {
         if (!FLAC__stream_decoder_process_single(dec.d)) break;
         if (FLAC__stream_decoder_get_state(dec.d) == FLAC__STREAM_DECODER_END_OF_STREAM) break;
     }

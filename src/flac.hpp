@@ -25,12 +25,38 @@ namespace wm::flac {
 uint8_t crc8(std::span<const uint8_t> data);
 uint16_t crc16_update(uint16_t crc, std::span<const uint8_t> data);
 inline uint16_t crc16(std::span<const uint8_t> data) { return crc16_update(0, data); }
+/// The CRC-16 state `crc` advanced over `n` zero bytes, without touching them.
+/// FLAC's CRC-16 starts at 0 and is linear, so crc16(A || B) is
+/// crc16_shift(crc16(A), |B|) ^ crc16(B): a frame's CRC can be updated for a
+/// changed header from the stored one, without reading the frame's body.
+uint16_t crc16_shift(uint16_t crc, uint64_t n);
 
 // FLAC's extended UTF-8 number coding (frame/sample numbers, up to 36 bits)
 size_t coded_len(uint64_t v);
+/// Writes coded_len(v) bytes at `out`.
+void encode_number(uint64_t v, uint8_t* out);
 void encode_number(uint64_t v, Bytes& out);
 /// (value, byte length)
 std::optional<std::pair<uint64_t, size_t>> decode_number(std::span<const uint8_t> b);
+
+/// What a frame header says, field by field, with its explicit block-size and
+/// sample-rate bytes (which follow the codes that call for them).
+struct HeaderFields {
+    bool variable = false;
+    uint8_t bs_code = 0, sr_code = 0, ch_code = 0, bps_code = 0;
+    /// frame number (fixed blocksize) or first sample number (variable)
+    uint64_t number = 0;
+    std::span<const uint8_t> bs_bytes, sr_bytes;
+};
+
+/// A frame header built in place: at most 16 bytes, so building one allocates nothing.
+struct HeaderBytes {
+    std::array<uint8_t, 16> b{};
+    size_t len = 0;
+    std::span<const uint8_t> span() const { return {b.data(), len}; }
+};
+/// The header for `f`, CRC-8 included.
+HeaderBytes write_header(const HeaderFields& f);
 
 struct FrameHeader {
     bool variable = false;
@@ -46,11 +72,14 @@ struct FrameHeader {
 
     /// Parse and CRC-check a frame header at the start of `b`.
     static std::optional<FrameHeader> parse(std::span<const uint8_t> b);
+    /// The fields of this header, which was parsed from `b` (spans point into it).
+    HeaderFields fields(std::span<const uint8_t> b) const;
+    size_t bs_bytes_len() const { return bs_code == 6 ? 1 : bs_code == 7 ? 2 : 0; }
 };
 
-/// Rewrite a header (`orig`, parsed as `h`) into a variable-blocksize header
-/// carrying `sample_number`, optionally with an explicit bps code.
-Bytes rewrite_header(std::span<const uint8_t> orig, const FrameHeader& h, uint64_t sample_number, std::optional<uint8_t> bps_code);
+/// A header (`orig`, parsed as `h`) made into a variable-blocksize header
+/// carrying `sample_number`.
+HeaderBytes rewrite_header(std::span<const uint8_t> orig, const FrameHeader& h, uint64_t sample_number);
 uint8_t bps_code_for(uint32_t bps);
 
 struct StreamInfo {
