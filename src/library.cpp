@@ -21,9 +21,11 @@ namespace {
 /// servers re-read them once. 2026-10-01 13:00 UTC: C++ rewrite (tag synonyms,
 /// SACD genres, kept tag spelling, APE served as encoded FLAC).
 /// 2026-10-01 16:00 UTC: padding in generated tag areas (editable mount).
-/// 2026-10-19 13:00 UTC: ID3v2.4 tags written without unsynchronisation (covers
-/// reach such MP3s).
-constexpr int64_t OUTPUT_EPOCH_NS = 1792414876LL * 1'000'000'000;
+/// 2026-10-19 19:00 UTC (0.2.0): ID3v2.4 tags written without unsynchronisation;
+/// one tag-name table for ID3/MP4/APEv2 output; covers of APE/WV images and
+/// variable-blocksize FLAC images in their tracks; SACD catalog numbers; short
+/// FLAC tracks without undersized blocks.
+constexpr int64_t OUTPUT_EPOCH_NS = 1792436813LL * 1'000'000'000;
 
 const std::vector<std::string_view> AUDIO_IMAGE_EXT = {"flac", "ape", "wv", "tta", "tak", "wav", "m4a", "aiff", "aif"};
 /// A file modified more recently than this is assumed to still be written.
@@ -603,6 +605,10 @@ Library::ReadyImage Library::process_image(const fs::path& src) const {
     if (ext != "flac") {
         auto av = AvImage::open(src, &cache);
         r.source_tags = av->tags;
+        // the image's own front cover (an APEv2 "Cover Art (Front)" item) goes
+        // into the tracks like a FLAC image's, referenced in the image file
+        if (av->front_cover && av->front_cover->len <= MAX_COVER_BYTES)
+            r.pictures.push_back({flac::BLOCK_PICTURE, flac::picture_body(av->front_cover_mime, *av->front_cover)});
         r.av = av;
         return r;
     }

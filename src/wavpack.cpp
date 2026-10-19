@@ -422,22 +422,16 @@ WvTrack::WvTrack(std::shared_ptr<const WvImage> img, uint64_t start, uint64_t en
     size_ = (head_ ? head_->size : 0) + copy_size_ + (tail_ ? tail_->size : 0) + tag_.size();
 }
 
-WvTrack::Shared WvTrack::part_bytes(Shared& cell, const Part& p) const {
-    {
-        std::lock_guard g(mu_);
-        if (cell) return cell;
-    }
-    auto b = std::make_shared<const Bytes>(img_->encode(p.s, p.e, p.s - start_, end_ - start_));
-    WM_ENSURE(b->size() == p.size, "{}: re-encoded samples {}..{} are {} bytes, measured {}", img_->path.string(), p.s, p.e, b->size(), p.size);
-    std::lock_guard g(mu_);
-    if (!cell) cell = std::move(b);
-    return cell;
+Bytes WvTrack::encode_part(const Part& p) const {
+    Bytes b = img_->encode(p.s, p.e, p.s - start_, end_ - start_);
+    WM_ENSURE(b.size() == p.size, "{}: re-encoded samples {}..{} are {} bytes, measured {}", img_->path.string(), p.s, p.e, b.size(), p.size);
+    return b;
 }
 
 void WvTrack::drop_cached() const {
-    std::lock_guard g(mu_);
     head_bytes_.reset();
     tail_bytes_.reset();
+    std::lock_guard g(mu_);
     blocks_.clear();
     vstarts_.reset();
 }
@@ -483,9 +477,9 @@ void WvTrack::read_copy(uint64_t off, size_t len, Bytes& out) const {
     auto keep = vstarts();
     const auto& vs = *keep;
     uint64_t end = off + len;
+    // blocks [i0, i1) overlap the request
     size_t i0 = size_t(std::upper_bound(vs.begin(), vs.end(), off) - vs.begin()) - 1;
-    size_t i1 = i0;
-    while (i1 + 1 < vs.size() && vs[i1] < end) i1++;
+    size_t i1 = size_t(std::lower_bound(vs.begin(), vs.end(), end) - vs.begin());
     std::optional<File> file;  // opened once per request, if a block is not at hand
     for (size_t i = i0; i < i1; i++) copy_overlap(out, *block_bytes(i, file), vs[i], off, len);
 }
@@ -496,23 +490,13 @@ Bytes WvTrack::read_at(uint64_t off, size_t len) const {
     len = size_t(std::min<uint64_t>(len, size_ - off));
     out.reserve(len);
     touch(weak_from_this().lock());
-    uint64_t end = off + len, pos = 0;
-    if (head_) {
-        if (off < pos + head_->size && end > pos) copy_overlap(out, *part_bytes(head_bytes_, *head_), pos, off, len);
-        pos += head_->size;
-    }
-    if (copy_size_ > 0) {
-        if (off < pos + copy_size_ && end > pos) {
-            uint64_t a = std::max(off, pos) - pos, b = std::min(end, pos + copy_size_) - pos;
-            read_copy(a, size_t(b - a), out);
-        }
-        pos += copy_size_;
-    }
-    if (tail_) {
-        if (off < pos + tail_->size && end > pos) copy_overlap(out, *part_bytes(tail_bytes_, *tail_), pos, off, len);
-        pos += tail_->size;
-    }
-    tag_.read_at_base(img_->path, pos, off, len, out);
+    auto part = [this](const std::optional<Part>& p, const LazyBytes& bytes) {
+        return Piece{p ? p->size : 0, [this, p = &p, b = &bytes](uint64_t a, size_t n, Bytes& o) {
+                         copy_overlap(o, *b->get([&] { return encode_part(**p); }), 0, a, n);
+                     }};
+    };
+    stitch(out, off, len, part(head_, head_bytes_), Piece{copy_size_, [&](uint64_t a, size_t n, Bytes& o) { read_copy(a, n, o); }},
+           part(tail_, tail_bytes_), Piece{tag_.size(), [&](uint64_t a, size_t n, Bytes& o) { tag_.read(img_->path, a, n, o); }});
     WM_ENSURE(out.size() == len, "internal: produced {} of {} bytes at {}", out.size(), len, off);
     return out;
 }
