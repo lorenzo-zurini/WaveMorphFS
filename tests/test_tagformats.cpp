@@ -10,8 +10,10 @@
 #include "cue.hpp"
 #include "id3.hpp"
 #include "mp4.hpp"
+#include "retag.hpp"
 #include "test.hpp"
 #include "util.hpp"
+#include "writeback.hpp"
 
 using namespace wm;
 using namespace std::string_view_literals;
@@ -481,5 +483,41 @@ TEST(cover_jpeg_dimensions_past_large_segments_and_no_enlarging) {
     auto small = prepare_cover(d / "big.jpg", d / "cache");
     CHECK_MSG(small && *small->path != d / "big.jpg" && small->width == 600 && small->height == 400, "re-encoded, not enlarged: {}x{}",
               small ? small->width : 0, small ? small->height : 0);
+    fs::remove_all(d);
+}
+
+TEST(retag_dsf_with_chunk_sizes_beyond_the_file_is_refused) {
+    auto d = scratch("dsf");
+    auto dsf = [](uint64_t data_size) {
+        Bytes f = B("DSD ");
+        put_le64(f, 28);
+        put_le64(f, 92 + 16);
+        put_le64(f, 0);
+        append(f, B("fmt "));
+        put_le64(f, 52);
+        f.resize(f.size() + 40);
+        append(f, B("data"));
+        put_le64(f, data_size);
+        f.resize(f.size() + 16, 0x69);
+        return f;
+    };
+    atomic_write(d / "ok.dsf", dsf(28));
+    auto vf = retag_file(d / "ok.dsf", "dsf", Tags::from_pairs({{"TITLE", "t"}}));
+    CHECK(value(read_file_tags("dsf", [&](uint64_t o, size_t l) { return vf->read_at(o, l); }, vf->size()), "TITLE") == "t");
+    // a data size that wraps the end of the audio around to before the start
+    atomic_write(d / "wrap.dsf", dsf(~uint64_t(0) - 79 + 5));
+    CHECK_THROWS(retag_file(d / "wrap.dsf", "dsf", Tags::from_pairs({{"TITLE", "t"}})));
+    fs::remove_all(d);
+}
+
+TEST(retag_flac_leaves_out_names_vorbis_cannot_hold) {
+    auto d = scratch("flac-names");
+    fs::path f = d / "a.flac";
+    auto st = run({"ffmpeg", "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t", "0.2", "-c:a", "flac", f.string()});
+    CHECK_MSG(st.ok(), "ffmpeg: {}", st.err);
+    auto vf = retag_file(f, "flac", Tags::from_pairs({{"TITLE", "t"}, {"\u00A9wrk", "w"}, {"A=B", "x"}, {"MusicBrainz Album Id", "m"}}));
+    auto t = read_file_tags("flac", [&](uint64_t o, size_t l) { return vf->read_at(o, l); }, vf->size());
+    CHECK(value(t, "TITLE") == "t" && value(t, "MUSICBRAINZ_ALBUMID") == "m");
+    CHECK(!t.m.contains("\u00A9wrk") && !t.m.contains("A") && t.m.size() == 2 + size_t(t.m.contains("ENCODER")));
     fs::remove_all(d);
 }
