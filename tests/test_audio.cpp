@@ -312,3 +312,42 @@ TEST(encoded_layouts_carry_the_encoder_fingerprint) {
     CHECK_THROWS(tr.read_at(0, size_t(tr.size())));
     CHECK(!fs::exists(file));
 }
+
+TEST(av_image_rejects_float_audio_without_leaking) {
+    // the decoder fails half-way through its setup (run under ASan to see leaks)
+    TmpDir dir("float");
+    fs::path img = dir.path / "img.wav";
+    auto st = run({"ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=d=0.2", "-c:a", "pcm_f32le", img.string()});
+    CHECK_MSG(st.ok(), "ffmpeg: {}", st.err);
+    CHECK_THROWS(AvImage::open(img, nullptr));
+}
+
+TEST(av_image_index_is_checked_and_dropped_when_stale) {
+    TmpDir dir("avidx");
+    fs::path img = dir.path / "img.wav";
+    make_wav(img, 44100, 2, 44100);
+    Cache cache(dir.path / "cache");
+    auto good = AvImage::open(img, &cache);
+    fs::path idx = cache.av_index_path(img, SrcKey::of(img));
+    Bytes stored = read_file(idx);
+    CHECK(stored.size() > 32 + 2 * 20);
+    // packet timestamps that do not increase (stored by an older version): re-indexed
+    Bytes dup = stored;
+    std::copy(dup.begin() + 32, dup.begin() + 40, dup.begin() + 52);  // packet 1 gets packet 0's pts
+    atomic_write(idx, dup);
+    CHECK(AvImage::open(img, &cache)->total == good->total);
+    CHECK(read_file(idx) == stored);
+    // an index the demuxer no longer agrees with: reads fail, and the index goes
+    Bytes bad = stored;
+    uint32_t c0 = le32(&bad[32 + 16]), c1 = le32(&bad[52 + 16]);
+    auto put = [&](size_t at, uint32_t v) {
+        for (int i = 0; i < 4; i++) bad[at + size_t(i)] = uint8_t(v >> (8 * i));
+    };
+    put(32 + 16, c0 + 1);  // packet 0 one sample longer, packet 1 one shorter
+    put(52 + 16, c1 - 1);
+    for (int i = 0; i < 8; i++) bad[52 + 8 + size_t(i)] = uint8_t(uint64_t(c0 + 1) >> (8 * i));
+    atomic_write(idx, bad);
+    auto stale = AvImage::open(img, &cache);
+    CHECK_THROWS(stale->decode_range(0, 100));
+    CHECK(!fs::exists(idx));
+}
