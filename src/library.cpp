@@ -1151,16 +1151,12 @@ int64_t Library::results_mtime(const ReadyImage& ready, const Ranges& ranges) co
         for (auto& f : files) m = std::max(m, mtime_ns(f).value_or(0));
         return m;
     };
-    if (ready.av) {
-        auto k = SrcKey::of(ready.av->path);
-        return newest({cache.av_index_path(ready.av->path, k), layout_path(*ready.av, ranges, cache)});
-    }
-    if (ready.wv) {
-        auto k = SrcKey::of(ready.wv->path);
-        return newest({cache.wv_index_path(ready.wv->path, k), wv_layout_path(*ready.wv, ranges, cache)});
-    }
-    if (auto k = SrcKey::try_of(ready.flac->path)) return newest({cache.idx_path(ready.flac->path, *k), cache.md5_path(ready.flac->path, *k)});
-    return 0;
+    const fs::path& src = ready.av ? ready.av->path : ready.wv ? ready.wv->path : ready.flac->path;
+    auto k = SrcKey::try_of(src);
+    if (!k) return 0;  // gone: the next listing drops its tracks
+    if (ready.av) return newest({cache.av_index_path(src, *k), layout_path(*ready.av, ranges, cache)});
+    if (ready.wv) return newest({cache.wv_index_path(src, *k), wv_layout_path(*ready.wv, ranges, cache)});
+    return newest({cache.idx_path(src, *k), cache.md5_path(src, *k)});
 }
 
 std::optional<Entry> Library::standalone_track(ListingBuild& b, const std::string& src_name, const ReadyImage& ready, int64_t mt) {
