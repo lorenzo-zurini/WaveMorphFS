@@ -10,7 +10,6 @@
 
 #include <nlohmann/json.hpp>
 
-#include "cue.hpp"
 #include "retag.hpp"
 
 namespace wm {
@@ -29,31 +28,10 @@ constexpr int64_t OUTPUT_EPOCH_NS = 1792414876LL * 1'000'000'000;
 const std::vector<std::string_view> AUDIO_IMAGE_EXT = {"flac", "ape", "wv", "tta", "tak", "wav", "m4a", "aiff", "aif"};
 /// A file modified more recently than this is assumed to still be written.
 constexpr auto SETTLE = std::chrono::seconds(60);
+/// How long a listing is served without checking whether anything changed.
 constexpr auto RECHECK = std::chrono::milliseconds(1500);
-
-struct DirItem {
-    std::string name;
-    bool is_dir = false, is_file = false;
-    uint64_t size = 0;
-    int64_t mtime = 0;
-};
-
-std::vector<DirItem> read_dir(const fs::path& dir) {
-    DIR* d = ::opendir(dir.c_str());
-    if (!d) fail("read_dir {}: {}", dir.string(), std::strerror(errno));
-    std::vector<DirItem> out;
-    while (auto* e = ::readdir(d)) {
-        std::string n = e->d_name;
-        if (n == "." || n == "..") continue;
-        struct stat st;
-        if (::stat((dir / n).c_str(), &st) != 0) continue;  // follows symlinks, like the source tree should
-        out.push_back({n, S_ISDIR(st.st_mode), S_ISREG(st.st_mode), uint64_t(st.st_size),
-                       int64_t(st.st_mtim.tv_sec) * 1'000'000'000 + st.st_mtim.tv_nsec});
-    }
-    ::closedir(d);
-    std::sort(out.begin(), out.end(), [](auto& a, auto& b) { return a.name < b.name; });
-    return out;
-}
+/// FLAC/ID3 picture type of the front cover
+constexpr uint32_t PICTURE_FRONT_COVER = 3;
 
 bool is_ignored(const std::string& name) {
     std::string l = lower(name);
@@ -76,8 +54,7 @@ std::optional<int64_t> newest_mtime(const fs::path& dir) {
     if (!d) return best;
     while (auto* e = ::readdir(d)) {
         struct stat st;
-        if (::stat((dir / e->d_name).c_str(), &st) == 0 && S_ISREG(st.st_mode))
-            best = std::max(*best, int64_t(st.st_mtim.tv_sec) * 1'000'000'000 + st.st_mtim.tv_nsec);
+        if (::stat((dir / e->d_name).c_str(), &st) == 0 && S_ISREG(st.st_mode)) best = std::max(*best, ns_of(st.st_mtim));
     }
     ::closedir(d);
     return best;
@@ -98,13 +75,151 @@ bool is_audio_name(const std::string& n) {
     return std::find(AUDIO_IMAGE_EXT.begin(), AUDIO_IMAGE_EXT.end(), e) != AUDIO_IMAGE_EXT.end();
 }
 
+/// The file name a cue sheet's FILE line refers to, without directories.
+std::string cue_file_name(const CueSheet& cue) {
+    std::string ref = cue.files[0];
+    std::replace(ref.begin(), ref.end(), '\\', '/');
+    return fs::path(ref).filename().string();
+}
+
+std::optional<uint32_t> picture_type(const Bytes& data) {
+    if (data.size() < 4) return std::nullopt;
+    return be32(data.data());
+}
+
+int64_t max_mtime(std::initializer_list<std::optional<int64_t>> v) {
+    int64_t m = 0;
+    for (auto& x : v)
+        if (x) m = std::max(m, *x);
+    return m;
+}
+
+/// Section of status.txt a processing state is listed in.
+template <class T>
+int status_section(const detail::Work<T>& w) {
+    switch (w.st) {
+    case detail::Work<T>::Ready: return 0;
+    case detail::Work<T>::Pending: return 1;
+    case detail::Work<T>::Settling: return 2;
+    case detail::Work<T>::Failed: break;
+    }
+    return 3;
+}
+
+/// Run `open`, turning its result or failure into a processing state.
+template <class T, class Open>
+detail::Work<T> attempt(Open&& open) {
+    detail::Work<T> st;
+    try {
+        st.ready = open();
+        st.st = detail::Work<T>::Ready;
+    } catch (const std::exception& e) {
+        st.st = detail::Work<T>::Failed;
+        st.err = e.what();
+    }
+    return st;
+}
+
+}  // namespace
+
+namespace detail {
+
+struct DirItem {
+    std::string name;
+    bool is_dir = false, is_file = false;
+    uint64_t size = 0;
+    int64_t mtime = 0;
+};
+
+/// Sidecar "_cover"s resolved while building one listing (loaded once each).
+struct CoverSet {
+    const fs::path& covers_dir;
+    const fs::path& cache_dir;  // scaled-down copies of large images
+    std::map<std::string, std::optional<Cover>> loaded;
+    std::vector<std::pair<fs::path, std::optional<int64_t>>> used;  // for Listing::covers
+
+    const Cover* get(const std::string* spec) {
+        if (!spec) return nullptr;
+        auto it = loaded.find(*spec);
+        if (it == loaded.end()) {
+            fs::path p = *spec;
+            if (p.is_relative()) {
+                if (covers_dir.empty()) {
+                    warn("cover {}: a relative path needs --covers-dir", *spec);
+                    loaded.emplace(*spec, std::nullopt);
+                    return nullptr;
+                }
+                p = covers_dir / p;
+            }
+            used.emplace_back(p, mtime_ns(p));
+            it = loaded.emplace(*spec, prepare_cover(p, cache_dir)).first;  // a missing or bad image keeps the original pictures
+        }
+        return it->second ? &*it->second : nullptr;
+    }
+};
+
+/// What one build_listing call works with and produces.
+struct ListingBuild {
+    fs::path dir;
+    std::vector<DirItem> names;
+    std::set<std::string> name_set;
+    std::optional<fs::path> overlay;
+    std::optional<Sidecar> sidecar;
+    const Sidecar* sc = nullptr;  // &*sidecar, or null
+    std::optional<int64_t> sidecar_mtime;
+    CoverSet covers;
+    std::set<std::string> hidden;  // source files not listed as they are
+    std::vector<Entry> entries;    // listed under their own names
+    std::vector<Entry> virtuals;   // generated; renamed when a real file has their name
+    bool has_cover = false;        // the folder has a cover image of its own
+    std::optional<Clock::time_point> retry_at;
+
+    ListingBuild(fs::path d, const Config& cfg) : dir(std::move(d)), covers{cfg.covers_dir, cfg.cache_dir, {}, {}} {}
+    /// `n` is still being downloaded (a file still being downloaded is written as "<n>.!qB")
+    bool incomplete(const std::string& n) const { return name_set.contains(n + ".!qB") || name_set.contains(n + ".!qb"); }
+    void settle_until(Clock::time_point until) { retry_at = retry_at ? std::min(*retry_at, until) : until; }
+};
+
+/// The disc tracks belong to. With several discs in one folder the disc number is
+/// part of the track names and sidecar keys ("2-05 - Title.flac", track."2-05").
+struct DiscSlot {
+    std::optional<uint32_t> number;  // DISCNUMBER
+    bool several = false;            // the folder holds several discs
+    size_t count = 1;                // DISCTOTAL, when several
+    /// the disc as track names and sidecar keys use it
+    std::optional<uint32_t> keyed() const { return several ? number : std::nullopt; }
+};
+
+}  // namespace detail
+
+using detail::CoverSet;
+using detail::DirItem;
+using detail::DiscSlot;
+using detail::ListingBuild;
+
+namespace {
+
+std::vector<DirItem> read_dir(const fs::path& dir) {
+    DIR* d = ::opendir(dir.c_str());
+    if (!d) fail("read_dir {}: {}", dir.string(), std::strerror(errno));
+    std::vector<DirItem> out;
+    while (auto* e = ::readdir(d)) {
+        std::string n = e->d_name;
+        if (n == "." || n == "..") continue;
+        struct stat st;
+        if (::stat((dir / n).c_str(), &st) != 0) continue;  // follows symlinks, like the source tree should
+        out.push_back({n, S_ISDIR(st.st_mode), S_ISREG(st.st_mode), uint64_t(st.st_size), ns_of(st.st_mtim)});
+    }
+    ::closedir(d);
+    std::sort(out.begin(), out.end(), [](auto& a, auto& b) { return a.name < b.name; });
+    return out;
+}
+
 /// Find the audio file a single-FILE cue refers to. Rips are often converted after
 /// the cue was written (cue says .wav, file is .flac), so fall back to matching by
 /// stem, then by the cue's own stem.
 std::optional<std::string> resolve_image(const CueSheet& cue, const std::string& cue_name, const std::vector<DirItem>& names) {
-    std::string ref = cue.files[0];
-    std::replace(ref.begin(), ref.end(), '\\', '/');
-    ref = fs::path(ref).filename().string();
+    std::string ref = cue_file_name(cue);
     if (ref.empty()) return std::nullopt;
     std::vector<const std::string*> files;
     for (auto& n : names)
@@ -122,14 +237,163 @@ std::optional<std::string> resolve_image(const CueSheet& cue, const std::string&
     return std::nullopt;
 }
 
-std::optional<uint32_t> picture_type(const Bytes& data) {
-    if (data.size() < 4) return std::nullopt;
-    return be32(data.data());
+struct ImageGroup {
+    std::string cue_name;
+    CueSheet cue;
+    std::string img_name;
+};
+
+/// The folder's cue sheets with the image each describes, minus sheets hidden by
+/// the sidecar and duplicates: several sheets describing the same image with the
+/// same tracks (e.g. "X.ape.cue" and "X.wav.cue") list it once, from the sheet
+/// whose FILE names the image itself, else the first by name. Both happen before
+/// discs are numbered.
+std::vector<ImageGroup> image_groups(ListingBuild& b) {
+    std::vector<ImageGroup> groups;
+    for (auto& n : b.names) {
+        if (!n.is_file || ext_lower(n.name) != "cue") continue;
+        CueSheet cue;
+        try {
+            cue = CueSheet::read(b.dir / n.name);
+        } catch (const std::exception& e) {
+            warn("cue {}: {}", (b.dir / n.name).string(), e.what());
+            continue;
+        }
+        if (!cue.is_image()) continue;
+        if (auto img = resolve_image(cue, n.name, b.names)) groups.push_back({n.name, std::move(cue), *img});
+        else if (b.incomplete(cue_file_name(cue))) b.hidden.insert(n.name);  // image still being written as <name>.!qB
+    }
+    std::erase_if(groups, [&](const ImageGroup& g) {
+        if (!b.sc || !(b.sc->hides(g.cue_name) || b.sc->hides(g.img_name))) return false;
+        b.hidden.insert(g.cue_name);
+        b.hidden.insert(g.img_name);
+        return true;
+    });
+    auto same_tracks = [](const CueSheet& x, const CueSheet& y) {
+        if (x.tracks.size() != y.tracks.size()) return false;
+        for (size_t i = 0; i < x.tracks.size(); i++)
+            if (x.tracks[i].number != y.tracks[i].number || x.tracks[i].index01 != y.tracks[i].index01) return false;
+        return true;
+    };
+    auto names_image = [](const ImageGroup& g) { return cue_file_name(g.cue) == g.img_name; };
+    std::set<size_t> dropped;
+    for (size_t i = 0; i < groups.size(); i++)
+        for (size_t j = i + 1; j < groups.size(); j++) {
+            if (dropped.contains(i) || dropped.contains(j)) continue;
+            if (groups[i].img_name != groups[j].img_name || !same_tracks(groups[i].cue, groups[j].cue)) continue;
+            bool ni = names_image(groups[i]), nj = names_image(groups[j]);
+            bool keep_j = (nj && !ni) || (nj == ni && groups[j].cue_name < groups[i].cue_name);
+            dropped.insert(keep_j ? i : j);
+        }
+    for (auto it = dropped.rbegin(); it != dropped.rend(); ++it) {
+        b.hidden.insert(groups[*it].cue_name);
+        groups.erase(groups.begin() + ptrdiff_t(*it));
+    }
+    return groups;
 }
 
-std::string error_text(const std::exception& e) { return e.what(); }
+/// TRACKNUMBER/TRACKTOTAL, and the disc fields when there is a disc number.
+void set_position(Tags& tg, const DiscSlot& disc, uint32_t num, size_t total) {
+    tg.set("TRACKNUMBER", std::to_string(num));
+    tg.set("TRACKTOTAL", std::to_string(total));
+    if (disc.number) {
+        tg.set("DISCNUMBER", std::to_string(*disc.number));
+        if (disc.several) tg.set("DISCTOTAL", std::to_string(disc.count));
+    }
+}
+
+/// The sidecar's album table, then the track's own table.
+void overlay_sidecar_track(Tags& tg, const Sidecar* sc, const DiscSlot& disc, uint32_t num) {
+    if (!sc) return;
+    tg.overlay(sc->album);
+    if (auto t = sc->track(disc.keyed(), num)) tg.overlay(*t);
+}
+
+struct NamedTrack {
+    std::string name, key;
+    const Cover* cover;
+};
+
+/// What every split track derives the same way once its own tags are complete:
+/// the file name ("[prefix][D-]NN - Title.ext", unless the sidecar pins one and
+/// `pin` allows it), the tags of the sidecar's file table for that name, the
+/// track's sidecar key and its cover.
+NamedTrack name_track(ListingBuild& b, Tags& tg, const DiscSlot& disc, uint32_t num, std::string_view prefix, std::string_view ext, bool pin) {
+    auto title_v = tg.get("TITLE");
+    std::string title = title_v ? sanitize_name(*title_v) : std::format("Track {:02}", num);
+    auto d = disc.keyed();
+    std::string name = d ? std::format("{}{}-{:02} - {}.{}", prefix, *d, num, title, ext) : std::format("{}{:02} - {}.{}", prefix, num, title, ext);
+    if (b.sc && pin)
+        if (auto pinned = b.sc->track_name(d, num)) name = *pinned;
+    if (b.sc)
+        if (auto ft = b.sc->file(name)) tg.overlay(*ft);
+    std::string key = track_key(d, num);
+    const Cover* cv = b.sc ? b.covers.get(b.sc->cover_for(name, &key)) : nullptr;
+    return {std::move(name), std::move(key), cv};
+}
+
+/// mtime of generated content: never older than OUTPUT_EPOCH_NS (changes of the
+/// output format), than what it is made from, or than the cover embedded in it
+int64_t output_mtime(int64_t mt, const Cover* cover) { return std::max({mt, OUTPUT_EPOCH_NS, cover ? cover->mtime : 0}); }
+
+/// Add the generated entries, renaming those that clash with a real name ("X (2).flac").
+void merge_virtuals(ListingBuild& b) {
+    std::set<std::string> taken;
+    for (auto& e : b.entries) taken.insert(e.name);
+    for (auto& v : b.virtuals) {
+        std::string name = v.name;
+        for (int i = 2; taken.contains(name); i++) {
+            auto dot = v.name.rfind('.');
+            std::string stem = dot == std::string::npos ? v.name : v.name.substr(0, dot);
+            std::string ext = dot == std::string::npos ? "" : v.name.substr(dot + 1);
+            name = std::format("{} ({}).{}", stem, i, ext);
+        }
+        v.name = name;
+        b.entries.push_back(std::move(v));
+    }
+    b.virtuals.clear();
+}
+
+/// Cover art exported into the sidecar tree, for folders of generated tracks
+/// without a cover image of their own.
+void add_overlay_cover(ListingBuild& b) {
+    if (b.has_cover || b.virtuals.empty() || !b.overlay) return;
+    for (auto c : {"cover.jpg", "cover.png"}) {
+        fs::path p = *b.overlay / c;
+        struct stat st;
+        if (::stat(p.c_str(), &st) == 0) {
+            b.entries.push_back(Entry::make_file(c, std::make_shared<Passthrough>(p, uint64_t(st.st_size)), ns_of(st.st_mtim)));
+            return;
+        }
+    }
+}
 
 }  // namespace
+
+Entry Entry::make_dir(std::string name, fs::path dir, int64_t mtime) {
+    Entry e;
+    e.name = std::move(name);
+    e.is_dir = true;
+    e.dir = std::move(dir);
+    e.mtime = mtime;
+    return e;
+}
+
+Entry Entry::make_file(std::string name, VFilePtr file, int64_t mtime) {
+    Entry e;
+    e.name = std::move(name);
+    e.file = std::move(file);
+    e.mtime = mtime;
+    return e;
+}
+
+Entry Entry::make_tagged(std::string name, VFilePtr file, int64_t mtime, std::string_view section, std::string key, std::string ext) {
+    Entry e = make_file(std::move(name), std::move(file), mtime);
+    e.tag_section = section;
+    e.tag_key = std::move(key);
+    e.tag_ext = std::move(ext);
+    return e;
+}
 
 const Entry* Listing::find(std::string_view name) const {
     for (auto& e : entries)
@@ -184,6 +448,7 @@ void Library::walk(const fs::path& dir, size_t& n) {
     try {
         l = list_dir(dir);
     } catch (const std::exception& e) {
+        debug("prescan {}: {}", dir.string(), e.what());
         return;
     }
     for (auto& e : l->entries)
@@ -193,16 +458,9 @@ void Library::walk(const fs::path& dir, size_t& n) {
 void Library::run_job(Job job) {
     if (auto* j = std::get_if<ImageJob>(&job)) {
         auto key = SrcKey::try_of(j->src);
-        Work<ReadyImage> st;
-        try {
-            st.ready = std::make_shared<const ReadyImage>(process_image(j->src));
-            st.st = Work<ReadyImage>::Ready;
-            info("image ready: {}", j->src.string());
-        } catch (const std::exception& e) {
-            st.st = Work<ReadyImage>::Failed;
-            st.err = error_text(e);
-            warn("image failed: {}: {}", j->src.string(), st.err);
-        }
+        auto st = attempt<ReadyImage>([&] { return std::make_shared<const ReadyImage>(process_image(j->src)); });
+        if (st.st == Work<ReadyImage>::Ready) info("image ready: {}", j->src.string());
+        else warn("image failed: {}: {}", j->src.string(), st.err);
         if (key) {
             std::lock_guard g(mu_);
             images_[j->src] = {*key, st};
@@ -239,18 +497,11 @@ void Library::run_job(Job job) {
     } else if (auto* j = std::get_if<SacdJob>(&job)) {
         auto key = SrcKey::try_of(j->src);
         const char* area = j->mc ? "multichannel" : "stereo";
-        Work<SacdDisc> st;
-        try {
-            auto d = SacdDisc::open(j->src, &cache, j->mc);
-            info("SACD {} area ready: {} ({} tracks, {} ch{})", area, j->src.string(), d->tracks.size(), d->channels, d->dst ? ", DST" : "");
-            st.st = Work<SacdDisc>::Ready;
-            st.ready = d;
-        } catch (const std::exception& e) {
-            st.st = Work<SacdDisc>::Failed;
-            st.err = error_text(e);
-            if (st.err.find("no multichannel area") != std::string::npos) debug("{}: {}", j->src.string(), st.err);
-            else warn("SACD {} area failed: {}: {}", area, j->src.string(), st.err);
-        }
+        auto st = attempt<SacdDisc>([&] { return SacdDisc::open(j->src, &cache, j->mc); });
+        if (st.st == Work<SacdDisc>::Ready)
+            info("SACD {} area ready: {} ({} tracks, {} ch{})", area, j->src.string(), st.ready->tracks.size(), st.ready->channels, st.ready->dst ? ", DST" : "");
+        else if (st.err.find("no multichannel area") != std::string::npos) debug("{}: {}", j->src.string(), st.err);
+        else warn("SACD {} area failed: {}: {}", area, j->src.string(), st.err);
         if (key) {
             std::lock_guard g(mu_);
             sacds_[{j->src, j->mc}] = {*key, st};
@@ -259,25 +510,25 @@ void Library::run_job(Job job) {
     }
 }
 
-ReadyImage Library::process_image(const fs::path& src) const {
+Library::ReadyImage Library::process_image(const fs::path& src) const {
     ReadyImage r;
-    if (ext_lower(src) == "wv" && WvImage::is_float(src)) {
+    std::string ext = ext_lower(src);
+    if (ext == "wv" && WvImage::is_float(src)) {
         auto wv = WvImage::open(src, &cache);
         r.source_tags = wv->tags;
         r.wv = wv;
         return r;
     }
-    if (ext_lower(src) != "flac") {
+    if (ext != "flac") {
         auto av = AvImage::open(src, &cache);
         r.source_tags = av->tags;
         r.av = av;
         return r;
     }
-    fs::path flac_path = src;
-    auto meta = flac::FlacMeta::read(flac_path);
+    auto meta = flac::FlacMeta::read(src);
     flac::FrameIndex idx;
     try {
-        idx = cache.index_for(flac_path, meta);
+        idx = cache.index_for(src, meta);
     } catch (const Error& e) {
         // frames can only be copied from fixed-blocksize images; others are
         // decoded and re-encoded on the fly like non-FLAC images
@@ -289,42 +540,34 @@ ReadyImage Library::process_image(const fs::path& src) const {
     }
     r.source_tags = Tags::from_pairs(meta.vorbis_comments());
     for (auto* b : meta.pictures())
-        if (b->data.size() <= (2 << 20) && picture_type(b->data) == 3) {
+        if (b->data.size() <= MAX_COVER_BYTES && picture_type(b->data) == PICTURE_FRONT_COVER) {
             r.pictures.push_back({b->kind, SrcRange{b->offset, b->data.size()}});
             break;
         }
-    r.flac = FlacImage::open(flac_path, std::move(meta), std::move(idx));
+    r.flac = FlacImage::open(src, std::move(meta), std::move(idx));
     return r;
 }
 
 void Library::write_status() const {
     std::vector<std::string> sections[4];  // ready, pending, settling, failed
-    auto push = [&](int i, std::string s) { sections[i].push_back(std::move(s)); };
     {
         std::lock_guard g(mu_);
         for (auto& [p, ks] : images_) {
             auto& st = ks.second;
             std::string label = "image  " + p.string();
-            switch (st.st) {
-            case Work<ReadyImage>::Ready: push(0, label); break;
-            case Work<ReadyImage>::Pending: push(1, label); break;
-            case Work<ReadyImage>::Settling: push(2, label); break;
-            case Work<ReadyImage>::Failed: push(3, label + "\n         " + st.err); break;
-            }
+            if (st.st == Work<ReadyImage>::Failed) label += "\n         " + st.err;
+            sections[status_section(st)].push_back(std::move(label));
         }
         for (auto& [pk, ks] : sacds_) {
             auto& st = ks.second;
             std::string label = std::string(pk.second ? "SACD/MC " : "SACD    ") + pk.first.string();
-            switch (st.st) {
-            case Work<SacdDisc>::Ready:
-                push(0, std::format("{}  ({} tracks, {} ch{})", label, st.ready->tracks.size(), st.ready->channels, st.ready->dst ? ", DST" : ""));
-                break;
-            case Work<SacdDisc>::Pending: push(1, label); break;
-            case Work<SacdDisc>::Settling: push(2, label); break;
-            case Work<SacdDisc>::Failed:
-                if (st.err.find("no multichannel area") == std::string::npos) push(3, label + "\n         " + st.err);
-                break;
+            if (st.st == Work<SacdDisc>::Ready)
+                label += std::format("  ({} tracks, {} ch{})", st.ready->tracks.size(), st.ready->channels, st.ready->dst ? ", DST" : "");
+            if (st.st == Work<SacdDisc>::Failed) {
+                if (st.err.find("no multichannel area") != std::string::npos) continue;
+                label += "\n         " + st.err;
             }
+            sections[status_section(st)].push_back(std::move(label));
         }
     }
     static const char* titles[4] = {"ready", "pending", "settling (still being written)", "FAILED"};
@@ -356,7 +599,7 @@ void Library::apply_edit(const fs::path& dir, const std::string& file_name, cons
     json& entry = doc[section][key];
     if (!entry.is_object()) entry = json::object();
     // pin the file name: retitling must not move the file under the editor
-    if (section == "track" && !entry.contains("_name")) entry["_name"] = file_name;
+    if (section == EDIT_TRACK && !entry.contains("_name")) entry["_name"] = file_name;
     auto erase_field = [](json& obj, const std::string& k, const std::string& keep) {
         std::vector<std::string> drop;
         for (auto& [ek, ev] : obj.items())
@@ -382,7 +625,7 @@ void Library::apply_edit(const fs::path& dir, const std::string& file_name, cons
         erase_field(entry, k, name);
         entry[name] = vals.empty() ? json("") : vals.size() == 1 ? json(vals[0]) : json(vals);
         // a per-file entry would override the track entry: drop the field there
-        if (section == "track" && doc.contains("file") && doc["file"].contains(file_name) && doc["file"][file_name].is_object())
+        if (section == EDIT_TRACK && doc.contains("file") && doc["file"].contains(file_name) && doc["file"][file_name].is_object())
             erase_field(doc["file"][file_name], k, "");
     }
     fs::create_directories(*ov);
@@ -407,77 +650,47 @@ bool Library::enqueue(Job job) {
     return true;
 }
 
-Work<ReadyImage> Library::image_state(const fs::path& src, const fs::path& dir) {
+template <class K, class T, class Cached, class Open>
+Library::Work<T> Library::work_state(WorkMap<K, T>& states, const K& k, const fs::path& src, Cached cached, Open open, Job job) {
     auto key = SrcKey::try_of(src);
-    if (!key) return {Work<ReadyImage>::Failed, {}, nullptr, "stat failed"};
+    if (!key) return {Work<T>::Failed, {}, nullptr, "stat failed"};
     {
         std::lock_guard g(mu_);
-        if (auto it = images_.find(src); it != images_.end() && it->second.first == *key) {
+        if (auto it = states.find(k); it != states.end() && it->second.first == *key) {
             auto& st = it->second.second;
-            if (st.st != Work<ReadyImage>::Settling || Clock::now() < st.until) return st;
+            if (st.st != Work<T>::Settling || Clock::now() < st.until) return st;
         }
     }
     if (recently_modified(src)) {
-        Work<ReadyImage> st{Work<ReadyImage>::Settling, Clock::now() + SETTLE, nullptr, ""};
+        Work<T> st{Work<T>::Settling, Clock::now() + SETTLE, nullptr, ""};
         std::lock_guard g(mu_);
-        images_[src] = {*key, st};
+        states[k] = {*key, st};
         return st;
     }
     // cached work is cheap to reopen: do it inline so albums never vanish from a
     // listing just because the process restarted
-    bool cached = cache.image_is_cached(src);
+    bool inline_ok = cached();
     {
         std::lock_guard g(mu_);
-        images_[src] = {*key, Work<ReadyImage>{}};
+        states[k] = {*key, Work<T>{}};
     }
-    if (!cached && enqueue(ImageJob{src, dir})) return {};
-    Work<ReadyImage> st;
-    try {
-        st.ready = std::make_shared<const ReadyImage>(process_image(src));
-        st.st = Work<ReadyImage>::Ready;
-    } catch (const std::exception& e) {
-        st.st = Work<ReadyImage>::Failed;
-        st.err = error_text(e);
-    }
+    if (!inline_ok && enqueue(std::move(job))) return {};
+    auto st = attempt<T>(open);
     std::lock_guard g(mu_);
-    images_[src] = {*key, st};
+    states[k] = {*key, st};
     return st;
 }
 
-Work<SacdDisc> Library::sacd_state(const fs::path& src, const fs::path& dir, bool mc) {
-    auto mkey = std::pair{src, mc};
-    auto key = SrcKey::try_of(src);
-    if (!key) return {Work<SacdDisc>::Failed, {}, nullptr, "stat failed"};
-    {
-        std::lock_guard g(mu_);
-        if (auto it = sacds_.find(mkey); it != sacds_.end() && it->second.first == *key) {
-            auto& st = it->second.second;
-            if (st.st != Work<SacdDisc>::Settling || Clock::now() < st.until) return st;
-        }
-    }
-    if (recently_modified(src)) {
-        Work<SacdDisc> st{Work<SacdDisc>::Settling, Clock::now() + SETTLE, nullptr, ""};
-        std::lock_guard g(mu_);
-        sacds_[mkey] = {*key, st};
-        return st;
-    }
-    bool cached = sacd_is_cached(cache, src, mc);
-    {
-        std::lock_guard g(mu_);
-        sacds_[mkey] = {*key, Work<SacdDisc>{}};
-    }
-    if (!cached && enqueue(SacdJob{src, dir, mc})) return {};
-    Work<SacdDisc> st;
-    try {
-        st.ready = SacdDisc::open(src, &cache, mc);
-        st.st = Work<SacdDisc>::Ready;
-    } catch (const std::exception& e) {
-        st.st = Work<SacdDisc>::Failed;
-        st.err = error_text(e);
-    }
-    std::lock_guard g(mu_);
-    sacds_[mkey] = {*key, st};
-    return st;
+Library::Work<Library::ReadyImage> Library::image_state(const fs::path& src, const fs::path& dir) {
+    return work_state(
+        images_, src, src, [&] { return cache.image_is_cached(src); }, [&] { return std::make_shared<const ReadyImage>(process_image(src)); },
+        ImageJob{src, dir});
+}
+
+Library::Work<SacdDisc> Library::sacd_state(const fs::path& src, const fs::path& dir, bool mc) {
+    return work_state(
+        sacds_, std::pair{src, mc}, src, [&] { return sacd_is_cached(cache, src, mc); }, [&] { return SacdDisc::open(src, &cache, mc); },
+        SacdJob{src, dir, mc});
 }
 
 std::optional<std::pair<const Root*, fs::path>> Library::root_of(const fs::path& p) const {
@@ -516,10 +729,7 @@ std::shared_ptr<const Listing> Library::list_dir(const fs::path& dir) {
         if (!l) l = std::make_shared<std::mutex>();
         lock = l;
     }
-    if (cached) {
-        std::lock_guard g(cached->mu);
-        if (Clock::now() - cached->checked < RECHECK) return cached;
-    }
+    if (cached && Clock::now() - cached->checked.load() < RECHECK) return cached;
     std::lock_guard dg(*lock);
     Sig sig = signature(dir);
     {
@@ -530,7 +740,6 @@ std::shared_ptr<const Listing> Library::list_dir(const fs::path& dir) {
         return std::all_of(l.covers.begin(), l.covers.end(), [](auto& c) { return mtime_ns(c.first) == c.second; });
     };
     if (cached && cached->sig == sig && !(cached->retry_at && Clock::now() >= *cached->retry_at) && covers_unchanged(*cached)) {
-        std::lock_guard g(cached->mu);
         cached->checked = Clock::now();
         return cached;
     }
@@ -541,251 +750,26 @@ std::shared_ptr<const Listing> Library::list_dir(const fs::path& dir) {
 }
 
 std::shared_ptr<Listing> Library::build_listing(const fs::path& dir, const Sig& sig) {
-    auto names = with_context("read_dir " + dir.string(), [&] { return read_dir(dir); });
-    std::set<std::string> name_set;
-    for (auto& n : names) name_set.insert(n.name);
-    auto incomplete = [&](const std::string& n) { return name_set.contains(n + ".!qB") || name_set.contains(n + ".!qb"); };
-    auto item = [&](const std::string& n) -> const DirItem* {
-        for (auto& x : names)
-            if (x.name == n) return &x;
-        return nullptr;
-    };
-
-    auto overlay = overlay_dir(dir);
-    std::optional<Sidecar> sidecar;
+    ListingBuild b(dir, cfg);
+    b.names = with_context("read_dir " + dir.string(), [&] { return read_dir(dir); });
+    for (auto& n : b.names) b.name_set.insert(n.name);
+    b.overlay = overlay_dir(dir);
     try {
-        sidecar = Sidecar::load(dir, overlay);
+        b.sidecar = Sidecar::load(dir, b.overlay);
     } catch (const std::exception& e) {
         warn("sidecar in {}: {}", dir.string(), e.what());
     }
-    std::optional<int64_t> sidecar_mtime = sidecar ? sidecar->mtime : std::nullopt;
-    const Sidecar* sc = sidecar ? &*sidecar : nullptr;
-    CoverSet covers{cfg.covers_dir, cfg.cache_dir, {}, {}};
-    std::set<std::string> hidden;
-    std::vector<Entry> virtuals;
-    std::optional<Clock::time_point> retry_at;
-    auto note_settle = [&](Clock::time_point until) { retry_at = retry_at ? std::min(*retry_at, until) : until; };
-    auto max_mtime = [](std::initializer_list<std::optional<int64_t>> v) {
-        int64_t m = 0;
-        for (auto& x : v)
-            if (x) m = std::max(m, *x);
-        return m;
-    };
+    b.sc = b.sidecar ? &*b.sidecar : nullptr;
+    b.sidecar_mtime = b.sc ? b.sc->mtime : std::nullopt;
 
-    // --- CUE + image groups
-    struct Group {
-        std::string cue_name;
-        CueSheet cue;
-        std::string img_name;
-    };
-    std::vector<Group> groups;
-    for (auto& n : names) {
-        if (!n.is_file || ext_lower(n.name) != "cue") continue;
-        CueSheet cue;
-        try {
-            cue = CueSheet::read(dir / n.name);
-        } catch (const std::exception& e) {
-            warn("cue {}: {}", (dir / n.name).string(), e.what());
-            continue;
-        }
-        if (!cue.is_image()) continue;
-        if (auto img = resolve_image(cue, n.name, names)) {
-            groups.push_back({n.name, std::move(cue), *img});
-        } else {
-            std::string ref = cue.files[0];
-            std::replace(ref.begin(), ref.end(), '\\', '/');
-            if (incomplete(fs::path(ref).filename().string())) hidden.insert(n.name);  // image still being written as <name>.!qB
-        }
-    }
-    // sheets hidden by the sidecar, and duplicates: several sheets describing the
-    // same image with the same tracks (e.g. "X.ape.cue" and "X.wav.cue") list it
-    // once, from the sheet whose FILE names the image itself, else the first by
-    // name. Both happen before discs are numbered.
-    std::erase_if(groups, [&](const Group& g) {
-        if (!sc || !(sc->hides(g.cue_name) || sc->hides(g.img_name))) return false;
-        hidden.insert(g.cue_name);
-        hidden.insert(g.img_name);
-        return true;
-    });
-    auto same_tracks = [](const CueSheet& a, const CueSheet& b) {
-        if (a.tracks.size() != b.tracks.size()) return false;
-        for (size_t i = 0; i < a.tracks.size(); i++)
-            if (a.tracks[i].number != b.tracks[i].number || a.tracks[i].index01 != b.tracks[i].index01) return false;
-        return true;
-    };
-    auto names_image = [](const Group& g) {
-        std::string ref = g.cue.files[0];
-        std::replace(ref.begin(), ref.end(), '\\', '/');
-        return fs::path(ref).filename().string() == g.img_name;
-    };
-    std::set<size_t> dropped;
-    for (size_t i = 0; i < groups.size(); i++)
-        for (size_t j = i + 1; j < groups.size(); j++) {
-            if (dropped.contains(i) || dropped.contains(j)) continue;
-            if (groups[i].img_name != groups[j].img_name || !same_tracks(groups[i].cue, groups[j].cue)) continue;
-            bool ni = names_image(groups[i]), nj = names_image(groups[j]);
-            bool keep_j = (nj && !ni) || (nj == ni && groups[j].cue_name < groups[i].cue_name);
-            dropped.insert(keep_j ? i : j);
-        }
-    for (auto it = dropped.rbegin(); it != dropped.rend(); ++it) {
-        hidden.insert(groups[*it].cue_name);
-        groups.erase(groups.begin() + ptrdiff_t(*it));
-    }
-    bool multi = groups.size() > 1;
-    for (size_t gi = 0; gi < groups.size(); gi++) {
-        auto& [cue_name, cue, img_name] = groups[gi];
-        fs::path img_path = dir / img_name;
-        if (incomplete(img_name)) {
-            hidden.insert(cue_name);
-            hidden.insert(img_name);
-            continue;
-        }
-        auto st = image_state(img_path, dir);
-        if (st.st == Work<ReadyImage>::Ready) {
-            std::optional<uint32_t> disc;
-            if (auto d = cue.fields.find("DISCNUMBER"); d != cue.fields.end())
-                if (auto v = parse_u64(trim(split(d->second, '/')[0])); v && *v <= UINT32_MAX) disc = uint32_t(*v);
-            if (!disc && multi) disc = uint32_t(gi + 1);
-            try {
-                auto v = image_tracks(dir, cue, *st.ready, disc, multi, groups.size(), sc,
-                                      max_mtime({mtime_ns(dir / cue_name), mtime_ns(img_path), sidecar_mtime}), covers);
-                hidden.insert(cue_name);
-                hidden.insert(img_name);
-                if (v)
-                    for (auto& e : *v) virtuals.push_back(std::move(e));
-            } catch (const std::exception& e) {
-                warn("splitting {}: {}", img_path.string(), e.what());
-            }
-        } else if (st.st == Work<ReadyImage>::Pending || st.st == Work<ReadyImage>::Settling) {
-            if (st.st == Work<ReadyImage>::Settling) note_settle(st.until);
-            hidden.insert(cue_name);
-            hidden.insert(img_name);
-        }
-        // Failed: leave cue + image visible as-is
-    }
-
-    // --- SACD ISOs
-    std::vector<const DirItem*> isos;
-    for (auto& n : names)
-        if (n.is_file && ext_lower(n.name) == "iso" && !(sc && sc->hides(n.name))) isos.push_back(&n);
-    bool multi_iso = isos.size() > 1;
-    for (size_t ii = 0; ii < isos.size(); ii++) {
-        const std::string& n = isos[ii]->name;
-        fs::path p = dir / n;
-        if (incomplete(n) || !is_sacd(p)) continue;
-        std::optional<uint32_t> disc_no = multi_iso ? std::optional<uint32_t>(uint32_t(ii + 1)) : std::nullopt;
-        auto st = sacd_state(p, dir, false);
-        int64_t mt = max_mtime({mtime_ns(p), sidecar_mtime});
-        if (auto k = SrcKey::try_of(p)) mt = std::max(mt, mtime_ns(cache.sacd_frames_path(p, *k, false)).value_or(0));
-        if (st.st == Work<SacdDisc>::Ready) {
-            for (auto& e : sacd_tracks(st.ready, disc_no, isos.size(), sc, mt, false, covers)) virtuals.push_back(std::move(e));
-            hidden.insert(n);
-            if (cfg.sacd_multichannel) {
-                auto mc = sacd_state(p, dir, true);
-                if (mc.st == Work<SacdDisc>::Ready)
-                    for (auto& e : sacd_tracks(mc.ready, disc_no, isos.size(), sc, mt, true, covers)) virtuals.push_back(std::move(e));
-            }
-        } else if (st.st == Work<SacdDisc>::Pending || st.st == Work<SacdDisc>::Settling) {
-            if (st.st == Work<SacdDisc>::Settling) note_settle(st.until);
-            hidden.insert(n);
-        }
-    }
-
-    // --- everything else
-    std::vector<Entry> entries;
-    bool has_cover = false;
-    for (auto& n : names) {
-        if (hidden.contains(n.name) || is_ignored(n.name)) continue;
-        fs::path p = dir / n.name;
-        if (n.is_dir) {
-            entries.push_back({n.name, true, p, nullptr, n.mtime});
-            continue;
-        }
-        if (is_cover_name(n.name)) has_cover = true;
-        std::string ext = ext_lower(n.name);
-        // standalone tracks in formats players and taggers handle poorly: served
-        // as FLAC encoded on the fly, like the tracks of such images
-        if (ext == "ape" || ext == "wv" || ext == "tta" || ext == "tak") {
-            if (incomplete(n.name)) continue;
-            auto st = image_state(p, dir);
-            if (st.st == Work<ReadyImage>::Pending) continue;
-            if (st.st == Work<ReadyImage>::Settling) {
-                note_settle(st.until);
-                continue;
-            }
-            if (st.st == Work<ReadyImage>::Ready && st.ready->wv) {
-                // floating-point WavPack: served as it is, with the sidecar's tags
-                auto& wv = *st.ready->wv;
-                Tags tg = st.ready->source_tags;
-                if (sc) {
-                    tg.overlay(sc->album);
-                    if (auto f = sc->file(n.name)) tg.overlay(*f);
-                }
-                const Cover* cv = sc ? covers.get(sc->cover_for(n.name, nullptr)) : nullptr;
-                int64_t mt = std::max({n.mtime, sidecar_mtime.value_or(0), OUTPUT_EPOCH_NS, cv ? cv->mtime : 0});
-                entries.push_back({n.name, false, {}, retag_wavpack(wv, tg, cv), mt, "file", n.name, "wv"});
-                continue;
-            }
-            if (st.st == Work<ReadyImage>::Ready && st.ready->av) {
-                try {
-                    if (auto e = standalone_track(dir, n.name, *st.ready, sc, max_mtime({n.mtime, sidecar_mtime}), covers)) virtuals.push_back(std::move(*e));
-                    continue;  // shown once measured
-                } catch (const std::exception& e) {
-                    warn("encoding {}: {}", p.string(), e.what());
-                }
-            }
-            // failed: shown as it is
-        }
-        bool taggable = ext == "flac" || ext == "mp3" || ext == "m4a" || ext == "dsf";
-        VFilePtr vf;
-        const Cover* cv = sc && taggable && ext != "m4a" ? covers.get(sc->cover_for(n.name, nullptr)) : nullptr;
-        if (sc && taggable && (!sc->album.empty() || sc->file(n.name) || cv)) {
-            Tags ov = sc->album;
-            if (auto f = sc->file(n.name)) ov.merge(*f);  // keeps removals for retag_file
-            try {
-                vf = retag_file(p, ext, ov, cv);
-            } catch (const std::exception& e) {
-                warn("retag {}: {}", p.string(), e.what());
-            }
-        }
-        bool retagged = vf != nullptr;
-        if (!vf) vf = std::make_shared<Passthrough>(p, n.size);
-        int64_t mt = taggable ? std::max(n.mtime, sidecar_mtime.value_or(n.mtime)) : n.mtime;
-        if (retagged) mt = std::max({mt, OUTPUT_EPOCH_NS, cv ? cv->mtime : 0});
-        Entry e{n.name, false, {}, vf, mt};
-        if (taggable) e.tag_section = "file", e.tag_key = n.name, e.tag_ext = ext;
-        entries.push_back(std::move(e));
-    }
-
-    // cover art exported into the sidecar tree
-    if (!has_cover && !virtuals.empty() && overlay) {
-        for (auto c : {"cover.jpg", "cover.png"}) {
-            fs::path p = *overlay / c;
-            struct stat st;
-            if (::stat(p.c_str(), &st) == 0) {
-                entries.push_back({c, false, {}, std::make_shared<Passthrough>(p, uint64_t(st.st_size)),
-                                   int64_t(st.st_mtim.tv_sec) * 1'000'000'000 + st.st_mtim.tv_nsec});
-                break;
-            }
-        }
-    }
-
-    // virtual tracks, de-duplicated against real names
-    std::set<std::string> taken;
-    for (auto& e : entries) taken.insert(e.name);
-    for (auto& v : virtuals) {
-        std::string name = v.name;
-        for (int i = 2; taken.contains(name); i++) {
-            auto dot = v.name.rfind('.');
-            std::string stem = dot == std::string::npos ? v.name : v.name.substr(0, dot);
-            std::string ext = dot == std::string::npos ? "" : v.name.substr(dot + 1);
-            name = std::format("{} ({}).{}", stem, i, ext);
-        }
-        v.name = name;
-        entries.push_back(std::move(v));
-    }
-    if (sc) std::erase_if(entries, [&](const Entry& e) { return sc->hides(e.name); });
-    std::sort(entries.begin(), entries.end(), [](auto& a, auto& b) { return a.name < b.name; });
+    add_image_groups(b);
+    add_sacd_isos(b);
+    for (auto& n : b.names)
+        if (!b.hidden.contains(n.name) && !is_ignored(n.name)) add_source_file(b, n);
+    add_overlay_cover(b);
+    merge_virtuals(b);
+    if (b.sc) std::erase_if(b.entries, [&](const Entry& e) { return b.sc->hides(e.name); });
+    std::sort(b.entries.begin(), b.entries.end(), [](auto& x, auto& y) { return x.name < y.name; });
 
     std::optional<int64_t> gen_time;
     {
@@ -793,16 +777,144 @@ std::shared_ptr<Listing> Library::build_listing(const fs::path& dir, const Sig& 
         if (auto it = generations_.find(dir); it != generations_.end()) gen_time = it->second.second;
     }
     auto l = std::make_shared<Listing>();
-    l->entries = std::move(entries);
+    l->entries = std::move(b.entries);
     l->mtime = max_mtime({sig.dir_mtime, sig.sidecar_mtime, sig.overlay_mtime, gen_time});
     for (auto& e : l->entries)
         if (!e.is_dir) l->mtime = std::max(l->mtime, e.mtime);
     l->sig = sig;
     l->checked = Clock::now();
-    l->retry_at = retry_at;
-    l->covers = std::move(covers.used);
-    (void)item;
+    l->retry_at = b.retry_at;
+    l->covers = std::move(b.covers.used);
     return l;
+}
+
+/// CUE + image groups: split into tracks once processed, hidden until then.
+void Library::add_image_groups(ListingBuild& b) {
+    auto groups = image_groups(b);
+    bool multi = groups.size() > 1;
+    for (size_t gi = 0; gi < groups.size(); gi++) {
+        auto& [cue_name, cue, img_name] = groups[gi];
+        fs::path img_path = b.dir / img_name;
+        if (b.incomplete(img_name)) {
+            b.hidden.insert(cue_name);
+            b.hidden.insert(img_name);
+            continue;
+        }
+        auto st = image_state(img_path, b.dir);
+        if (st.st == Work<ReadyImage>::Ready) {
+            DiscSlot disc{std::nullopt, multi, groups.size()};
+            if (auto d = cue.fields.find("DISCNUMBER"); d != cue.fields.end())
+                if (auto v = parse_u64(trim(split(d->second, '/')[0])); v && *v <= UINT32_MAX) disc.number = uint32_t(*v);
+            if (!disc.number && multi) disc.number = uint32_t(gi + 1);
+            try {
+                auto v = image_tracks(b, cue, *st.ready, disc, max_mtime({mtime_ns(b.dir / cue_name), mtime_ns(img_path), b.sidecar_mtime}));
+                b.hidden.insert(cue_name);
+                b.hidden.insert(img_name);
+                if (v)
+                    for (auto& e : *v) b.virtuals.push_back(std::move(e));
+            } catch (const std::exception& e) {
+                warn("splitting {}: {}", img_path.string(), e.what());
+            }
+        } else if (st.st == Work<ReadyImage>::Pending || st.st == Work<ReadyImage>::Settling) {
+            if (st.st == Work<ReadyImage>::Settling) b.settle_until(st.until);
+            b.hidden.insert(cue_name);
+            b.hidden.insert(img_name);
+        }
+        // Failed: leave cue + image visible as-is
+    }
+}
+
+/// SACD ISOs: DSF tracks once scanned, hidden until then.
+void Library::add_sacd_isos(ListingBuild& b) {
+    std::vector<const DirItem*> isos;
+    for (auto& n : b.names)
+        if (n.is_file && ext_lower(n.name) == "iso" && !(b.sc && b.sc->hides(n.name))) isos.push_back(&n);
+    bool multi = isos.size() > 1;
+    for (size_t ii = 0; ii < isos.size(); ii++) {
+        const std::string& n = isos[ii]->name;
+        fs::path p = b.dir / n;
+        if (b.incomplete(n) || !is_sacd(p)) continue;
+        DiscSlot disc{multi ? std::optional<uint32_t>(uint32_t(ii + 1)) : std::nullopt, multi, isos.size()};
+        auto st = sacd_state(p, b.dir, false);
+        int64_t mt = max_mtime({mtime_ns(p), b.sidecar_mtime});
+        if (auto k = SrcKey::try_of(p)) mt = std::max(mt, mtime_ns(cache.sacd_frames_path(p, *k, false)).value_or(0));
+        if (st.st == Work<SacdDisc>::Ready) {
+            for (auto& e : sacd_tracks(b, st.ready, disc, mt, false)) b.virtuals.push_back(std::move(e));
+            b.hidden.insert(n);
+            if (cfg.sacd_multichannel) {
+                auto mc = sacd_state(p, b.dir, true);
+                if (mc.st == Work<SacdDisc>::Ready)
+                    for (auto& e : sacd_tracks(b, mc.ready, disc, mt, true)) b.virtuals.push_back(std::move(e));
+            }
+        } else if (st.st == Work<SacdDisc>::Pending || st.st == Work<SacdDisc>::Settling) {
+            if (st.st == Work<SacdDisc>::Settling) b.settle_until(st.until);
+            b.hidden.insert(n);
+        }
+    }
+}
+
+/// A file or folder of the source folder that no image or ISO accounts for.
+void Library::add_source_file(ListingBuild& b, const DirItem& n) {
+    fs::path p = b.dir / n.name;
+    if (n.is_dir) {
+        b.entries.push_back(Entry::make_dir(n.name, p, n.mtime));
+        return;
+    }
+    if (is_cover_name(n.name)) b.has_cover = true;
+    std::string ext = ext_lower(n.name);
+    if ((ext == "ape" || ext == "wv" || ext == "tta" || ext == "tak") && add_standalone(b, n)) return;
+    bool taggable = ext == "flac" || ext == "mp3" || ext == "m4a" || ext == "dsf";
+    VFilePtr vf;
+    const Cover* cv = b.sc && taggable && ext != "m4a" ? b.covers.get(b.sc->cover_for(n.name, nullptr)) : nullptr;
+    if (b.sc && taggable && (!b.sc->album.empty() || b.sc->file(n.name) || cv)) {
+        Tags ov = b.sc->album;
+        if (auto f = b.sc->file(n.name)) ov.merge(*f);  // keeps removals for retag_file
+        try {
+            vf = retag_file(p, ext, ov, cv);
+        } catch (const std::exception& e) {
+            warn("retag {}: {}", p.string(), e.what());
+        }
+    }
+    bool retagged = vf != nullptr;
+    if (!vf) vf = std::make_shared<Passthrough>(p, n.size);
+    int64_t mt = taggable ? std::max(n.mtime, b.sidecar_mtime.value_or(n.mtime)) : n.mtime;
+    if (retagged) mt = output_mtime(mt, cv);
+    if (taggable) b.entries.push_back(Entry::make_tagged(n.name, vf, mt, EDIT_FILE, n.name, ext));
+    else b.entries.push_back(Entry::make_file(n.name, vf, mt));
+}
+
+// Standalone tracks in formats players and taggers handle poorly are served as
+// FLAC encoded on the fly, like the tracks of such images; floating-point
+// WavPack, which FLAC cannot hold, as it is with the sidecar's tags.
+bool Library::add_standalone(ListingBuild& b, const DirItem& n) {
+    if (b.incomplete(n.name)) return true;
+    fs::path p = b.dir / n.name;
+    auto st = image_state(p, b.dir);
+    if (st.st == Work<ReadyImage>::Pending) return true;
+    if (st.st == Work<ReadyImage>::Settling) {
+        b.settle_until(st.until);
+        return true;
+    }
+    if (st.st != Work<ReadyImage>::Ready) return false;  // failed: shown as it is
+    if (st.ready->wv) {
+        Tags tg = st.ready->source_tags;
+        if (b.sc) {
+            tg.overlay(b.sc->album);
+            if (auto f = b.sc->file(n.name)) tg.overlay(*f);
+        }
+        const Cover* cv = b.sc ? b.covers.get(b.sc->cover_for(n.name, nullptr)) : nullptr;
+        int64_t mt = output_mtime(std::max(n.mtime, b.sidecar_mtime.value_or(0)), cv);
+        b.entries.push_back(Entry::make_tagged(n.name, retag_wavpack(*st.ready->wv, tg, cv), mt, EDIT_FILE, n.name, "wv"));
+        return true;
+    }
+    if (!st.ready->av) return false;
+    try {
+        if (auto e = standalone_track(b, n.name, *st.ready, max_mtime({n.mtime, b.sidecar_mtime}))) b.virtuals.push_back(std::move(*e));
+        return true;  // shown once measured
+    } catch (const std::exception& e) {
+        warn("encoding {}: {}", p.string(), e.what());
+        return false;
+    }
 }
 
 std::optional<std::vector<TrackLayout>> Library::track_layouts(const std::shared_ptr<const AvImage>& av, const Ranges& ranges, const fs::path& dir) {
@@ -827,50 +939,45 @@ std::optional<std::vector<TrackLayout>> Library::track_layouts(const std::shared
     return layout;
 }
 
-const Cover* Library::CoverSet::get(const std::string* spec) {
-    if (!spec) return nullptr;
-    auto it = loaded.find(*spec);
-    if (it == loaded.end()) {
-        fs::path p = *spec;
-        if (p.is_relative()) {
-            if (covers_dir.empty()) {
-                warn("cover {}: a relative path needs --covers-dir", *spec);
-                loaded.emplace(*spec, std::nullopt);
-                return nullptr;
-            }
-            p = covers_dir / p;
-        }
-        used.emplace_back(p, mtime_ns(p));
-        it = loaded.emplace(*spec, prepare_cover(p, cache_dir)).first;  // a missing or bad image keeps the original pictures
+int64_t Library::results_mtime(const ReadyImage& ready, const Ranges& ranges) const {
+    // the content changes when processing results land (layout, MD5s): make that
+    // visible in the timestamps, also across restarts of this process
+    auto newest = [](std::initializer_list<fs::path> files) {
+        int64_t m = 0;
+        for (auto& f : files) m = std::max(m, mtime_ns(f).value_or(0));
+        return m;
+    };
+    if (ready.av) {
+        auto k = SrcKey::of(ready.av->path);
+        return newest({cache.av_index_path(ready.av->path, k), layout_path(*ready.av, ranges, cache)});
     }
-    return it->second ? &*it->second : nullptr;
+    if (ready.wv) {
+        auto k = SrcKey::of(ready.wv->path);
+        return newest({cache.wv_index_path(ready.wv->path, k), wv_layout_path(*ready.wv, ranges, cache)});
+    }
+    if (auto k = SrcKey::try_of(ready.flac->path)) return newest({cache.idx_path(ready.flac->path, *k), cache.md5_path(ready.flac->path, *k)});
+    return 0;
 }
 
-std::optional<Entry> Library::standalone_track(const fs::path& dir, const std::string& src_name, const ReadyImage& ready, const Sidecar* sidecar,
-                                               int64_t mt, CoverSet& covers) {
+std::optional<Entry> Library::standalone_track(ListingBuild& b, const std::string& src_name, const ReadyImage& ready, int64_t mt) {
     auto& av = ready.av;
     Ranges ranges = {{0, av->total}};
-    auto layout = track_layouts(av, ranges, dir);
+    auto layout = track_layouts(av, ranges, b.dir);
     if (!layout) return std::nullopt;
     std::string name = stem_of(src_name) + ".flac";
     Tags tg = ready.source_tags;
-    if (sidecar) {
-        tg.overlay(sidecar->album);
-        if (auto f = sidecar->file(name)) tg.overlay(*f);
+    if (b.sc) {
+        tg.overlay(b.sc->album);
+        if (auto f = b.sc->file(name)) tg.overlay(*f);
     }
-    auto k = SrcKey::of(av->path);
-    mt = std::max({mt, mtime_ns(cache.av_index_path(av->path, k)).value_or(0), mtime_ns(layout_path(*av, ranges, cache)).value_or(0), OUTPUT_EPOCH_NS});
+    const Cover* cv = b.sc ? b.covers.get(b.sc->cover_for(name, nullptr)) : nullptr;
     std::vector<flac::HeaderBlock> pictures;
-    if (auto* cv = sidecar ? covers.get(sidecar->cover_for(name, nullptr)) : nullptr) {
-        pictures.push_back({flac::BLOCK_PICTURE, flac_picture(*cv)});
-        mt = std::max(mt, cv->mtime);
-    }
-    return Entry{name, false, {}, std::make_shared<EncodedTrack>(av, 0, av->total, tg, (*layout)[0], pictures), mt, "file", name, "flac"};
+    if (cv) pictures.push_back({flac::BLOCK_PICTURE, flac_picture(*cv)});
+    mt = output_mtime(std::max(mt, results_mtime(ready, ranges)), cv);
+    return Entry::make_tagged(name, std::make_shared<EncodedTrack>(av, 0, av->total, tg, (*layout)[0], pictures), mt, EDIT_FILE, name, "flac");
 }
 
-std::optional<std::vector<Entry>> Library::image_tracks(const fs::path& dir, const CueSheet& cue, const ReadyImage& ready,
-                                                        std::optional<uint32_t> disc, bool multi, size_t ndiscs, const Sidecar* sidecar, int64_t mt,
-                                                        CoverSet& covers) {
+std::optional<std::vector<Entry>> Library::image_tracks(ListingBuild& b, const CueSheet& cue, const ReadyImage& ready, const DiscSlot& disc, int64_t mt) {
     auto& img = ready.flac;
     uint32_t rate = img ? img->si().sample_rate : ready.wv ? ready.wv->sample_rate : ready.av->sample_rate;
     uint64_t total = img ? img->si().total_samples : ready.wv ? ready.wv->total : ready.av->total;
@@ -879,14 +986,14 @@ std::optional<std::vector<Entry>> Library::image_tracks(const fs::path& dir, con
     Tags base = ready.source_tags.without_track_specific();
     base.overlay(from_cue_disc(cue.fields));
     size_t ntracks = cue.tracks.size();
-    std::vector<std::pair<uint64_t, uint64_t>> ranges;
+    Ranges ranges;
     for (size_t i = 0; i < ntracks; i++) {
         uint64_t e = i + 1 < ntracks ? cue.tracks[i + 1].index01 * spf : total;
         ranges.emplace_back(cue.tracks[i].index01 * spf, std::min(e, total));
     }
     std::optional<std::vector<TrackLayout>> layout;
     if (ready.av) {
-        layout = track_layouts(ready.av, ranges, dir);
+        layout = track_layouts(ready.av, ranges, b.dir);
         if (!layout) return std::nullopt;
     }
     std::vector<WvLayout> wv_layout;
@@ -899,107 +1006,63 @@ std::optional<std::vector<Entry>> Library::image_tracks(const fs::path& dir, con
             std::lock_guard g(mu_);
             fresh = md5_queued_.insert(img->path).second;
         }
-        if (fresh && !enqueue(Md5Job{img, ranges, dir})) {
+        if (fresh && !enqueue(Md5Job{img, ranges, b.dir})) {
             std::lock_guard g(mu_);
             md5_queued_.erase(img->path);
         }
     }
-    // the content changes when processing results land (layout, MD5s): make that
-    // visible in the timestamps, also across restarts of this process
-    if (ready.av) {
-        auto k = SrcKey::of(ready.av->path);
-        mt = std::max({mt, mtime_ns(cache.av_index_path(ready.av->path, k)).value_or(0), mtime_ns(layout_path(*ready.av, ranges, cache)).value_or(0)});
-    } else if (ready.wv) {
-        auto k = SrcKey::of(ready.wv->path);
-        mt = std::max({mt, mtime_ns(cache.wv_index_path(ready.wv->path, k)).value_or(0), mtime_ns(wv_layout_path(*ready.wv, ranges, cache)).value_or(0)});
-    } else if (auto k = SrcKey::try_of(img->path)) {
-        mt = std::max({mt, mtime_ns(cache.idx_path(img->path, *k)).value_or(0), mtime_ns(cache.md5_path(img->path, *k)).value_or(0)});
-    }
-    mt = std::max(mt, OUTPUT_EPOCH_NS);
+    mt = output_mtime(std::max(mt, results_mtime(ready, ranges)), nullptr);
+    std::string ext = ready.wv ? "wv" : "flac";
     std::vector<Entry> out;
     for (size_t i = 0; i < ntracks; i++) {
         const auto& t = cue.tracks[i];
-        if (sidecar && sidecar->hides_track(multi ? disc : std::nullopt, t.number)) continue;
+        if (b.sc && b.sc->hides_track(disc.keyed(), t.number)) continue;
         auto [s, e] = ranges[i];
         WM_ENSURE(s < e, "track {} starts beyond the end of the image", t.number);
         Tags tg = base;
         tg.overlay(from_cue_track(t.fields));
-        tg.set("TRACKNUMBER", std::to_string(t.number));
-        tg.set("TRACKTOTAL", std::to_string(ntracks));
-        if (disc) {
-            tg.set("DISCNUMBER", std::to_string(*disc));
-            if (multi) tg.set("DISCTOTAL", std::to_string(ndiscs));
-        }
+        set_position(tg, disc, t.number, ntracks);
         if (!tg.get("ARTIST"))
             if (auto aa = tg.get_all("ALBUMARTIST")) tg.set_many("ARTIST", *aa);
-        if (sidecar) {
-            tg.overlay(sidecar->album);
-            if (auto tt = sidecar->track(multi ? disc : std::nullopt, t.number)) tg.overlay(*tt);
-        }
-        auto title_v = tg.get("TITLE");
-        std::string title = title_v ? sanitize_name(*title_v) : std::format("Track {:02}", t.number);
-        std::string ext = ready.wv ? "wv" : "flac";
-        std::string name = multi && disc ? std::format("{}-{:02} - {}.{}", *disc, t.number, title, ext) : std::format("{:02} - {}.{}", t.number, title, ext);
-        if (sidecar)
-            if (auto pinned = sidecar->track_name(multi ? disc : std::nullopt, t.number)) name = *pinned;
-        if (sidecar)
-            if (auto ft = sidecar->file(name)) tg.overlay(*ft);
-        std::string key = multi && disc ? std::format("{}-{:02}", *disc, t.number) : std::to_string(t.number);
-        // a sidecar cover replaces the image's picture
-        const Cover* cv = sidecar ? covers.get(sidecar->cover_for(name, &key)) : nullptr;
-        int64_t tmt = cv ? std::max(mt, cv->mtime) : mt;
+        overlay_sidecar_track(tg, b.sc, disc, t.number);
+        auto [name, key, cv] = name_track(b, tg, disc, t.number, "", ext, true);
+        VFilePtr vf;
         if (ready.wv) {
-            out.push_back({name, false, {}, std::make_shared<WvTrack>(ready.wv, s, e, tg, wv_layout[i], cv), tmt, "track", key, "wv"});
-            continue;
+            vf = std::make_shared<WvTrack>(ready.wv, s, e, tg, wv_layout[i], cv);
+        } else {
+            // a sidecar cover replaces the image's picture
+            std::vector<flac::HeaderBlock> cover_block;
+            if (cv) cover_block.push_back({flac::BLOCK_PICTURE, flac_picture(*cv)});
+            if (ready.av) {
+                vf = std::make_shared<EncodedTrack>(ready.av, s, e, tg, (*layout)[i], cover_block);
+            } else {
+                std::optional<std::array<uint8_t, 16>> md5;
+                if (auto it = md5s.find({s, e}); it != md5s.end()) md5 = it->second;
+                vf = std::make_shared<FlacTrack>(img, s, e, tg, cv ? cover_block : ready.pictures, md5);
+            }
         }
-        std::vector<flac::HeaderBlock> cover_block;
-        if (cv) cover_block.push_back({flac::BLOCK_PICTURE, flac_picture(*cv)});
-        if (ready.av) {
-            out.push_back({name, false, {}, std::make_shared<EncodedTrack>(ready.av, s, e, tg, (*layout)[i], cover_block), tmt, "track", key, "flac"});
-            continue;
-        }
-        std::optional<std::array<uint8_t, 16>> md5;
-        if (auto it = md5s.find({s, e}); it != md5s.end()) md5 = it->second;
-        out.push_back({name, false, {}, std::make_shared<FlacTrack>(img, s, e, tg, cv ? cover_block : ready.pictures, md5), tmt, "track", key, "flac"});
+        out.push_back(Entry::make_tagged(std::move(name), std::move(vf), output_mtime(mt, cv), EDIT_TRACK, std::move(key), ext));
     }
     return out;
 }
 
-std::vector<Entry> Library::sacd_tracks(const std::shared_ptr<const SacdDisc>& disc, std::optional<uint32_t> disc_no, size_t ndiscs,
-                                        const Sidecar* sidecar, int64_t mt, bool mc, CoverSet& covers) {
-    size_t n = disc->tracks.size();
-    mt = std::max(mt, OUTPUT_EPOCH_NS);
+std::vector<Entry> Library::sacd_tracks(ListingBuild& b, const std::shared_ptr<const SacdDisc>& sacd, const DiscSlot& disc, int64_t mt, bool mc) {
+    size_t n = sacd->tracks.size();
     std::vector<Entry> out;
     for (size_t i = 0; i < n; i++) {
         uint32_t num = uint32_t(i + 1);
-        if (sidecar && sidecar->hides_track(disc_no, num)) continue;
-        Tags tg = disc->track_tags(i);
-        tg.set("TRACKNUMBER", std::to_string(num));
-        tg.set("TRACKTOTAL", std::to_string(n));
-        if (disc_no) {
-            tg.set("DISCNUMBER", std::to_string(*disc_no));
-            tg.set("DISCTOTAL", std::to_string(ndiscs));
-        }
-        if (sidecar) {
-            tg.overlay(sidecar->album);
-            if (auto tt = sidecar->track(disc_no, num)) tg.overlay(*tt);
-        }
+        if (b.sc && b.sc->hides_track(disc.keyed(), num)) continue;
+        Tags tg = sacd->track_tags(i);
+        set_position(tg, disc, num, n);
+        overlay_sidecar_track(tg, b.sc, disc, num);
         if (mc) {
             // a separate album in music servers, e.g. "Pictures at an Exhibition (Multichannel)"
             auto a = tg.get("ALBUM");
             tg.set("ALBUM", (a ? *a : std::string("SACD")) + " (Multichannel)");
         }
-        auto title_v = tg.get("TITLE");
-        std::string title = title_v ? sanitize_name(*title_v) : std::format("Track {:02}", num);
-        std::string prefix = mc ? "MC " : "";
-        std::string name = disc_no ? std::format("{}{}-{:02} - {}.dsf", prefix, *disc_no, num, title) : std::format("{}{:02} - {}.dsf", prefix, num, title);
-        if (sidecar && !mc)
-            if (auto pinned = sidecar->track_name(disc_no, num)) name = *pinned;
-        if (sidecar)
-            if (auto ft = sidecar->file(name)) tg.overlay(*ft);
-        std::string key = disc_no ? std::format("{}-{:02}", *disc_no, num) : std::to_string(num);
-        const Cover* cv = sidecar ? covers.get(sidecar->cover_for(name, &key)) : nullptr;
-        out.push_back({name, false, {}, std::make_shared<DsfTrack>(disc, i, tg, cv), cv ? std::max(mt, cv->mtime) : mt, "track", key, "dsf"});
+        // pinned names are the stereo tracks': the multichannel ones keep theirs
+        auto [name, key, cv] = name_track(b, tg, disc, num, mc ? "MC " : "", "dsf", !mc);
+        out.push_back(Entry::make_tagged(std::move(name), std::make_shared<DsfTrack>(sacd, i, tg, cv), output_mtime(mt, cv), EDIT_TRACK, std::move(key), "dsf"));
     }
     return out;
 }
