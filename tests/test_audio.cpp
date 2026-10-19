@@ -256,3 +256,59 @@ TEST(encode_frames_matches_one_encoder_per_frame) {
         }
     }
 }
+
+// ---- decoded images encoded on the fly
+
+#include "avimage.hpp"
+#include "cache.hpp"
+#include "encoded.hpp"
+
+namespace {
+
+/// A WAV image made by ffmpeg (decoded through libav like APE etc.); returns its PCM.
+Bytes make_wav(const fs::path& out, uint32_t rate, size_t ch, size_t total) {
+    Bytes pcm = raw_pcm(signal(total, ch, 16), 16);
+    fs::path raw = out.parent_path() / "in.raw";
+    atomic_write(raw, pcm);
+    auto st = run({"ffmpeg", "-v", "error", "-y", "-f", "s16le", "-ar", std::to_string(rate), "-ac", std::to_string(ch), "-i", raw.string(), out.string()});
+    CHECK_MSG(st.ok(), "ffmpeg encode: {}", st.err);
+    return pcm;
+}
+
+}  // namespace
+
+TEST(encoded_layouts_carry_the_encoder_fingerprint) {
+    TmpDir dir("layout");
+    fs::path img = dir.path / "img.wav";
+    make_wav(img, 44100, 2, 44100 * 2);
+    Cache cache(dir.path / "cache");
+    auto av = AvImage::open(img, &cache);
+    Ranges ranges = {{0, 30000}, {30000, av->total}};
+    auto built = build_layout(*av, ranges, &cache);
+    fs::path file = layout_path(*av, ranges, cache);
+    CHECK(built[0].file && *built[0].file == file);
+    Bytes stored = read_file(file);
+    CHECK(std::equal(encoder_fingerprint().begin(), encoder_fingerprint().end(), stored.begin() + 8));
+    auto same = [&](const std::optional<std::vector<TrackLayout>>& l) {
+        return l && l->size() == 2 && (*l)[0].frame_sizes == built[0].frame_sizes && (*l)[1].md5 == built[1].md5;
+    };
+    CHECK(same(load_layout(*av, ranges, cache)));
+    // measured by an encoder that encodes differently: measure again
+    Bytes other = stored;
+    other[8] ^= 1;
+    atomic_write(file, other);
+    CHECK(!load_layout(*av, ranges, cache));
+    // stored before fingerprints: trusted as it is
+    Bytes legacy(std::begin("WMENC001"), std::end("WMENC001") - 1);
+    legacy.insert(legacy.end(), stored.begin() + 24, stored.end());
+    atomic_write(file, legacy);
+    CHECK(same(load_layout(*av, ranges, cache)));
+
+    // a frame that does not encode to its measured size drops the layout
+    auto wrong = *load_layout(*av, ranges, cache);
+    wrong[0].frame_sizes[2] += 1;
+    wrong[0].frame_sizes[3] -= 1;
+    EncodedTrack tr(av, ranges[0].first, ranges[0].second, Tags{}, wrong[0]);
+    CHECK_THROWS(tr.read_at(0, size_t(tr.size())));
+    CHECK(!fs::exists(file));
+}
