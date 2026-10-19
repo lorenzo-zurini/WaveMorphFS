@@ -110,7 +110,8 @@ Bytes concat(const std::vector<Seg>& segs) {
 }  // namespace
 
 TEST(float_wavpack_image_split_by_blocks) {
-    fs::path dir = fs::temp_directory_path() / std::format("wm-wv-{}", ::getpid());
+    wmtest::TempDir tmp("wm-wv");
+    fs::path dir = tmp.path();
     fs::path src = dir / "lib" / "Album", single = dir / "lib" / "Single";
     fs::create_directories(src);
     fs::create_directories(single);
@@ -197,7 +198,6 @@ TEST(float_wavpack_image_split_by_blocks) {
         auto t = read_file_tags("wv", [&](uint64_t o, size_t len) { return e.file->read_at(o, len); }, e.file->size());
         CHECK(t.get("TITLE") && *t.get("TITLE") == "Solo" && t.get("ALBUM") && *t.get("ALBUM") == "Album X");
     }
-    fs::remove_all(dir);
 }
 
 TEST(wavpack_block_numbers_as_libwavpack_stores_them) {
@@ -219,7 +219,8 @@ TEST(wavpack_block_numbers_as_libwavpack_stores_them) {
 }
 
 TEST(float_wavpack_multichannel_tracks_at_block_edges) {
-    fs::path dir = fs::temp_directory_path() / std::format("wm-wv-mc-{}", ::getpid());
+    wmtest::TempDir tmp("wm-wv-mc");
+    fs::path dir = tmp.path();
     fs::path src = dir / "lib" / "Album";
     fs::create_directories(src);
     // four channels in two blocks per frame (pairs), the last two with identities
@@ -260,5 +261,4 @@ TEST(float_wavpack_multichannel_tracks_at_block_edges) {
             CHECK_MSG(e.file->read_at(o, 3000) == Bytes(whole.begin() + ptrdiff_t(o), whole.begin() + ptrdiff_t(std::min<uint64_t>(o + 3000, whole.size()))),
                       "track {}: read at {}", t + 1, o);
     }
-    fs::remove_all(dir);
 }
