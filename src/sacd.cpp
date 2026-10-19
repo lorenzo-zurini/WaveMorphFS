@@ -318,7 +318,10 @@ std::shared_ptr<SacdDisc> SacdDisc::open(const fs::path& path, const Cache* cach
     }
     album.set("MEDIA", "SACD");
 
-    uint64_t needed = disc->tracks.back().end;
+    // frames up to the end of the track ending last (the TOC does not promise
+    // that this is the last track)
+    uint64_t needed = 0;
+    for (auto& t : disc->tracks) needed = std::max(needed, t.end);
     auto key = SrcKey::of(path);
     std::optional<SacdFrames> frames;
     fs::path cp;
@@ -457,6 +460,7 @@ std::shared_future<SacdDisc::Chunk> SacdDisc::start(uint64_t c, std::shared_ptr<
 void SacdDisc::fulfil(uint64_t c, std::promise<Chunk>& p) const {
     try {
         uint64_t f0 = c * CHUNK_FRAMES, f1 = std::min<uint64_t>((c + 1) * CHUNK_FRAMES, frames_.size() - 1);
+        WM_ENSURE(f0 < f1, "internal: chunk {} is past the area's {} frames", c, frames_.size() - 1);
         p.set_value(std::make_shared<const std::vector<Bytes>>(read_frames(f0, f1)));
     } catch (...) {
         p.set_exception(std::current_exception());
@@ -551,6 +555,7 @@ void DsfTrack::read_data(uint64_t a, uint64_t b, Bytes& out) const {
                 have_chunk = k;
             }
             const Bytes& src = (*data)[size_t(c)];
+            WM_ENSURE(off < src.size(), "internal: byte {} of a {}-byte chunk", off, src.size());
             uint64_t n = std::min({run, uint64_t(src.size()) - off, bytes_per_ch_ - jj});
             const uint8_t* s = src.data() + off;
             for (uint64_t x = 0; x < n; x++) dst[x] = BITREV[s[x]];

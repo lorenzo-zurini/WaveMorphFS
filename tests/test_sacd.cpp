@@ -285,3 +285,15 @@ TEST(sacd_short_final_frame_before_a_broken_sector) {
     std::fill(frames.back().begin() + 5000, frames.back().end(), 0x69);
     check_dsf(disc, 0, a, expected_dsf_audio(frames, 0, 12, 2));
 }
+
+TEST(sacd_track_list_not_ending_with_the_last_track) {
+    // the TOC's last track need not end last: every track must still be served
+    Dir d;
+    Area a;
+    a.frames = dsd_frames(30, 2, 4);
+    a.tracks = {{0, 30}, {10, 20}};
+    fs::path iso = d.path / "disc.iso";
+    atomic_write(iso, make_iso(a, std::nullopt));
+    auto disc = SacdDisc::open(iso, nullptr, false);
+    for (size_t t = 0; t < 2; t++) check_dsf(disc, t, a, expected_dsf_audio(a.frames, a.tracks[t].first, a.tracks[t].second, 2));
+}
