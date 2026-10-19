@@ -135,8 +135,9 @@ Two things can look like a change but aren't:
   are usually a little larger than the APE file. DSF has no compression, so DST
   discs come out larger than the ISO. In both cases the decoded audio is the
   same.
-- **Cover art.** The only thing ever scaled down is a picture you add with
-  `_cover`: images over 1024 px or 2 MB are resized once. Pictures already
+- **Cover art.** The only thing ever scaled down is a cover you add (with
+  `_cover` or by embedding it on the mount): images over 1024 px or 2 MB are
+  resized once. Pictures already
   inside your files are passed through as they are.
 
 ## Quick start with Docker
