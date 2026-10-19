@@ -145,7 +145,8 @@ Bytes encode_frame(const std::vector<std::span<const int32_t>>& chans, uint32_t 
 std::vector<std::vector<int32_t>> decode_frame(std::span<const uint8_t> frame, uint32_t bps, uint32_t sample_rate);
 
 /// Decode a whole FLAC file, calling `sink(first_sample, per-channel samples)` per
-/// frame. Decoder complaints after `expected` samples (trailing tags) are ignored.
+/// frame. Fails unless `expected` samples decode cleanly; decoder complaints after
+/// them (trailing tags) are ignored.
 void decode_file(const fs::path& p, uint64_t expected, const std::function<void(uint64_t, const std::vector<std::span<const int32_t>>&)>& sink);
 
 }  // namespace wm::flac

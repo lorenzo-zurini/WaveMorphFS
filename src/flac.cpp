@@ -661,6 +661,7 @@ struct FileSink {
     const std::function<void(uint64_t, const std::vector<std::span<const int32_t>>&)>* sink;
     uint64_t pos = 0;
     std::string error;
+    uint64_t error_at = UINT64_MAX;  // sample position of the first decoder complaint
     std::string exception;
 };
 
@@ -680,7 +681,10 @@ FLAC__StreamDecoderWriteStatus file_write(const FLAC__StreamDecoder*, const FLAC
 
 void file_error(const FLAC__StreamDecoder*, FLAC__StreamDecoderErrorStatus st, void* cd) {
     auto* s = static_cast<FileSink*>(cd);
-    if (s->error.empty()) s->error = FLAC__StreamDecoderErrorStatusString[st];
+    if (s->error.empty()) {
+        s->error = FLAC__StreamDecoderErrorStatusString[st];
+        s->error_at = s->pos;
+    }
 }
 }  // namespace
 
@@ -694,8 +698,10 @@ void decode_file(const fs::path& p, uint64_t expected, const std::function<void(
     bool ok = FLAC__stream_decoder_process_until_end_of_stream(dec.d);
     FLAC__stream_decoder_finish(dec.d);
     if (!s.exception.empty()) throw Error(s.exception);
-    if (s.pos >= expected) return;
-    WM_ENSURE(ok && s.error.empty(), "decoding {}: {}", p.string(), s.error.empty() ? "decoder failed" : s.error);
+    // libFLAC reports a frame with a bad CRC and then delivers it as silence, so
+    // reaching `expected` samples proves nothing: only complaints past it are fine
+    if (s.error_at < expected) fail("decoding {}: {} at sample {}", p.string(), s.error, s.error_at);
+    WM_ENSURE(s.pos >= expected, "decoding {}: {} of {} samples ({})", p.string(), s.pos, expected, ok ? "early end of stream" : "decoder failed");
 }
 
 }  // namespace wm::flac
