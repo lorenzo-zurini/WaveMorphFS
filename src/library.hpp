@@ -152,6 +152,10 @@ public:
     std::shared_ptr<const Listing> list_dir(const fs::path& dir);
     /// A directory of the mount by its path ("" = the mount root, "Music/Artist").
     std::shared_ptr<const VListing> list_vdir(const std::string& vpath);
+    /// The entry `name` of mount directory `vpath`, copied. Another thread may
+    /// replace the cached listing at any moment, so nothing may keep a pointer
+    /// into a listing it no longer holds.
+    std::optional<VEntry> lookup(const std::string& vpath, std::string_view name);
     /// Re-read "_target"s from the tags tree (rate-limited unless forced).
     void refresh_placements(bool force = false);
     /// Root this source path belongs to and the path relative to it.

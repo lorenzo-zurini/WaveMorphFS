@@ -171,6 +171,12 @@ std::shared_ptr<const VListing> Library::list_vdir(const std::string& vpath) {
     return l;
 }
 
+std::optional<VEntry> Library::lookup(const std::string& vpath, std::string_view name) {
+    auto l = list_vdir(vpath);
+    auto* ve = l->find(name);
+    return ve ? std::optional<VEntry>(*ve) : std::nullopt;
+}
+
 std::shared_ptr<VListing> Library::build_vlisting(const std::string& vpath, const std::shared_ptr<const Placements>& pp) {
     const Placements& p = *pp;
     auto out = std::make_shared<VListing>();

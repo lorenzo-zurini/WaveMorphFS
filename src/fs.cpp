@@ -69,7 +69,7 @@ std::optional<Node> resolve(const char* path) {
         last = c;
     }
     if (last.empty()) return Node{Node::Root, {}, nullptr, g_started};
-    auto* ve = g_lib->list_vdir(parent)->find(last);
+    auto ve = g_lib->lookup(parent, last);
     if (!ve) return std::nullopt;
     auto& e = ve->e;
     if (e.is_dir) {
