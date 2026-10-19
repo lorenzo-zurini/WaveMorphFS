@@ -270,7 +270,7 @@ void atomic_write(const fs::path& p, std::span<const uint8_t> data) {
 std::optional<int64_t> mtime_ns(const fs::path& p) {
     struct stat st;
     if (::stat(p.c_str(), &st) != 0) return std::nullopt;
-    return int64_t(st.st_mtim.tv_sec) * 1'000'000'000 + st.st_mtim.tv_nsec;
+    return ns_of(st.st_mtim);
 }
 
 int64_t now_ns() {
@@ -278,15 +278,14 @@ int64_t now_ns() {
 }
 
 SrcKey SrcKey::of(const fs::path& p) {
-    struct stat st;
-    if (::stat(p.c_str(), &st) != 0) fail("stat {}: {}", p.string(), std::strerror(errno));
-    return {uint64_t(st.st_size), int64_t(st.st_mtim.tv_sec) * 1'000'000'000 + st.st_mtim.tv_nsec};
+    if (auto k = try_of(p)) return *k;
+    fail("stat {}: {}", p.string(), std::strerror(errno));
 }
 
 std::optional<SrcKey> SrcKey::try_of(const fs::path& p) {
     struct stat st;
     if (::stat(p.c_str(), &st) != 0) return std::nullopt;
-    return SrcKey{uint64_t(st.st_size), int64_t(st.st_mtim.tv_sec) * 1'000'000'000 + st.st_mtim.tv_nsec};
+    return SrcKey{uint64_t(st.st_size), ns_of(st.st_mtim)};
 }
 
 // ---------------------------------------------------------------- worker pool

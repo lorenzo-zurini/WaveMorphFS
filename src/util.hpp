@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <ctime>
 #include <filesystem>
 #include <format>
 #include <functional>
@@ -115,6 +116,8 @@ void atomic_write(const fs::path& p, std::span<const uint8_t> data);
 inline void atomic_write(const fs::path& p, std::string_view s) { atomic_write(p, bytes_of(s)); }
 
 /// Modification time in ns since the epoch, if the path exists.
+/// st_mtim (or any timespec) as nanoseconds since the epoch.
+inline int64_t ns_of(const struct timespec& t) { return int64_t(t.tv_sec) * 1'000'000'000 + t.tv_nsec; }
 std::optional<int64_t> mtime_ns(const fs::path& p);
 int64_t now_ns();
 
