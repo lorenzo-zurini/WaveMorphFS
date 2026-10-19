@@ -132,6 +132,10 @@ struct HeaderBlock {
 };
 /// The same bytes as build_header, as segments.
 std::vector<Seg> header_segments(const std::array<uint8_t, 34>& si, const std::vector<HeaderBlock>& blocks);
+/// Body of a front-cover PICTURE block whose image is `image`, a range of the
+/// source file (e.g. AvImage::front_cover), referenced rather than copied. The
+/// dimensions are left 0 (unknown): players take them from the image itself.
+std::vector<Seg> picture_body(std::string_view mime, SrcRange image);
 
 /// Byte offsets of every frame of a fixed-blocksize FLAC image, built by a single
 /// sequential pass that verifies each frame's header CRC-8, frame number and

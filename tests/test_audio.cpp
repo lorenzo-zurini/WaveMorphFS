@@ -395,3 +395,63 @@ TEST(stitch_reads_only_what_each_piece_covers) {
     lazy.get(make);
     CHECK(made == 2);
 }
+
+#include "apetag.hpp"
+#include "cover.hpp"
+
+TEST(av_image_front_cover_from_apev2_becomes_a_picture) {
+    TmpDir dir("avcover");
+    fs::path png = dir.path / "cover.png", img = dir.path / "img.wv";
+    auto st = run({"ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "color=c=red:s=2x2", "-frames:v", "1", png.string()});
+    CHECK_MSG(st.ok(), "ffmpeg png: {}", st.err);
+    make_wav(dir.path / "src.wav", 44100, 2, 44100);
+    st = run({"ffmpeg", "-v", "error", "-y", "-i", (dir.path / "src.wav").string(), "-map_metadata", "-1", "-c:a", "wavpack", img.string()});
+    CHECK_MSG(st.ok(), "ffmpeg wv: {}", st.err);
+    // replace ffmpeg's APEv2 tag (it writes the encoder name) with one carrying the
+    // cover ("Cover Art (Front)": file name, NUL, image)
+    auto cover = load_cover(png);
+    CHECK(cover.has_value());
+    Tags tags;
+    tags.set("TITLE", "t");
+    Segments tag(ape::build(tags, &*cover, std::nullopt));
+    Bytes file = read_file(img), tag_bytes;
+    if (file.size() > 64 && std::memcmp(&file[file.size() - 32], "APETAGEX", 8) == 0) {
+        size_t footer = file.size() - 32;
+        bool header = file[footer + 23] & 0x80;
+        file.resize(file.size() - le32(&file[footer + 12]) - (header ? 32 : 0));
+    }
+    tag.read(img, 0, size_t(tag.size()), tag_bytes);
+    append(file, tag_bytes);
+    atomic_write(img, file);
+
+    auto av = AvImage::open(img, nullptr);
+    CHECK(av->front_cover.has_value() && av->front_cover_mime == "image/png");
+    Bytes want = read_file(png);
+    CHECK(File(img).read_vec(av->front_cover->off, size_t(av->front_cover->len)) == want);
+    Ranges ranges = {{0, av->total}};
+    auto layout = build_layout(*av, ranges, nullptr);
+    EncodedTrack tr(av, 0, av->total, tags, layout[0], {{flac::BLOCK_PICTURE, flac::picture_body(av->front_cover_mime, *av->front_cover)}});
+    fs::path out = dir.path / "t.flac";
+    atomic_write(out, whole(tr));
+    CHECK(run({"flac", "-t", "-s", out.string()}).ok());
+    fs::path got = dir.path / "got.png";
+    CHECK(run({"metaflac", "--export-picture-to=" + got.string(), out.string()}).ok());
+    CHECK(read_file(got) == want);
+}
+
+TEST(caches_are_filed_under_the_source_as_it_was_opened) {
+    // a source replaced while its tracks are measured: the sizes measured from the
+    // old audio must not be found for the new file
+    TmpDir dir("srckey");
+    fs::path img = dir.path / "img.wav";
+    make_wav(img, 44100, 2, 20000);
+    Cache cache(dir.path / "cache");
+    auto av = AvImage::open(img, &cache);
+    Ranges ranges = {{0, av->total}};
+    fs::last_write_time(img, fs::last_write_time(img) + std::chrono::seconds(5));
+    build_layout(*av, ranges, &cache);
+    CHECK(fs::exists(layout_path(*av, ranges, cache)));
+    auto now = AvImage::open(img, &cache);
+    CHECK(layout_path(*now, ranges, cache) != layout_path(*av, ranges, cache));
+    CHECK(!load_layout(*now, ranges, cache));
+}
