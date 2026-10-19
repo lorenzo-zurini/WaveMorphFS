@@ -28,13 +28,21 @@ developer briefing.
 
 ```
 src/
-  main.cpp       CLI: mount, ls, verify, compare, tags-init (hand-rolled parser)
-  fs.cpp         libfuse3 high-level API; path -> Library listing; writable mount (edits -> sidecars)
-  library.cpp    per-directory listing rules, background jobs, status.txt, apply_edit(), OUTPUT_EPOCH_NS
+  main.cpp       CLI: mount, ls, verify, compare, tags-init (command table, validated roots, --version)
+  fs.cpp         libfuse3 high-level API (every op through guarded()); path -> Library listing; writable
+                 mount (shared_ptr WriteSessions, edits -> sidecars, default_permissions)
+  library.cpp    per-directory listing rules (build_listing = ListingBuild steps), background jobs
+                 (measured<L>() for on-the-fly layouts, failures remembered per SrcKey), status.txt,
+                 apply_edit(), OUTPUT_EPOCH_NS
   flac.cpp       FLAC primitives: headers/CRCs, frame index, VERBATIM + libFLAC frame encode, libFLAC decode
   track.cpp      FlacTrack: split track of a fixed-blocksize FLAC image (frames copied, headers rewritten)
-  avimage.cpp    AvImage: non-FLAC images (APE/WV/TTA/...) decoded with libav; packet index; parallel read-ahead
-  encoded.cpp    EncodedTrack: tracks of an AvImage as compressed FLAC encoded per frame on the fly (layout index)
+  avimage.cpp    AvImage: non-FLAC images (APE/WV/TTA/...) decoded with libav; packet index; parallel read-ahead;
+                 the APEv2 front cover as a byte range
+  encoded.cpp    EncodedTrack: tracks of an AvImage as compressed FLAC encoded per frame on the fly (layout index
+                 carries an encoder fingerprint; legacy WMENC001 layouts trusted)
+  vfile.cpp      VFile, Passthrough, Segments/Spliced; stitch()/Piece and LazyBytes for tracks made of parts
+  futurelru.hpp  FutureLru: bounded cache of shared futures (decoded packets, encoded frames)
+  md5.cpp        MD5 + md5_pcm (STREAMINFO convention)
   wavpack.cpp    float WavPack (FLAC can't hold it): WvImage block index (libwavpack verify), WvTrack = copied blocks
                  (header + block checksum rewritten, WAV header/MD5 sub-blocks dropped) + re-encoded head/tail; retag_wavpack
   apetag.cpp     APEv2 reader/writer (WavPack tags; Track/Disc/Year/Album Artist mapped, other names as given)
@@ -49,10 +57,18 @@ src/
   tags.cpp       Tags model (case-insensitive keys keeping spelling), synonyms, cue mapping, sanitize_name
   cue.cpp charset.cpp  CUE parsing; charset detection via iconv + script/language scoring (no chardetng)
   cache.cpp      on-disk index cache names = md5(path\nsize\nmtime\nextra)[:16]
-  util.cpp       errors (wm::Error, WM_ENSURE, with_context), File/pread, atomic_write, logging, run(), worker pools
-tests/           tiny in-tree framework (TEST/CHECK); test_flac (splitting vs the flac tool), formats, tags
-docker/entrypoint.sh, Dockerfile (Debian trixie, builds + runs tests; PUID/PGID, /wavemorph defaults)
-.github/workflows/docker.yml  multi-arch (native amd64+arm64) image -> ghcr.io/<owner>/wavemorphfs
+  util.cpp       errors (wm::Error, WM_ENSURE, with_context), File/pread, atomic_write (fsync'd), logging, run(),
+                 worker pools, strict UTF-8
+  version.hpp.in generated version.hpp (WAVEMORPH_VERSION, set by CI from the tag)
+tests/           tiny in-tree framework (TEST/CHECK/TempDir, `--list`, name filter): test_flac, test_audio
+                 (FLAC/encoded paths vs the flac tool), test_wavpack, test_sacd (synthetic ISOs, DST vs FFmpeg),
+                 test_tags, test_tagformats (parsers incl. malformed input), test_library, test_fs (FUSE;
+                 skips without /dev/fuse), test_formats
+docker/entrypoint.sh, Dockerfile (Debian trixie, builds with -Werror + runs tests; runtime has only the libs;
+                 PUID/PGID, hands its own dirs to PUID, /wavemorph defaults)
+.github/workflows/docker.yml  ASan/UBSan job + multi-arch (native amd64+arm64) image -> ghcr.io/<owner>/wavemorphfs;
+                 a vX.Y.Z tag must match project(VERSION) and creates a GitHub release from CHANGELOG.md
+CHANGELOG.md, CONTRIBUTING.md, SECURITY.md  (keep CHANGELOG's "unreleased" section up to date)
 ```
 
 Key types: `VFile` (size + read_at + describe), `Entry` in a `Listing` (name,
@@ -75,7 +91,8 @@ file, mtime, tag_section/tag_key/tag_ext for edit routing).
   the optional block checksum (it covers the header). A track's first block is
   always re-encoded (it carries the stream config), as is a partial last block;
   libwavpack in the source's mode, single-threaded, so deterministic; sizes cached
-  per libwavpack version. Integer WavPack still goes the AvImage/FLAC route.
+  per libwavpack version and measured by a background job. Integer WavPack still
+  goes the AvImage/FLAC route.
 - **SACD**: master/area TOC, one scan records where each 1/75 s frame starts
   (cache .sacdidx). DSF output = byte de-interleave + bit reversal; DST decoded in
   8-frame chunks in parallel. Multichannel area optional (`--sacd-multichannel`).
@@ -105,8 +122,10 @@ file, mtime, tag_section/tag_key/tag_ext for edit routing).
 ## Build / test
 
 ```sh
-cmake -S . -B build -G Ninja && cmake --build build -j
+cmake -S . -B build -G Ninja -DWAVEMORPH_WERROR=ON && cmake --build build -j
 build/wavemorphfs-tests            # all; or a substring filter: build/wavemorphfs-tests decoded
+# before committing anything substantial, also the sanitizers:
+cmake -S . -B build-asan -G Ninja -DCMAKE_BUILD_TYPE=Debug -DWAVEMORPH_SANITIZE=address,undefined
 ```
 Deps: libfuse3, libFLAC, libwavpack, libavformat/libavcodec/libavutil/libswscale, nlohmann-json; `flac`
 and `ffmpeg` binaries for tests/verify. Warnings must stay at zero.
