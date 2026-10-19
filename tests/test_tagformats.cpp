@@ -103,6 +103,36 @@ const std::string& value(const Tags& t, std::string_view k) {
     return v ? *v : none;
 }
 
+Bytes ilst_item(std::string_view atom, uint32_t type, const Bytes& payload) {
+    Bytes d;
+    put_be32(d, type);
+    put_be32(d, 0);
+    append(d, payload);
+    return box(atom, {box("data", {d})});
+}
+
+Bytes freeform(std::string_view name, std::string_view v) {
+    return box("----", {box("mean", {Bytes(4, 0), B("com.apple.iTunes")}), box("name", {Bytes(4, 0), B(name)}),
+                        box("data", {Bytes{0, 0, 0, 1, 0, 0, 0, 0}, B(v)})});
+}
+
+/// A minimal M4A: ftyp, a moov holding just the item list, mdat.
+Bytes m4a(std::initializer_list<Bytes> items) {
+    Bytes meta = box("meta", {Bytes(4, 0), box("hdlr", {Bytes(25, 0)}), box("ilst", items)});
+    return cat({box("ftyp", {B("M4A "), Bytes(4, 0)}), box("moov", {box("udta", {meta})}), box("mdat", {B("AUDIO")})});
+}
+
+/// The tags of `file` retagged with `overlay`, read back.
+Tags m4a_retagged(const fs::path& dir, const Bytes& file, const Tags& overlay) {
+    fs::path p = dir / "t.m4a";
+    atomic_write(p, file);
+    auto r = mp4::retag_m4a(p, overlay);
+    Bytes out(file.begin(), file.begin() + ptrdiff_t(r.moov_pos));
+    append(out, r.moov);
+    out.insert(out.end(), file.begin() + ptrdiff_t(r.moov_pos + r.moov_len), file.end());
+    return mp4::read_tags(reader_of(out), out.size());
+}
+
 }  // namespace
 
 TEST(utf8_ill_formed_sequences_become_replacement_characters) {
@@ -228,4 +258,86 @@ TEST(id3_tag_length_counts_the_footer) {
     Bytes v23 = {'I', 'D', '3', 3, 0, 0x10, 0, 0, 1, 0};
     CHECK(id3::tag_length(v23) == 138u);
     CHECK(!id3::tag_length(B("TAGxxxxxxx")) && !id3::tag_length(B("ID3")));
+}
+
+TEST(tag_fields_one_table_for_all_formats) {
+    CHECK(canonical_field("aART") == "ALBUMARTIST" && canonical_field("TPE2") == "ALBUMARTIST" && canonical_field("album artist") == "ALBUMARTIST");
+    CHECK(canonical_field("trkn") == "TRACKNUMBER" && canonical_field("DISK") == "DISCNUMBER" && canonical_field("Custom Tag") == "CUSTOM TAG");
+    CHECK(same_field("MIXARTIST", "remixer") && same_field("UNSYNCEDLYRICS", "LYRICS") && same_field("encodersettings", "encoder"));
+    CHECK(same_field("Custom", "CUSTOM") && !same_field("Custom", "Custom2"));
+    CHECK_MSG(!same_field("YEAR", "DATE") && !same_field("WORK", "GROUPING"), "fields sharing a frame stay fields of their own");
+    CHECK(id3_owner("TDRC")->name == "DATE" && id3_owner("TIT1")->name == "GROUPING" && field_spec("year")->id3 == "TDRC");
+    CHECK(mp4_owner("\u00A9wrk")->name == "WORK" && mp4_owner("\u00A9day")->name == "DATE" && !id3_owner("TXXX"));
+    CHECK(is_track_specific("TOTALTRACKS") && is_track_specific("unsyncedlyrics") && is_track_specific("Part") && !is_track_specific("ALBUM"));
+    CHECK(is_number_field("trkn") && is_number_field("TotalDiscs") && !is_number_field("TITLE"));
+}
+
+TEST(tag_numbers_fill_only_missing_fields) {
+    auto t = Tags::from_pairs({{"TRACKTOTAL", "12"}});
+    add_number(t, "TRACKNUMBER", "TRACKTOTAL", "3/12");
+    CHECK(value(t, "TRACKNUMBER") == "3" && t.get_all("TRACKTOTAL")->size() == 1);
+    add_number(t, "DISCNUMBER", "DISCTOTAL", " /2");
+    CHECK(!t.get("DISCNUMBER") && value(t, "DISCTOTAL") == "2");
+    std::string total = "12";
+    CHECK(join_number("3", &total) == "3/12" && join_number("3/9", &total) == "3/9" && join_number("3", nullptr) == "3");
+}
+
+TEST(id3_synonym_spellings_replace_the_frames_they_name) {
+    auto [src, len] = id3::parse_tag(id3::build(Tags::from_pairs({{"MusicBrainz Album Id", "old"}, {"ACOUSTID ID", "a"}})));
+    id3::apply(src.frames, Tags::from_pairs({{"MUSICBRAINZ_ALBUMID", "new"}}));
+    auto t = id3::read_tags(id3::serialize(src.frames));
+    CHECK_MSG(!t.m.contains("MusicBrainz Album Id") && *t.m.at("MUSICBRAINZ_ALBUMID").data() == "new", "one MusicBrainz album id, spelled as given");
+    CHECK(value(t, "ACOUSTID_ID") == "a");
+}
+
+TEST(id3_names_from_other_formats_go_to_their_frames) {
+    auto tag = id3::build(Tags::from_pairs({{"DISK", "2"}, {"trkn", "3/12"}, {"aART", "X"}, {"SORT_ALBUM", "S"}, {"\u00A9nam", "T"}}));
+    auto ids = frame_ids(id3::parse_tag(tag).first.frames);
+    std::sort(ids.begin(), ids.end());
+    CHECK_MSG((ids == std::vector<std::string>{"TIT2", "TPE2", "TPOS", "TRCK", "TSOA"}), "no TXXX, no TRKN frame");
+    auto t = id3::read_tags(tag);
+    CHECK(value(t, "DISCNUMBER") == "2" && value(t, "TRACKNUMBER") == "3" && value(t, "TRACKTOTAL") == "12");
+    CHECK(value(t, "ALBUMARTIST") == "X" && value(t, "ALBUMSORT") == "S" && value(t, "TITLE") == "T");
+}
+
+TEST(id3_the_owner_of_a_shared_frame_wins) {
+    auto t = id3::read_tags(id3::build(Tags::from_pairs({{"YEAR", "1999"}, {"DATE", "2001-02-03"}, {"WORK", "w"}, {"GROUPING", "g"}})));
+    CHECK(value(t, "DATE") == "2001-02-03" && t.m.size() == 2 && value(t, "GROUPING") == "g");
+    CHECK_MSG(value(id3::read_tags(id3::build(Tags::from_pairs({{"WORK", "w"}}))), "GROUPING") == "w", "WORK alone goes to TIT1");
+    // a tag editor's change of TIT1/TPE4 is saved under the frame's field and must show
+    for (auto [old_name, edited] : {std::pair{"WORK", "GROUPING"}, std::pair{"MIXARTIST", "REMIXER"}}) {
+        auto sidecar = Tags::from_pairs({{old_name, "old"}});
+        sidecar.merge(Tags::from_pairs({{edited, "new"}}));
+        CHECK_MSG(value(id3::read_tags(id3::build(sidecar)), edited) == "new", "{} edit shown", edited);
+    }
+}
+
+TEST(id3_lyrics_in_several_languages) {
+    auto [src, len] = id3::parse_tag(id3::build(Tags::from_pairs({{"LYRICS-deu", "d"}, {"lyrics-eng", "e"}})));
+    auto uslt = [&] { return std::count_if(src.frames.begin(), src.frames.end(), [](auto& f) { return f.sid() == "USLT"; }); };
+    CHECK(uslt() == 2);
+    id3::apply(src.frames, Tags::from_pairs({{"LYRICS-eng", "e2"}}));
+    CHECK_MSG(uslt() == 2, "the German lyrics stay");
+    id3::apply(src.frames, Tags::from_pairs({{"LYRICS", "all"}}));
+    CHECK_MSG(uslt() == 1 && value(id3::read_tags(id3::serialize(src.frames)), "LYRICS") == "all", "plain LYRICS replaces every language");
+}
+
+TEST(mp4_names_from_other_formats_and_synonyms) {
+    auto d = scratch("mp4-names");
+    Bytes file = m4a({ilst_item("\xA9nam", 1, B("Old")), freeform("MusicBrainz Album Id", "old"), ilst_item("trkn", 0, Bytes{0, 0, 0, 4, 0, 10, 0, 0})});
+    auto t = m4a_retagged(d, file, Tags::from_pairs({{"TPE2", "AA"}, {"TRCK", "3/12"}, {"MUSICBRAINZ_ALBUMID", "new"}, {"TIT2", "New"}}));
+    CHECK(value(t, "ALBUMARTIST") == "AA" && value(t, "TITLE") == "New" && value(t, "TRACKNUMBER") == "3" && value(t, "TRACKTOTAL") == "12");
+    CHECK_MSG(!t.m.contains("MusicBrainz Album Id") && value(t, "MUSICBRAINZ_ALBUMID") == "new", "one album id, spelled as given");
+    CHECK_MSG(!t.m.contains("TPE2") && !t.m.contains("TRCK") && !t.m.contains("TIT2"), "no freeform items for known fields");
+    fs::remove_all(d);
+}
+
+TEST(mp4_values_that_do_not_fit_keep_the_item) {
+    auto d = scratch("mp4-values");
+    Bytes file = m4a({ilst_item("trkn", 0, Bytes{0, 0, 0, 4, 0, 10, 0, 0}), ilst_item("cpil", 21, Bytes{1}), ilst_item("tmpo", 21, Bytes{0, 120})});
+    auto t = m4a_retagged(d, file, Tags::from_pairs({{"TRACKNUMBER", "A1"}, {"COMPILATION", "yes"}, {"BPM", "fast"}}));
+    CHECK(value(t, "TRACKNUMBER") == "4" && value(t, "TRACKTOTAL") == "10" && value(t, "COMPILATION") == "1" && value(t, "BPM") == "120");
+    t = m4a_retagged(d, file, Tags::from_pairs({{"BPM", "120.6"}, {"COMPILATION", "False"}, {"TRACKTOTAL", "12"}}));
+    CHECK(value(t, "BPM") == "121" && value(t, "COMPILATION") == "0" && value(t, "TRACKNUMBER") == "4" && value(t, "TRACKTOTAL") == "12");
+    fs::remove_all(d);
 }

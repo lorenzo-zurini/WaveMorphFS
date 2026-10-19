@@ -22,69 +22,30 @@ constexpr uint8_t V23_COMPRESSED = 0x80, V23_ENCRYPTED = 0x40, V23_GROUP = 0x20;
 
 /// Where a tag name goes in ID3v2.4.
 struct Target {
-    enum Kind { Text, Txxx, Comment, Lyrics, Track, Disc } kind;
-    std::string s;  // frame id, TXXX description or lyrics language
-    bool operator==(const Target&) const = default;
+    enum Kind { Text, Txxx, Comment, Lyrics } kind;
+    std::string s;      // frame id, TXXX description or lyrics language ("" = any)
+    bool owner = true;  // the field owns the frame (see FieldSpec)
+
+    bool same_place(const Target& o) const { return kind == o.kind && (kind == Txxx ? same_field(s, o.s) : iequals(s, o.s)); }
 };
 
-const std::vector<std::string_view> TRACK_NAMES = {"TRACKNUMBER", "TRACK", "TRCK"};
-const std::vector<std::string_view> TRACK_TOTALS = {"TRACKTOTAL", "TOTALTRACKS"};
-const std::vector<std::string_view> DISC_NAMES = {"DISCNUMBER", "DISC", "TPOS"};
-const std::vector<std::string_view> DISC_TOTALS = {"DISCTOTAL", "TOTALDISCS"};
-
-bool in(const std::vector<std::string_view>& v, std::string_view k) { return std::find(v.begin(), v.end(), k) != v.end(); }
-
-/// Tag name -> ID3v2.4 frame. Accepts Vorbis names (TITLE, ALBUMARTIST), the names
-/// ffprobe reports for ID3 sources (album_artist, publisher, album-sort, lyrics-eng)
-/// and raw text-frame ids (TSRC). Case-insensitive.
+/// Tag name -> ID3v2.4 frame. Accepts every spelling field_spec() knows (Vorbis
+/// TITLE, ffprobe album_artist, frame ids such as TSRC), ffprobe's "lyrics-eng"
+/// and raw text-frame ids. Track and disc numbers are not handled here.
 Target target_for(const std::string& key) {
     std::string k = upper(key);
-    if (in(TRACK_NAMES, k) || in(TRACK_TOTALS, k)) return {Target::Track, ""};
-    if (in(DISC_NAMES, k) || in(DISC_TOTALS, k)) return {Target::Disc, ""};
-    if (k == "COMMENT") return {Target::Comment, ""};
-    if (k == "LYRICS" || k == "UNSYNCEDLYRICS" || starts_with(k, "LYRICS-")) {
+    if (starts_with(k, "LYRICS-")) {
         // ffprobe: "lyrics-eng" / "lyrics-<description>-eng"
         auto dash = k.rfind('-');
-        std::string lang = dash != std::string::npos && k.size() - dash - 1 == 3 ? k.substr(dash + 1) : "XXX";
-        return {Target::Lyrics, lower(lang)};
+        return {Target::Lyrics, k.size() - dash - 1 == 3 ? lower(k.substr(dash + 1)) : ""};
     }
-    static const std::vector<std::pair<std::vector<std::string_view>, const char*>> map = {
-        {{"TITLE"}, "TIT2"},
-        {{"ARTIST"}, "TPE1"},
-        {{"ALBUMARTIST", "ALBUM_ARTIST", "ALBUM ARTIST"}, "TPE2"},
-        {{"CONDUCTOR"}, "TPE3"},
-        {{"REMIXER", "MIXARTIST"}, "TPE4"},
-        {{"ALBUM"}, "TALB"},
-        {{"DATE", "YEAR"}, "TDRC"},
-        {{"ORIGINALDATE", "ORIGINAL_DATE"}, "TDOR"},
-        {{"RELEASEDATE"}, "TDRL"},
-        {{"GENRE"}, "TCON"},
-        {{"COMPOSER"}, "TCOM"},
-        {{"LYRICIST"}, "TEXT"},
-        {{"LABEL", "PUBLISHER", "ORGANIZATION"}, "TPUB"},
-        {{"COPYRIGHT"}, "TCOP"},
-        {{"ISRC"}, "TSRC"},
-        {{"WORK", "GROUPING"}, "TIT1"},
-        {{"SUBTITLE"}, "TIT3"},
-        {{"BPM"}, "TBPM"},
-        {{"MOOD"}, "TMOO"},
-        {{"ENCODEDBY", "ENCODED_BY"}, "TENC"},
-        {{"ENCODER", "ENCODERSETTINGS"}, "TSSE"},
-        {{"COMPILATION"}, "TCMP"},
-        {{"ALBUMSORT", "ALBUM_SORT", "ALBUM-SORT"}, "TSOA"},
-        {{"ARTISTSORT", "ARTIST_SORT", "ARTIST-SORT"}, "TSOP"},
-        {{"TITLESORT", "TITLE_SORT", "TITLE-SORT"}, "TSOT"},
-        {{"ALBUMARTISTSORT", "ALBUM_ARTIST_SORT", "ALBUM_ARTIST-SORT", "ALBUM-ARTIST-SORT"}, "TSO2"},
-        {{"COMPOSERSORT", "COMPOSER_SORT", "COMPOSER-SORT"}, "TSOC"},
-        {{"MOVEMENTNAME"}, "MVNM"},
-        {{"MEDIA"}, "TMED"},
-        {{"LANGUAGE"}, "TLAN"},
-        {{"DISCSUBTITLE"}, "TSST"},
-        {{"CREATION_TIME"}, "TDEN"},
-    };
-    for (auto& [names, id] : map)
-        if (in(names, k)) return {Target::Text, id};
-    // a raw text-frame id such as TSRC or TMED
+    if (auto f = field_spec(key); f && !f->id3.empty()) {
+        bool owner = id3_owner(f->id3) == f;
+        if (f->id3 == "COMM") return {Target::Comment, "", owner};
+        if (f->id3 == "USLT") return {Target::Lyrics, "", owner};
+        return {Target::Text, std::string(f->id3), owner};
+    }
+    // a raw text-frame id such as TKEY
     bool raw = k.size() == 4 && k[0] == 'T' && k != "TXXX" && std::all_of(k.begin(), k.end(), [](char c) { return (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'); });
     return raw ? Target{Target::Text, k} : Target{Target::Txxx, key};
 }
@@ -172,6 +133,12 @@ std::optional<std::string> description(const Frame& f) {
     size_t skip = f.sid() == "TXXX" ? 1 : 4;
     if (b->size() < skip) return std::nullopt;
     return decode_text(enc, split_terminated(enc, b->subspan(skip)).first);
+}
+
+/// Language of a COMM/USLT frame.
+std::string language(const Frame& f) {
+    auto b = body_of(f);
+    return b && b->size() >= 4 ? std::string(str_of(b->subspan(1, 3))) : "";
 }
 
 /// The values of a text frame body (encoding byte, then terminated strings).
@@ -414,83 +381,69 @@ std::pair<SourceTag, size_t> parse_tag(std::span<const uint8_t> b) {
 }
 
 void apply(std::vector<Frame>& frames, const Tags& overlay) {
-    auto get = [&](const std::vector<std::string_view>& names) -> const std::string* {
-        for (auto n : names)
-            if (auto v = overlay.get(n)) return v;
-        return nullptr;
-    };
-    auto named = [&](const std::vector<std::string_view>& names) {
-        return std::any_of(names.begin(), names.end(), [&](auto n) { return overlay.get_all(n) != nullptr; });
-    };
-    // track / disc combine two names into one frame
-    for (auto [id, nums, totals] : {std::tuple{"TRCK", &TRACK_NAMES, &TRACK_TOTALS}, std::tuple{"TPOS", &DISC_NAMES, &DISC_TOTALS}}) {
-        if (!named(*nums) && !named(*totals)) continue;
+    // track / disc: number and total share one "n/total" frame
+    for (auto [id, num, total] : {std::tuple{"TRCK", "TRACKNUMBER", "TRACKTOTAL"}, std::tuple{"TPOS", "DISCNUMBER", "DISCTOTAL"}}) {
+        bool num_named = overlay.get_all(num) != nullptr;
+        if (!num_named && !overlay.get_all(total)) continue;
         std::optional<std::string> n;
-        if (auto v = get(*nums)) n = *v;
-        else if (!named(*nums))
-            if (auto old = frame_text(frames, id)) n = split(*old, '/')[0];
+        if (auto v = overlay.get(num)) n = *v;
+        else if (!num_named)
+            if (auto old = frame_text(frames, id)) n = trim(split(*old, '/')[0]);
         std::erase_if(frames, [&](auto& f) { return f.sid() == id; });
-        if (n) {
-            const std::string* t = get(*totals);
-            std::string v = t && n->find('/') == std::string::npos ? *n + "/" + *t : *n;
-            frames.push_back(text_frame(id, {v}));
-        }
+        if (n && !n->empty()) frames.push_back(text_frame(id, {join_number(*n, overlay.get(total))}));
     }
-    std::vector<Target> used;
+    // One frame per place. When several fields of the overlay share a place the
+    // owner wins, so that a value read back from the frame and saved under the
+    // owner's name (TDRC -> DATE) replaces the other field's (YEAR).
+    std::vector<std::pair<Target, const std::vector<std::string>*>> picks;
     for (auto& [k, vs] : overlay.m) {
+        if (is_number_field(k)) continue;
         Target t = target_for(k);
-        if (t.kind == Target::Track || t.kind == Target::Disc) continue;
-        // two spellings mapping to the same frame: the first one wins
-        if (std::find(used.begin(), used.end(), t) != used.end()) continue;
+        auto it = std::find_if(picks.begin(), picks.end(), [&](auto& p) { return p.first.same_place(t); });
+        if (it == picks.end()) picks.emplace_back(std::move(t), &vs);
+        else if (t.owner && !it->first.owner) *it = {std::move(t), &vs};
+    }
+    // remove everything first: a plain LYRICS replaces every USLT frame, but not
+    // the LYRICS-eng frame added next to it
+    for (auto& [t, vs] : picks)
         std::erase_if(frames, [&](const Frame& f) {
             switch (t.kind) {
             case Target::Text: return f.sid() == t.s || (t.s == "TDRC" && (f.sid() == "TYER" || f.sid() == "TDAT" || f.sid() == "TIME" || f.sid() == "TRDA"));
             case Target::Txxx: {
                 if (f.sid() != "TXXX") return false;
                 auto d = description(f);
-                return d && iequals(*d, t.s);
+                return d && same_field(*d, t.s);
             }
             case Target::Comment: {
                 if (f.sid() != "COMM") return false;
                 auto d = description(f);
                 return d && d->empty();
             }
-            case Target::Lyrics: return f.sid() == "USLT";
-            default: return false;
+            case Target::Lyrics: return f.sid() == "USLT" && (t.s.empty() || iequals(language(f), t.s));
             }
+            return false;
         });
-        if (!vs.empty()) {
-            switch (t.kind) {
-            case Target::Text: frames.push_back(text_frame(t.s, vs)); break;
-            case Target::Txxx: frames.push_back(txxx_frame(t.s, vs)); break;
-            case Target::Comment: frames.push_back(lang_frame("COMM", "eng", joined(vs, "\n"))); break;
-            case Target::Lyrics: frames.push_back(lang_frame("USLT", t.s, joined(vs, "\n"))); break;
-            default: break;
-            }
+    for (auto& [t, vs] : picks) {
+        if (vs->empty()) continue;
+        switch (t.kind) {
+        case Target::Text: frames.push_back(text_frame(t.s, *vs)); break;
+        case Target::Txxx: frames.push_back(txxx_frame(t.s, *vs)); break;
+        case Target::Comment: frames.push_back(lang_frame("COMM", "eng", joined(*vs, "\n"))); break;
+        case Target::Lyrics: frames.push_back(lang_frame("USLT", t.s.empty() ? "xxx" : t.s, joined(*vs, "\n"))); break;
         }
-        used.push_back(t);
     }
 }
 
 Tags read_tags(std::span<const uint8_t> tag) {
-    static const std::map<std::string, std::string> names = {
-        {"TIT2", "TITLE"}, {"TPE1", "ARTIST"}, {"TPE2", "ALBUMARTIST"}, {"TPE3", "CONDUCTOR"}, {"TPE4", "REMIXER"},
-        {"TALB", "ALBUM"}, {"TDRC", "DATE"}, {"TDOR", "ORIGINALDATE"}, {"TDRL", "RELEASEDATE"}, {"TCON", "GENRE"},
-        {"TCOM", "COMPOSER"}, {"TEXT", "LYRICIST"}, {"TPUB", "LABEL"}, {"TCOP", "COPYRIGHT"}, {"TSRC", "ISRC"},
-        {"TIT1", "GROUPING"}, {"TIT3", "SUBTITLE"}, {"TBPM", "BPM"}, {"TMOO", "MOOD"}, {"TENC", "ENCODEDBY"},
-        {"TSSE", "ENCODER"}, {"TCMP", "COMPILATION"}, {"TSOA", "ALBUMSORT"}, {"TSOP", "ARTISTSORT"}, {"TSOT", "TITLESORT"},
-        {"TSO2", "ALBUMARTISTSORT"}, {"TSOC", "COMPOSERSORT"}, {"MVNM", "MOVEMENTNAME"}, {"TMED", "MEDIA"},
-        {"TLAN", "LANGUAGE"}, {"TSST", "DISCSUBTITLE"}, {"TDEN", "CREATION_TIME"},
-    };
     Tags t;
     if (tag.size() < 10 || std::memcmp(tag.data(), "ID3", 3) != 0) return t;
-    auto frames = parse_tag(tag).first.frames;
-    for (auto& f : frames) {
+    std::vector<std::pair<std::string, std::string>> numbers;  // TRCK/TPOS, added last (see add_number)
+    for (auto& f : parse_tag(tag).first.frames) {
         auto body = body_of(f);
         if (!body || body->empty()) continue;
         std::string id(f.sid());
+        uint8_t enc = (*body)[0];
         if (id == "TXXX") {
-            uint8_t enc = (*body)[0];
             auto [d, rest] = split_terminated(enc, body->subspan(1));
             std::string name = decode_text(enc, d);
             if (name.empty()) continue;  // a value without a name is no tag
@@ -498,24 +451,21 @@ Tags read_tags(std::span<const uint8_t> tag) {
             append(values, rest);
             for (auto& v : text_values(values)) t.add(name, v);
         } else if (id == "COMM" || id == "USLT") {
-            uint8_t enc = (*body)[0];
             if (body->size() < 4) continue;
             auto [d, text] = split_terminated(enc, body->subspan(4));
             if (id == "COMM" && !decode_text(enc, d).empty()) continue;  // described comments are not "the" comment
             std::string v = decode_text(enc, text);
             while (!v.empty() && v.back() == '\0') v.pop_back();  // optional terminator
-            t.add(id == "COMM" ? "COMMENT" : "LYRICS", v);
+            t.add(std::string(id3_owner(id)->name), v);
         } else if (id == "TRCK" || id == "TPOS") {
-            auto vs = text_values(*body);
-            if (vs.empty()) continue;
-            auto p = split(vs[0], '/');
-            t.add(id == "TRCK" ? "TRACKNUMBER" : "DISCNUMBER", trim(p[0]));
-            if (p.size() > 1) t.add(id == "TRCK" ? "TRACKTOTAL" : "DISCTOTAL", trim(p[1]));
-        } else if (id[0] == 'T' || id == "MVNM") {
-            auto it = names.find(id);
-            for (auto& v : text_values(*body)) t.add(it != names.end() ? it->second : id, v);
+            if (auto vs = text_values(*body); !vs.empty()) numbers.emplace_back(id, vs[0]);
+        } else if (auto o = id3_owner(id)) {
+            for (auto& v : text_values(*body)) t.add(std::string(o->name), v);
+        } else if (id[0] == 'T') {
+            for (auto& v : text_values(*body)) t.add(id, v);
         }
     }
+    for (auto& [id, v] : numbers) add_number(t, id == "TRCK" ? "TRACKNUMBER" : "DISCNUMBER", id == "TRCK" ? "TRACKTOTAL" : "DISCTOTAL", v);
     return t;
 }
 
