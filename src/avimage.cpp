@@ -13,7 +13,6 @@ extern "C" {
 #include <functional>
 
 #include "cache.hpp"
-#include "md5.hpp"
 
 namespace wm {
 
@@ -377,34 +376,6 @@ std::vector<std::vector<int32_t>> AvImage::decode_range(uint64_t s, uint64_t e) 
         for (size_t c = 0; c < channels; c++) out[c].insert(out[c].end(), (*smp)[c].begin() + ptrdiff_t(lo), (*smp)[c].begin() + ptrdiff_t(hi));
     }
     WM_ENSURE(out[0].size() == e - s, "decoded {} of {} samples", out[0].size(), e - s);
-    return out;
-}
-
-std::vector<std::array<uint8_t, 16>> AvImage::md5s(const std::vector<std::pair<uint64_t, uint64_t>>& ranges) const {
-    std::vector<Md5> ctx(ranges.size());
-    size_t bytes = (bps + 7) / 8;
-    uint64_t pos = 0;
-    Bytes pcm;
-    Decoder d(path);
-    d.decode_all([&](int64_t, const PerChannel& s) {
-        if (s.empty()) return;
-        uint64_t n = s[0].size(), fe = pos + n;
-        for (size_t ri = 0; ri < ranges.size(); ri++) {
-            auto [a, b] = ranges[ri];
-            if (a >= fe || b <= pos) continue;
-            size_t lo = size_t(std::max(a, pos) - pos), hi = size_t(std::min(b, fe) - pos);
-            pcm.clear();
-            for (size_t i = lo; i < hi; i++)
-                for (auto& c : s) {
-                    uint32_t v = uint32_t(c[i]);
-                    for (size_t k = 0; k < bytes; k++) pcm.push_back(uint8_t(v >> (8 * k)));
-                }
-            ctx[ri].update(pcm);
-        }
-        pos = fe;
-    });
-    std::vector<std::array<uint8_t, 16>> out;
-    for (auto& c : ctx) out.push_back(c.finish());
     return out;
 }
 
