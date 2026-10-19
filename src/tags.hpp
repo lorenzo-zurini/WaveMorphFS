@@ -87,6 +87,11 @@ std::string join_number(const std::string& number, const std::string* total);
 /// this after the tag's other items, which may carry the total on their own.
 void add_number(Tags& t, const std::string& num_field, const std::string& total_field, std::string_view value);
 
+/// The name=value pairs of `t` that a Vorbis comment can hold: its field names
+/// are printable ASCII without '=' (a sidecar written for MP4 may say ©nam).
+/// Other names are left out, with a debug message.
+std::vector<std::pair<std::string, std::string>> vorbis_comments(const Tags& t);
+
 Tags from_cue_disc(const std::map<std::string, std::string>& fields);
 Tags from_cue_track(const std::map<std::string, std::string>& fields);
 

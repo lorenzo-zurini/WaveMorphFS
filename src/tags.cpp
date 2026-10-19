@@ -253,6 +253,16 @@ bool Tags::operator==(const Tags& o) const {
     return true;
 }
 
+std::vector<std::pair<std::string, std::string>> vorbis_comments(const Tags& t) {
+    auto pairs = t.to_pairs();
+    std::erase_if(pairs, [](auto& kv) {
+        bool ok = !kv.first.empty() && std::all_of(kv.first.begin(), kv.first.end(), [](char c) { return c >= 0x20 && c <= 0x7D && c != '='; });
+        if (!ok) debug("Vorbis comment: tag name \"{}\" cannot be written", kv.first);
+        return !ok;
+    });
+    return pairs;
+}
+
 Tags from_cue_disc(const std::map<std::string, std::string>& fields) {
     Tags t;
     for (auto& [k, v] : fields) {
