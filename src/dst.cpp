@@ -100,11 +100,12 @@ void read_table(Bits& gb, Table& t, const int32_t pred[3][3], uint32_t length_bi
             uncoded(method + 1);
             uint32_t lsb_size = gb.bits(3);
             for (size_t j = method + 1; j < t.length[i]; j++) {
+                // the prediction wraps like FFmpeg's; rounding it is done in 64 bits so that
+                // x + 4 and -x cannot overflow on a hostile stream (|x| / 8 always fits)
                 int32_t x = 0;
                 for (size_t k = 0; k <= method; k++) x = int32_t(uint32_t(x) + uint32_t(pred[method][k]) * uint32_t(t.coeff[i][j - k - 1]));
-                int32_t c = gb.sr_golomb(lsb_size);
-                if (x >= 0) c -= (x + 4) / 8;
-                else c += (-x + 3) / 8;
+                int64_t x64 = x;
+                int32_t c = int32_t(gb.sr_golomb(lsb_size) + (x64 >= 0 ? -((x64 + 4) / 8) : (-x64 + 3) / 8));
                 WM_ENSURE(is_signed || (c >= offset && c < offset + (1 << coeff_bits)), "probability out of range");
                 t.coeff[i][j] = c;
             }
