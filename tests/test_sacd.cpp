@@ -4,6 +4,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
 
 #include "cache.hpp"
@@ -200,6 +201,127 @@ Bytes expected_dsf_audio(const std::vector<Bytes>& frames, uint64_t f0, uint64_t
     return out;
 }
 
+/// MSB-first bit writer for DST frames.
+struct BitWriter {
+    Bytes b;
+    size_t n = 0;
+    void put(uint32_t v, uint32_t bits) {
+        for (uint32_t i = bits; i-- > 0; n++) {
+            if (n % 8 == 0) b.push_back(0);
+            if (v >> i & 1) b.back() |= uint8_t(0x80 >> (n % 8));
+        }
+    }
+    /// sr_golomb as DST reads it: |v| as a Rice code (zeros, a one, k bits), then its sign if not 0
+    void signed_rice(int32_t v, uint32_t k) {
+        uint32_t m = uint32_t(std::abs(v));
+        for (uint32_t q = m >> k; q > 0; q--) put(0, 1);
+        put(1, 1);
+        put(m & ((1u << k) - 1), k);
+        if (v) put(v < 0, 1);
+    }
+};
+
+/// A compressed DST frame exercising every part of the format FFmpeg decodes:
+/// channel maps, half probabilities, filter and probability tables (stored
+/// plain and predicted with each method), then `ac_bytes` of arithmetic-coded
+/// data (any bits are a valid code).
+Bytes dst_frame(uint32_t channels, uint32_t& seed, size_t ac_bytes) {
+    BitWriter w;
+    auto rnd = [&](uint32_t n) { return lcg_next(seed) >> 8 & (n - 1); };  // n: a power of 2
+    w.put(1, 1);  // compressed
+    w.put(7, 3);  // same segmentation, for all channels, end of channel segmentation
+    bool same_map = channels == 1 || rnd(2);
+    w.put(same_map, 1);
+    auto channel_map = [&] {
+        w.put(0, 1);  // explicit
+        uint32_t elements = 1;
+        for (uint32_t ch = 1; ch < channels; ch++) {
+            uint32_t v = ch == 1 ? 1 : std::min(rnd(4), elements);
+            w.put(v, uint32_t(std::bit_width(elements)));
+            if (v == elements) elements++;
+        }
+        return elements;
+    };
+    uint32_t fsets = channel_map(), probs = same_map ? fsets : channel_map();
+    for (uint32_t ch = 0; ch < channels; ch++) w.put(rnd(2), 1);  // half probability
+    const int32_t fsets_pred[3][3] = {{-8, 0, 0}, {-16, 8, 0}, {-9, -5, 6}};
+    const int32_t probs_pred[3][3] = {{-8, 0, 0}, {-16, 8, 0}, {-24, 24, -8}};
+    auto table = [&](uint32_t elements, uint32_t length_bits, uint32_t coeff_bits, bool is_signed, const int32_t pred[3][3]) {
+        for (uint32_t e = 0; e < elements; e++) {
+            uint32_t len = 3 + rnd(1u << (length_bits - 2));
+            // filter coefficients small enough for the 16-bit filter tables; probabilities 1..128
+            auto value = [&] { return is_signed ? int32_t(rnd(128)) - 64 : int32_t(rnd(128)) + 1; };
+            auto plain = [&](int32_t v) { w.put(is_signed ? uint32_t(v) & ((1u << coeff_bits) - 1) : uint32_t(v - 1), coeff_bits); };
+            w.put(len - 1, length_bits);
+            uint32_t method = rnd(4);
+            if (method == 3) {
+                w.put(0, 1);
+                for (uint32_t j = 0; j < len; j++) plain(value());
+                continue;
+            }
+            w.put(1, 1);
+            w.put(method, 2);
+            std::vector<int32_t> c;
+            for (uint32_t j = 0; j <= method; j++) plain(c.emplace_back(value()));
+            uint32_t k = rnd(8);
+            w.put(k, 3);
+            for (uint32_t j = method + 1; j < len; j++) {
+                int64_t x = 0;
+                for (uint32_t m = 0; m <= method; m++) x += pred[method][m] * c[j - m - 1];
+                int32_t correction = int32_t(x >= 0 ? -((x + 4) / 8) : (-x + 3) / 8);
+                int32_t v = value();
+                w.signed_rice(v - correction, k);
+                c.push_back(v);
+            }
+        }
+    };
+    table(fsets, 7, 9, true, fsets_pred);
+    table(probs, 6, 7, false, probs_pred);
+    w.put(0, 1);  // arithmetic-coded data follows
+    for (size_t i = 0; i < ac_bytes; i++) w.put(lcg_next(seed) >> 24, 8);
+    return w.b;
+}
+
+/// A DSDIFF file (FFmpeg reads DST from these): `frames` are DST frames, or
+/// with `plain` byte-interleaved DSD.
+Bytes dff(uint32_t channels, const std::vector<Bytes>& frames, bool plain) {
+    auto chunk = [](std::string_view id, const Bytes& body) {
+        Bytes c(id.begin(), id.end());
+        put_be64(c, body.size());
+        append(c, body);
+        if (body.size() % 2) c.push_back(0);
+        return c;
+    };
+    Bytes fs, chnl, cmpr, prop(4), fver;
+    put_be32(fver, 0x01050000);
+    put_be32(fs, DSD64_RATE);
+    put_be16(chnl, uint16_t(channels));
+    for (uint32_t ch = 0; ch < channels; ch++) append(chnl, std::string_view(std::format("C{:03}", ch)));
+    append(cmpr, std::string_view(plain ? "DSD " : "DST "));
+    cmpr.push_back(0);
+    cmpr.push_back(0);
+    std::memcpy(prop.data(), "SND ", 4);
+    append(prop, chunk("FS  ", fs));
+    append(prop, chunk("CHNL", chnl));
+    append(prop, chunk("CMPR", cmpr));
+    Bytes audio;
+    if (plain) {
+        for (auto& f : frames) append(audio, f);
+    } else {
+        Bytes frte;
+        put_be32(frte, uint32_t(frames.size()));
+        put_be16(frte, 75);
+        append(audio, chunk("FRTE", frte));
+        for (auto& f : frames) append(audio, chunk("DSTF", f));
+    }
+    Bytes body(4);
+    std::memcpy(body.data(), "DSD ", 4);
+    append(body, chunk("FVER", fver));
+    append(body, chunk("PROP", prop));
+    append(body, chunk(plain ? "DSD " : "DST ", audio));
+    return chunk("FRM8", body);
+}
+
 struct Dir {
     fs::path path = fs::temp_directory_path() / std::format("wm-sacd-{}-{}", ::getpid(), counter()++);
     Dir() { fs::create_directories(path); }
@@ -314,5 +436,30 @@ TEST(sacd_multichannel_only_disc_is_served_once) {
         CHECK_MSG(false, "the multichannel area was offered a second time");
     } catch (const Error& e) {
         CHECK_MSG(std::string(e.what()).find("no multichannel area") != std::string::npos, "{}", e.what());
+    }
+}
+
+TEST(dst_decoder_matches_ffmpeg) {
+    // DST is checked through FFmpeg's decoder: the same frames as DST, and as the
+    // DSD decoded here, must give the same PCM (FFmpeg converts both alike)
+    Dir d;
+    for (uint32_t channels : {2u, 5u, 6u}) {
+        uint32_t seed = channels;
+        std::vector<Bytes> coded, decoded;
+        DstDecoder dec(channels);
+        for (int i = 0; i < 12; i++) {
+            coded.push_back(dst_frame(channels, seed, 600 + 80 * size_t(i)));
+            decoded.emplace_back(SACD_FRAME_BYTES * channels);
+            dec.decode(coded.back(), decoded.back());
+        }
+        auto pcm = [&](const Bytes& file, const char* name) {
+            fs::path p = d.path / name;
+            atomic_write(p, file);
+            auto r = run({"ffmpeg", "-v", "error", "-i", p.string(), "-f", "f32le", "-"});
+            CHECK_MSG(r.ok(), "{}", r.err);
+            return r.out;
+        };
+        std::string want = pcm(dff(channels, coded, false), "dst.dff"), got = pcm(dff(channels, decoded, true), "dsd.dff");
+        CHECK_MSG(!want.empty() && want == got, "{} channels: {} vs {} bytes of PCM", channels, want.size(), got.size());
     }
 }
