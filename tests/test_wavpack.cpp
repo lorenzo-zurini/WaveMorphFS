@@ -173,7 +173,7 @@ TEST(float_wavpack_image_split_by_blocks) {
         CHECK(tag->tags.get("TITLE") && *tag->tags.get("TITLE") == std::string(1, "ABC"[t]));
         CHECK(tag->tags.get("TRACKNUMBER") && *tag->tags.get("TRACKNUMBER") == std::to_string(t + 1) && tag->tags.get("TRACKTOTAL"));
         CHECK(tag->tags.get("ALBUM") && *tag->tags.get("ALBUM") == "Album X");
-        CHECK_MSG(tag->tags.get("DATE") && *tag->tags.get("DATE") == "1971", "Year read back as DATE");
+        CHECK_MSG(tag->tags.m.contains("Year") && *tag->tags.get("YEAR") == "1971" && !tag->tags.get("DATE"), "Year read back as written");
         CHECK_MSG(bool(tag->front_cover) == (t == 1), "cover on track 2 only");
         if (tag->front_cover) {
             Bytes v(whole.begin() + ptrdiff_t(tag->front_cover->off), whole.begin() + ptrdiff_t(tag->front_cover->off + tag->front_cover->len));
