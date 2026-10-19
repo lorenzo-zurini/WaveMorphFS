@@ -10,12 +10,13 @@
 namespace wm {
 
 std::shared_ptr<Spliced> retag_file(const fs::path& p, const std::string& ext, const Tags& overlay, const Cover* cover) {
-    uint64_t len = File(p).size();
+    File f(p);
+    uint64_t len = f.size();
     if (ext == "flac") {
         auto meta = flac::FlacMeta::read(p);
         Tags tags = Tags::from_pairs(meta.vorbis_comments());
         tags.overlay(overlay);
-        std::vector<flac::HeaderBlock> blocks = {{flac::BLOCK_VORBIS, flac::build_vorbis("WaveMorphFS", tags.to_pairs())}};
+        std::vector<flac::HeaderBlock> blocks = {{flac::BLOCK_VORBIS, flac::build_vorbis("WaveMorphFS", vorbis_comments(tags))}};
         // keep every other block (SEEKTABLE offsets are relative to the first frame, so
         // still valid), read from the source rather than held: pictures can be large
         for (auto& b : meta.blocks)
@@ -28,7 +29,7 @@ std::shared_ptr<Spliced> retag_file(const fs::path& p, const std::string& ext, c
         return std::make_shared<Spliced>(p, "retagged-flac", std::move(segs));
     }
     if (ext == "mp3") {
-        auto [segs, start] = id3::retag_at(File(p), 0, overlay, cover);
+        auto [segs, start] = id3::retag_at(f, 0, overlay, cover);
         segs.push_back(SrcRange{start, len - start});
         return std::make_shared<Spliced>(p, "retagged-mp3", std::move(segs));
     }
@@ -42,18 +43,22 @@ std::shared_ptr<Spliced> retag_file(const fs::path& p, const std::string& ext, c
         // (0 = none), which follows the data chunk. The audio is kept as is; the
         // tag is rebuilt (frames the overlay does not name are kept) and the two
         // size fields are patched.
-        File f(p);
         uint8_t h[28];
         f.read_exact_at(h, 28, 0);
         WM_ENSURE(std::memcmp(h, "DSD ", 4) == 0 && le64(h + 4) == 28, "not a DSF file");
         uint8_t fmt[12], data[12];
         f.read_exact_at(fmt, 12, 28);
         WM_ENSURE(std::memcmp(fmt, "fmt ", 4) == 0, "no fmt chunk");
-        uint64_t data_pos = 28 + le64(fmt + 4);
+        // chunk sizes include their 12-byte headers; compared with what is left
+        // of the file, as a bogus 64-bit size could wrap a sum around
+        uint64_t fmt_size = le64(fmt + 4);
+        WM_ENSURE(fmt_size >= 12 && fmt_size <= len - 28, "bad fmt chunk size {}", fmt_size);
+        uint64_t data_pos = 28 + fmt_size;
         f.read_exact_at(data, 12, data_pos);
         WM_ENSURE(std::memcmp(data, "data", 4) == 0, "no data chunk");
-        uint64_t audio_end = data_pos + le64(data + 4);
-        WM_ENSURE(audio_end <= len, "data chunk runs past the end of the file");
+        uint64_t data_size = le64(data + 4);
+        WM_ENSURE(data_size >= 12 && data_size <= len - data_pos, "data chunk runs past the end of the file");
+        uint64_t audio_end = data_pos + data_size;
         uint64_t meta = le64(h + 20);
         auto tag = id3::retag_at(f, meta ? meta : audio_end, overlay, cover).first;
         uint64_t tag_len = 0;

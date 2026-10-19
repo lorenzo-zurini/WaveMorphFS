@@ -27,47 +27,51 @@ std::optional<Cover> probe(const fs::path& p, uint64_t max_bytes) {
         warn("cover {}: {} bytes, more than the {} allowed", p.string(), size, max_bytes);
         return std::nullopt;
     }
-    Bytes h;
-    try {
-        File f(p);
-        h = f.read_vec(0, size_t(std::min<uint64_t>(size, 65536)));
-    } catch (const std::exception& e) {
-        warn("cover {}: {}", p.string(), e.what());
-        return std::nullopt;
-    }
     Cover c;
     c.path = std::make_shared<const fs::path>(p);
     c.size = size;
     c.mtime = *m;
-    if (h.size() >= 26 && std::memcmp(h.data(), "\x89PNG\r\n\x1a\n", 8) == 0 && std::memcmp(&h[12], "IHDR", 4) == 0) {
-        c.mime = "image/png";
-        c.width = be32(&h[16]);
-        c.height = be32(&h[20]);
-        static const uint32_t channels[] = {1, 0, 3, 1, 2, 0, 4};
-        uint8_t ct = h[25];
-        c.depth = h[24] * (ct < 7 ? channels[ct] : 0);
-        return c;
-    }
-    if (h.size() >= 4 && h[0] == 0xFF && h[1] == 0xD8) {
-        c.mime = "image/jpeg";
-        // walk the markers to the frame header (SOFn) for the dimensions
-        for (size_t i = 2; i + 9 < h.size();) {
-            if (h[i] != 0xFF) break;
-            uint8_t mk = h[i + 1];
-            if (mk == 0xFF) {
-                i++;
-                continue;
-            }
-            uint16_t len = uint16_t(h[i + 2] << 8 | h[i + 3]);
-            if (mk >= 0xC0 && mk <= 0xCF && mk != 0xC4 && mk != 0xC8 && mk != 0xCC) {
-                c.height = uint32_t(h[i + 5] << 8 | h[i + 6]);
-                c.width = uint32_t(h[i + 7] << 8 | h[i + 8]);
-                c.depth = uint32_t(h[i + 4]) * h[i + 9];
-                break;
-            }
-            i += 2 + len;
+    try {
+        File f(p);
+        Bytes h = f.read_vec(0, 32);
+        if (h.size() >= 26 && std::memcmp(h.data(), "\x89PNG\r\n\x1a\n", 8) == 0 && std::memcmp(&h[12], "IHDR", 4) == 0) {
+            c.mime = "image/png";
+            c.width = be32(&h[16]);
+            c.height = be32(&h[20]);
+            static const uint32_t channels[] = {1, 0, 3, 1, 2, 0, 4};
+            uint8_t ct = h[25];
+            c.depth = h[24] * (ct < 7 ? channels[ct] : 0);
+            return c;
         }
-        return c;
+        if (h.size() >= 4 && h[0] == 0xFF && h[1] == 0xD8) {
+            c.mime = "image/jpeg";
+            // Walk the markers to the frame header (SOFn) for the dimensions,
+            // segment by segment: EXIF thumbnails and ICC profiles can put it
+            // far beyond the first kilobytes. Real files have a few dozen
+            // segments before it; the step limit only stops crafted ones.
+            uint64_t i = 2;
+            for (int step = 0; step < 4096 && i + 10 <= size; step++) {
+                uint8_t seg[10];
+                f.read_exact_at(seg, 10, i);
+                if (seg[0] != 0xFF) break;
+                uint8_t mk = seg[1];
+                if (mk == 0xFF) {  // fill byte
+                    i++;
+                    continue;
+                }
+                if (mk >= 0xC0 && mk <= 0xCF && mk != 0xC4 && mk != 0xC8 && mk != 0xCC) {
+                    c.height = be16(&seg[5]);
+                    c.width = be16(&seg[7]);
+                    c.depth = uint32_t(seg[4]) * seg[9];
+                    break;
+                }
+                i += 2 + be16(&seg[2]);
+            }
+            return c;
+        }
+    } catch (const std::exception& e) {
+        warn("cover {}: {}", p.string(), e.what());
+        return std::nullopt;
     }
     warn("cover {}: not a JPEG or PNG image", p.string());
     return std::nullopt;
@@ -86,7 +90,7 @@ Bytes scale_to_jpeg(const fs::path& src) {
     using Ctx = std::unique_ptr<AVCodecContext, void (*)(AVCodecContext*)>;
     auto free_ctx = [](AVCodecContext* c) { avcodec_free_context(&c); };
     Ctx dctx(avcodec_alloc_context3(dec), free_ctx);
-    avcodec_parameters_to_context(dctx.get(), par);
+    WM_ENSURE(dctx && avcodec_parameters_to_context(dctx.get(), par) >= 0, "decoder parameters");
     dctx->thread_count = 1;
     WM_ENSURE(avcodec_open2(dctx.get(), dec, nullptr) == 0, "cannot open decoder");
     std::unique_ptr<AVFrame, void (*)(AVFrame*)> in(av_frame_alloc(), [](AVFrame* f) { av_frame_free(&f); });
@@ -102,7 +106,8 @@ Bytes scale_to_jpeg(const fs::path& src) {
     }
     WM_ENSURE(got && in->width > 0 && in->height > 0, "cannot decode");
     int w = in->width, h = in->height;
-    double f = double(COVER_EDGE) / std::max(w, h);
+    // (a picture over MAX_COVER_BYTES may be small already: never enlarge it)
+    double f = std::min(1.0, double(COVER_EDGE) / std::max(w, h));
     int dw = std::max(2, int(w * f + 0.5) & ~1), dh = std::max(2, int(h * f + 0.5) & ~1);
 
     const AVCodec* enc = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
@@ -139,8 +144,9 @@ Bytes scale_to_jpeg(const fs::path& src) {
     WM_ENSURE(sws, "cannot scale");
     const int* coef = sws_getCoefficients(SWS_CS_DEFAULT);
     sws_setColorspaceDetails(sws, coef, full ? 1 : 0, coef, 1, 0, 1 << 16, 1 << 16);
-    sws_scale(sws, in->data, in->linesize, 0, h, out->data, out->linesize);
+    int rows = sws_scale(sws, in->data, in->linesize, 0, h, out->data, out->linesize);
     sws_freeContext(sws);
+    WM_ENSURE(rows == dh, "scaling failed");
     out->quality = ectx->global_quality;
     out->pts = 0;
     WM_ENSURE(avcodec_send_frame(ectx.get(), out.get()) == 0, "encode");
@@ -162,9 +168,10 @@ std::optional<Cover> prepare_cover(const fs::path& src, const fs::path& cache_di
     auto c = probe(src, MAX_COVER_SOURCE_BYTES);
     if (!c) return std::nullopt;
     if (c->size <= MAX_COVER_BYTES && c->width && c->height && std::max(c->width, c->height) <= COVER_EDGE) return c;
-    // scaled once per version of the source image
+    // scaled once per version of the source image and of the scaling (the
+    // number names how it is done: bump it when scale_to_jpeg() changes)
     Md5 h;
-    h.update(std::format("{}\n{}\n{}\n{}", src.string(), c->size, c->mtime, COVER_EDGE));
+    h.update(std::format("{}\n{}\n{}\n{}\nscale-2", src.string(), c->size, c->mtime, COVER_EDGE));
     auto d = h.finish();
     fs::path scaled = cache_dir / "covers" / (hex(std::span(d).subspan(0, 8)) + ".jpg");
     if (!fs::exists(scaled)) {
@@ -172,7 +179,7 @@ std::optional<Cover> prepare_cover(const fs::path& src, const fs::path& cache_di
             Bytes jpeg = scale_to_jpeg(src);
             fs::create_directories(scaled.parent_path());
             atomic_write(scaled, jpeg);
-            info("cover {}: scaled to {} px ({} KB)", src.string(), COVER_EDGE, jpeg.size() / 1024);
+            info("cover {}: re-encoded at most {} px ({} KB)", src.string(), COVER_EDGE, jpeg.size() / 1024);
         } catch (const std::exception& e) {
             warn("cover {}: scaling failed: {}", src.string(), e.what());
             return std::nullopt;

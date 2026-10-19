@@ -20,6 +20,8 @@ namespace wm {
 /// Tags of a FLAC / DSF / MP3 / M4A / WavPack file (lower-case extension), read
 /// through `read`. Vorbis comments and APEv2 items keep their names; ID3 and MP4
 /// fields (and APEv2 Track/Disc/Year) are mapped back to Vorbis-style names.
+/// Throws if the bytes are not a complete file of that kind, so that a file an
+/// editor left half-written is never taken for one whose tags were all removed.
 Tags read_file_tags(const std::string& ext, const ByteReader& read, uint64_t size);
 
 /// What changed from `before` to `after`, field by field (synonyms are the same
@@ -38,9 +40,11 @@ public:
     Bytes read(uint64_t off, size_t len) const;
     void write(uint64_t off, std::span<const uint8_t> data);
     void truncate(uint64_t size);
+    /// Writes and truncations so far. Storing an edit records the count it saw,
+    /// so a write that lands while the edit is stored keeps the session dirty.
+    uint64_t changes() const;
+    void mark_stored(uint64_t changes);
     bool dirty() const;
-    void mark_clean();
-    const VFilePtr& original() const { return original_; }
 
 private:
     Bytes read_locked(uint64_t off, size_t len) const;
@@ -48,9 +52,9 @@ private:
     int fd_ = -1;
     mutable std::mutex mu_;
     std::map<uint64_t, uint64_t> written_;  // [start, end) ranges held by the scratch file
-    uint64_t size_;
-    uint64_t original_limit_;  // original bytes are visible below this (shrinks with truncation)
-    bool dirty_ = false;
+    uint64_t size_ = 0;
+    uint64_t original_limit_ = 0;  // original bytes are visible below this (shrinks with truncation)
+    uint64_t changes_ = 0, stored_ = 0;
 };
 
 }  // namespace wm
