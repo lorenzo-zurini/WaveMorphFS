@@ -1,5 +1,7 @@
 # WaveMorphFS
 
+[![Buy me a beer on Ko-fi](https://img.shields.io/badge/Buy%20me%20a%20beer-%F0%9F%8D%BA-FF5E5B?logo=kofi&logoColor=white&style=for-the-badge)](https://ko-fi.com/lorenzo_zurini)
+
 *Ordo ab chao.*
 
 WaveMorphFS takes a music collection as it really is (scattered folders, whole-disc
@@ -634,7 +636,7 @@ on every change.
 
 WaveMorphFS is a one-person project, developed in spare time. If it brought order
 to your collection and you'd like to say thanks, you can
-[buy me a coffee on Ko-fi](https://ko-fi.com/lorenzo_zurini).
+[buy me a beer on Ko-fi](https://ko-fi.com/lorenzo_zurini).
 
 ## Contributing, security, license
 
