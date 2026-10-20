@@ -41,6 +41,13 @@ std::pair<std::vector<Seg>, uint64_t> retag_at(const File& f, uint64_t pos, cons
 /// + TRACKTOTAL, TXXX -> its description, COMM -> COMMENT, other text frames by
 /// id). Pictures and binary frames are not tags and are skipped.
 Tags read_tags(std::span<const uint8_t> tag);
+/// Names of the frames of an ID3v2 tag that are not tags (private, binary and
+/// URL frames; pictures excepted): the frame id, followed by ":" and the frame's
+/// owner or description where it has one ("PRIV:<owner>", "GEOB:<description>",
+/// "UFID:<owner>", "POPM:<email>", "WXXX:<description>", "MCDI"). An overlay
+/// removal ("NAME": "") of such a name removes those frames; a bare id removes
+/// all frames with it.
+std::vector<std::string> other_frame_names(std::span<const uint8_t> tag);
 /// The image of an ID3v2 tag's front-cover picture (APIC type 3), else of its
 /// first picture; nullopt if it has none.
 std::optional<Bytes> front_picture(std::span<const uint8_t> tag);

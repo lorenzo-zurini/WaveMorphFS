@@ -1250,6 +1250,9 @@ void Library::add_source_file(ListingBuild& b, const DirItem& n) {
                 std::vector<std::string> drop;
                 for (auto& [k, v] : own.m)
                     if (!v.empty() && !filters.kept(k, -1)) drop.push_back(k);
+                // and ID3 frames that are not tags (PRIV, GEOB, ...), by their names
+                for (auto& n : read_other_frames(ext, [&](uint64_t o, size_t l) { return src.read_vec(o, l); }, src.size()))
+                    if (!filters.kept(n, -1)) drop.push_back(n);
                 for (auto& [k, v] : ov.m)
                     if (!v.empty() && !filters.kept(k, filters.set_at(k))) drop.push_back(k);
                 for (auto& k : drop) ov.m[k] = {};

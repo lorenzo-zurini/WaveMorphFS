@@ -5,6 +5,7 @@
 #include <array>
 #include <cstring>
 #include <map>
+#include <set>
 #include <tuple>
 
 namespace wm::id3 {
@@ -371,7 +372,71 @@ std::pair<SourceTag, size_t> parse_tag(std::span<const uint8_t> b) {
     return {std::move(tag), total};
 }
 
+namespace {
+
+/// ID3v2.4 (and v2.3) frames whose contents are not text tags.
+bool other_frame(std::string_view id) {
+    static const std::set<std::string, std::less<>> ids = {"AENC", "ASPI", "COMR", "ENCR", "EQU2", "EQUA", "ETCO", "GEOB", "GRID", "IPLS", "LINK", "MCDI",
+                                                           "MLLT", "OWNE", "PCNT", "POPM", "POSS", "PRIV", "RBUF", "RVA2", "RVAD", "RVRB", "SEEK", "SIGN",
+                                                           "SYLT", "SYTC", "UFID", "USER", "WCOM", "WCOP", "WOAF", "WOAR", "WOAS", "WORS", "WPAY", "WPUB",
+                                                           "WXXX"};
+    return ids.contains(id);
+}
+
+/// The frame id `name` refers to ("PRIV" or "PRIV:<owner>"), if it names frames that are not tags.
+std::optional<std::string> other_frame_id(std::string_view name) {
+    if (name.size() < 4 || (name.size() > 4 && name[4] != ':')) return std::nullopt;
+    std::string id = upper(name.substr(0, 4));
+    return other_frame(id) ? std::optional(id) : std::nullopt;
+}
+
+/// "<id>" or "<id>:<owner or description>" of a frame that is not a tag.
+std::optional<std::string> other_frame_name(const Frame& f) {
+    if (!other_frame(f.sid())) return std::nullopt;
+    std::string id(f.sid());
+    auto b = body_of(f);
+    if (!b) return id;
+    auto latin1_to_nul = [](std::span<const uint8_t> s) {
+        auto e = std::find(s.begin(), s.end(), 0);
+        return decode_text(0, s.subspan(0, size_t(e - s.begin())));
+    };
+    std::string owner;
+    if (id == "PRIV" || id == "UFID" || id == "POPM") {
+        owner = latin1_to_nul(*b);
+    } else if ((id == "GEOB" || id == "WXXX") && !b->empty()) {
+        uint8_t enc = (*b)[0];
+        auto rest = b->subspan(1);
+        if (id == "GEOB") {  // MIME type (Latin-1), file name, then the description
+            auto mime_end = std::find(rest.begin(), rest.end(), 0);
+            rest = rest.subspan(std::min(rest.size(), size_t(mime_end - rest.begin()) + 1));
+            rest = split_terminated(enc, rest).second;
+        }
+        owner = decode_text(enc, split_terminated(enc, rest).first);
+    }
+    return owner.empty() ? id : id + ":" + owner;
+}
+
+}  // namespace
+
+std::vector<std::string> other_frame_names(std::span<const uint8_t> tag) {
+    std::vector<std::string> out;
+    if (tag.size() < 10 || std::memcmp(tag.data(), "ID3", 3) != 0) return out;
+    for (auto& f : parse_tag(tag).first.frames)
+        if (auto n = other_frame_name(f); n && std::find(out.begin(), out.end(), *n) == out.end()) out.push_back(*n);
+    return out;
+}
+
 void apply(std::vector<Frame>& frames, const Tags& overlay) {
+    // removals of frames that are not tags (see other_frame_names)
+    for (auto& [k, vs] : overlay.m) {
+        auto id = other_frame_id(k);
+        if (!id || !vs.empty()) continue;
+        std::erase_if(frames, [&](const Frame& f) {
+            if (f.sid() != *id) return false;
+            auto n = other_frame_name(f);
+            return k.size() == 4 || (n && iequals(*n, k));
+        });
+    }
     // track / disc: number and total share one "n/total" frame
     for (auto [id, num, total] : {std::tuple{"TRCK", "TRACKNUMBER", "TRACKTOTAL"}, std::tuple{"TPOS", "DISCNUMBER", "DISCTOTAL"}}) {
         bool num_named = overlay.get_all(num) != nullptr;
@@ -388,7 +453,7 @@ void apply(std::vector<Frame>& frames, const Tags& overlay) {
     // owner's name (TDRC -> DATE) replaces the other field's (YEAR).
     std::vector<std::pair<Target, const std::vector<std::string>*>> picks;
     for (auto& [k, vs] : overlay.m) {
-        if (is_number_field(k)) continue;
+        if (is_number_field(k) || other_frame_id(k)) continue;
         Target t = target_for(k);
         auto it = std::find_if(picks.begin(), picks.end(), [&](auto& p) { return p.first.same_place(t); });
         if (it == picks.end()) picks.emplace_back(std::move(t), &vs);

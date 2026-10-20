@@ -57,6 +57,9 @@ std::optional<std::string> canonical_track_key(std::string_view k) {
 }
 
 bool tag_pattern_matches(std::string_view pattern, std::string_view name) {
+    // a frame that is not a tag ("PRIV:<owner>", see id3::other_frame_names) is
+    // also named by its frame id alone
+    if (name.size() > 5 && name[4] == ':' && pattern.find(':') == std::string_view::npos && tag_pattern_matches(pattern, name.substr(0, 4))) return true;
     if (pattern.find('*') == std::string_view::npos) return same_field(pattern, name);
     // a glob over the name as written and over its canonical field name
     auto glob = [](std::string_view p, std::string_view s) {

@@ -444,6 +444,10 @@ files, the CUE sheets or a tagger put in:
 - Names match the way sidecar names do (any case, and synonyms from other
   formats: dropping `ARTISTS` also removes an MP3's `TXXX:ARTISTS` frame), and `*`
   matches any run of characters (`MUSICBRAINZ_*`, `*_SORT`, `REPLAYGAIN_*`).
+- In MP3 and DSF files, ID3 frames that aren't tags can be dropped too: private
+  and binary frames such as `PRIV`, `GEOB`, `UFID` or `POPM`, and URL frames, by
+  frame ID (`"PRIV"` removes them all) or with their owner or description, the
+  way mutagen shows them (`"PRIV:mailto:uits-info@umusic.com"`, `"GEOB:*"`).
 - They can be set at every level. In a sidecar at the top of the tags directory
   (`<tags-dir>/wavemorph.json`) they apply to the whole library, in a root's or
   any folder's sidecar in the tags tree to that folder and everything below it,

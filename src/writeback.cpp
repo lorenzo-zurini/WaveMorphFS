@@ -138,6 +138,19 @@ std::optional<Bytes> read_front_cover(const std::string& ext, const ByteReader& 
     return std::nullopt;
 }
 
+std::vector<std::string> read_other_frames(const std::string& ext, const ByteReader& read, uint64_t size) {
+    uint64_t pos = 0;
+    if (ext == "dsf") {
+        Bytes h = read(0, 28);
+        if (h.size() < 28 || !(pos = le64(&h[20]))) return {};
+    } else if (ext != "mp3") {
+        return {};
+    }
+    auto len = id3::tag_length(read(pos, 10));
+    if (!len || *len > size || pos > size - *len) return {};
+    return id3::other_frame_names(read(pos, size_t(*len)));
+}
+
 Tags tag_changes(const Tags& before, const Tags& after) {
     struct Field {
         std::string name;

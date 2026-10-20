@@ -30,6 +30,10 @@ Tags read_file_tags(const std::string& ext, const ByteReader& read, uint64_t siz
 /// output, so a change to one could not be honoured.
 std::optional<Bytes> read_front_cover(const std::string& ext, const ByteReader& read, uint64_t size);
 
+/// Names of the ID3 frames of an MP3 / DSF file that are not tags
+/// (id3::other_frame_names); none for other formats.
+std::vector<std::string> read_other_frames(const std::string& ext, const ByteReader& read, uint64_t size);
+
 /// What changed from `before` to `after`, field by field (synonyms are the same
 /// field): changed or added fields with their new values, removed fields with
 /// an empty value list.

@@ -3,6 +3,7 @@
 // at every level from the whole library down to one file.
 #include <thread>
 
+#include "id3.hpp"
 #include "library.hpp"
 #include "sidecar.hpp"
 #include "test.hpp"
@@ -165,4 +166,61 @@ TEST(filters_whitelists_add_up_and_drops_still_apply) {
     CHECK_MSG(!has(a, "ENCODER"), "names no whitelist lists are dropped");
     CHECK_MSG(!has(a, "COMPOSER") && has(b, "COMPOSER"), "a more specific drop beats an inherited keep");
     CHECK(has(a, "TITLE") && has(b, "TITLE"));
+}
+
+namespace {
+
+/// An ID3v2.4 tag of the given frames (id, body), synchsafe sizes.
+Bytes id3_tag(const std::vector<std::pair<std::string, Bytes>>& frames) {
+    auto ss = [](Bytes& b, uint32_t n) {
+        for (int sh : {21, 14, 7, 0}) b.push_back(uint8_t(n >> sh & 0x7F));
+    };
+    Bytes body;
+    for (auto& [id, data] : frames) {
+        append(body, id);
+        ss(body, uint32_t(data.size()));
+        body.push_back(0);
+        body.push_back(0);
+        append(body, data);
+    }
+    Bytes tag = {'I', 'D', '3', 4, 0, 0};
+    ss(tag, uint32_t(body.size()));
+    append(tag, body);
+    return tag;
+}
+
+Bytes text(std::string_view s) { return Bytes(s.begin(), s.end()); }
+
+}  // namespace
+
+TEST(filters_drop_id3_frames_that_are_not_tags) {
+    Lib l;
+    // an MP3 with private, binary and URL frames next to its tags
+    fs::path raw = l.tmp / "raw.mp3";
+    CHECK(run({"ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=d=1", "-c:a", "libmp3lame", "-write_id3v2", "0", raw.string()}).ok());
+    Bytes mp3 = id3_tag({{"TIT2", text(std::string("\x03Tune", 5))},
+                         {"PRIV", text(std::string("mailto:uits-info@umusic.com\0<uits/>", 35))},
+                         {"PRIV", text(std::string("WM/MediaClassPrimaryID\0xx", 25))},
+                         {"GEOB", text(std::string("\x00" "application/x\0f.bin\0Serato Markers\0data", 41))},
+                         {"UFID", text(std::string("http://musicbrainz.org\0abc", 26))}});
+    append(mp3, *try_read_file(raw));
+    fs::create_directories(l.src / "A");
+    atomic_write(l.src / "A" / "tune.mp3", mp3);
+    fs::last_write_time(l.src / "A" / "tune.mp3", fs::file_time_type::clock::now() - std::chrono::hours(1));
+    auto names = id3::other_frame_names(mp3);
+    CHECK_MSG((names == std::vector<std::string>{"PRIV:mailto:uits-info@umusic.com", "PRIV:WM/MediaClassPrimaryID", "GEOB:Serato Markers",
+                                                  "UFID:http://musicbrainz.org"}),
+              "{}", names.size());
+    l.sidecar("Lib/A", R"({"_drop": ["PRIV:mailto:uits-info@umusic.com", "GEOB"]})");
+    auto& lib = l.open();
+    auto e = lib.list_dir(l.src / "A")->find("tune.mp3");
+    CHECK(e != nullptr);
+    if (!e) return;
+    Bytes served = e->file->read_at(0, size_t(e->file->size()));
+    auto left = id3::other_frame_names(served);
+    CHECK_MSG((left == std::vector<std::string>{"PRIV:WM/MediaClassPrimaryID", "UFID:http://musicbrainz.org"}),
+              "by full name and by frame id; other frames stay ({} left)", left.size());
+    CHECK(id3::read_tags(served).get("TITLE") && *id3::read_tags(served).get("TITLE") == "Tune");
+    CHECK_MSG(tag_pattern_matches("PRIV*", "PRIV:mailto:x") && tag_pattern_matches("PRIV", "PRIV:mailto:x"), "a frame id names its frames");
+    CHECK(!tag_pattern_matches("PRIV:other", "PRIV:mailto:x"));
 }
