@@ -9,6 +9,15 @@ Generated files carry an *output epoch*: when a release changes what generated
 files contain, their modification times move forward, so music servers re-read
 them once on their next scan.
 
+## [Unreleased]
+
+### Added
+- `"_hide"` patterns: `*`/`?` names (`"*.m3u"`, case-insensitive) and paths
+  (`"CD*/*.log"`, or `"/..."` tied to the sidecar's folder) hide matching files
+  in the folder and every folder below it, set anywhere from the whole library
+  (`<tags-dir>/wavemorph.json`) down. `"_hide": false` in a file entry shows a
+  file again. Plain names keep their meaning (that folder only).
+
 ## [0.2.3] - 2026-10-20
 
 ### Added
@@ -170,6 +179,7 @@ lossless images (APE, WavPack, TTA, TAK, WAV, ALAC) encoded to FLAC on the fly,
 SACD ISOs (plain DSD and DST) as DSF, sidecar tags for every file kind, tag edits
 on the mount stored in sidecars, and a container image for amd64 and arm64.
 
+[Unreleased]: https://github.com/lorenzo-zurini/WaveMorphFS/compare/v0.2.3...HEAD
 [0.2.3]: https://github.com/lorenzo-zurini/WaveMorphFS/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/lorenzo-zurini/WaveMorphFS/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/lorenzo-zurini/WaveMorphFS/compare/v0.2.0...v0.2.1

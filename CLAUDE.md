@@ -104,7 +104,9 @@ file, mtime, tag_section/tag_key/tag_ext for edit routing).
   folder, its track and file entries. Most specific mention decides, keep beats
   drop within a level, any `_keep` makes it a whitelist, explicit sidecar values
   beat less specific drops; regular files get dropped names as retag removals;
-  apply_edit doesn't store dropped names.
+  apply_edit doesn't store dropped names. `_hide` patterns (`*`/`?`, or paths
+  matched against the end of the path below the pattern's folder, `/...`
+  anchored) inherit the same way (ListingBuild::hides); plain names stay local.
 - **Writable mount**: writes go to a sparse anonymous scratch file; on
   flush/release tags are read back (Vorbis/ID3/MP4 → names), diffed against the
   generated file (`tag_changes`: synonyms one field, placeholder zeros and a YEAR

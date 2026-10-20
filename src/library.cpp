@@ -190,6 +190,9 @@ struct ListingBuild {
     /// newest sidecar or tags-tree change: files whose tags come from sidecars change with it
     std::optional<int64_t> edits_mtime;
     std::vector<TagFilter> inherited;  // "_keep"/"_drop" from the tags tree above (Library::inherited_filters)
+    std::vector<std::pair<std::string, size_t>> inherited_hides;  // "_hide" patterns from above, with their depth
+    std::vector<std::string> rel_parts;  // the folder's path below its root
+    int64_t inherited_mtime = 0;
     CoverSet covers;
     std::set<std::string> hidden;  // source files not listed as they are
     std::vector<Entry> entries;    // listed under their own names
@@ -201,6 +204,29 @@ struct ListingBuild {
     /// `n` is still being written: download clients keep a partial file as "<n>.!qB"
     bool incomplete(const std::string& n) const { return name_set.contains(n + ".!qB") || name_set.contains(n + ".!qb"); }
     void settle_until(Clock::time_point until) { retry_at = retry_at ? std::min(*retry_at, until) : until; }
+    /// Whether "_hide" (the folder's sidecar or a pattern from above) hides `name`;
+    /// "_hide": false in the file's table shows it whatever the patterns say.
+    bool hides(const std::string& name) const {
+        if (sc && sc->shown.contains(name)) return false;
+        if (sc && sc->hides(name)) return true;
+        for (auto& [pattern, depth] : inherited_hides) {
+            if (pattern.find('/') == std::string::npos) {
+                if (hide_pattern_matches(pattern, name)) return true;
+                continue;
+            }
+            // a path pattern matches the end of the path below its folder
+            // ("CD*/*.log": any CD folder's logs); "/..." anchors it to that folder
+            bool anchored = pattern.starts_with('/');
+            std::string_view pat = anchored ? std::string_view(pattern).substr(1) : std::string_view(pattern);
+            size_t parts = size_t(std::count(pat.begin(), pat.end(), '/'));  // folders the pattern names
+            size_t below = rel_parts.size() > depth ? rel_parts.size() - depth : 0;
+            if (anchored ? below != parts : below < parts) continue;
+            std::string rel;
+            for (size_t i = rel_parts.size() - parts; i < rel_parts.size(); i++) rel += rel_parts[i] + "/";
+            if (hide_pattern_matches(pat, rel + name)) return true;
+        }
+        return false;
+    }
 };
 
 /// The disc tracks belong to. With several discs in one folder the disc number is
@@ -287,7 +313,7 @@ std::vector<ImageGroup> image_groups(ListingBuild& b) {
         else if (b.incomplete(cue_file_name(cue))) b.hidden.insert(n.name);  // image still being written as <name>.!qB
     }
     std::erase_if(groups, [&](const ImageGroup& g) {
-        if (!b.sc || !(b.sc->hides(g.cue_name) || b.sc->hides(g.img_name))) return false;
+        if (!(b.hides(g.cue_name) || b.hides(g.img_name))) return false;
         b.hidden.insert(g.cue_name);
         b.hidden.insert(g.img_name);
         return true;
@@ -980,29 +1006,37 @@ std::vector<fs::path> Library::inherited_dirs(const fs::path& dir) const {
 
 Library::InheritedFilters Library::inherited_filters(const fs::path& dir) const {
     InheritedFilters out;
-    for (auto& d : inherited_dirs(dir)) {
-        fs::path p = d / SIDECAR_NAME;
+    auto dirs = inherited_dirs(dir);
+    for (size_t i = 0; i < dirs.size(); i++) {
+        fs::path p = dirs[i] / SIDECAR_NAME;
         auto m = mtime_ns(p);
         if (!m) continue;
-        TagFilter f;
+        InheritedRules r;
         bool known = false;
         {
             std::lock_guard g(mu_);
-            if (auto it = filter_files_.find(p); it != filter_files_.end() && it->second.first == *m) f = it->second.second, known = true;
+            if (auto it = filter_files_.find(p); it != filter_files_.end() && it->second.first == *m) r = it->second.second, known = true;
         }
         if (!known) {
-            // only the folder-level "_keep"/"_drop" are inherited (track and file
-            // tables name entries of that folder alone)
+            // only the folder-level "_keep"/"_drop" and "_hide" patterns are
+            // inherited (track and file tables, and plain "_hide" names, are about
+            // entries of that folder alone)
             try {
-                if (auto text = try_read_text(p)) f = Sidecar::parse(*text).filter;
+                if (auto text = try_read_text(p)) {
+                    Sidecar sc = Sidecar::parse(*text);
+                    r = {sc.filter, sc.hide_patterns};
+                }
             } catch (const std::exception& e) {
                 warn("sidecar {}: {}", p.string(), e.what());
             }
             std::lock_guard g(mu_);
-            filter_files_[p] = {*m, f};
+            filter_files_[p] = {*m, r};
         }
-        if (f.empty()) continue;
-        out.levels.push_back(std::move(f));
+        if (r.filter.empty() && r.hides.empty()) continue;
+        if (!r.filter.empty()) out.levels.push_back(std::move(r.filter));
+        // relative to the folder: the top of the tags tree and a root's folder are
+        // both a root's top (depth 0), each folder below one deeper
+        for (auto& h : r.hides) out.hides.emplace_back(h, i == 0 ? 0 : i - 1);
         out.mtime = std::max(out.mtime, *m);
     }
     return out;
@@ -1106,6 +1140,10 @@ std::shared_ptr<Listing> Library::build_listing(const fs::path& dir, const Sig& 
     // "_keep"/"_drop" from above change what every file here is served with
     auto inherited = inherited_filters(dir);
     b.inherited = std::move(inherited.levels);
+    b.inherited_hides = std::move(inherited.hides);
+    b.inherited_mtime = inherited.mtime;
+    if (auto r = root_of(dir))
+        for (auto& c : r->second) b.rel_parts.push_back(c.string());
     if (inherited.mtime) b.edits_mtime = std::max(b.edits_mtime.value_or(0), inherited.mtime);
     for (auto& n : b.names)
         if (n.is_file && !is_ignored(n.name))
@@ -1114,10 +1152,10 @@ std::shared_ptr<Listing> Library::build_listing(const fs::path& dir, const Sig& 
     add_image_groups(b);
     add_sacd_isos(b);
     for (auto& n : b.names)
-        if (!b.hidden.contains(n.name) && !is_ignored(n.name) && !(b.sc && !n.is_dir && b.sc->hides(n.name))) add_source_file(b, n);
+        if (!b.hidden.contains(n.name) && !is_ignored(n.name) && !(!n.is_dir && b.hides(n.name))) add_source_file(b, n);
     add_overlay_cover(b);
     merge_virtuals(b);
-    if (b.sc) std::erase_if(b.entries, [&](const Entry& e) { return b.sc->hides(e.name); });
+    std::erase_if(b.entries, [&](const Entry& e) { return b.hides(e.name); });
     std::stable_sort(b.entries.begin(), b.entries.end(), [](auto& x, auto& y) { return x.name < y.name; });
 
     std::optional<int64_t> gen_time;
@@ -1127,7 +1165,8 @@ std::shared_ptr<Listing> Library::build_listing(const fs::path& dir, const Sig& 
     }
     auto l = std::make_shared<Listing>();
     l->entries = std::move(b.entries);
-    l->mtime = max_mtime({sig.dir_mtime, sig.sidecar_mtime, sig.overlay_mtime, gen_time});
+    // what is hidden (or not) may change with a sidecar above
+    l->mtime = max_mtime({sig.dir_mtime, sig.sidecar_mtime, sig.overlay_mtime, gen_time, b.inherited_mtime ? std::optional(b.inherited_mtime) : std::nullopt});
     for (auto& e : l->entries)
         if (!e.is_dir) l->mtime = std::max(l->mtime, e.mtime);
     l->sig = sig;
@@ -1189,7 +1228,7 @@ void Library::add_sacd_isos(ListingBuild& b) {
     // only SACDs count as discs: a DVD image next to one must not number it
     std::vector<const DirItem*> isos;
     for (auto& n : b.names)
-        if (n.is_file && ext_lower(n.name) == "iso" && !(b.sc && b.sc->hides(n.name)) && !b.incomplete(n.name) && is_sacd(b.dir / n.name))
+        if (n.is_file && ext_lower(n.name) == "iso" && !b.hides(n.name) && !b.incomplete(n.name) && is_sacd(b.dir / n.name))
             isos.push_back(&n);
     bool multi = isos.size() > 1;
     for (size_t ii = 0; ii < isos.size(); ii++) {

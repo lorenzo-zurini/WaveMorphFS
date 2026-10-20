@@ -419,7 +419,13 @@ one in the tags tree wins.
 - `"_hide"` hides files. At the top level it takes a name or a list of names in
   the folder: a CUE sheet, an image or an SACD ISO (with all its tracks), or any
   file of the mount. Inside a `track` or `file` entry, `"_hide": true` hides that
-  one track or file. Hidden sheets and ISOs don't count as discs.
+  one track or file, and `"_hide": false` shows a file a pattern would hide.
+  Hidden sheets and ISOs don't count as discs.
+- `"_hide"` also takes patterns, which reach every folder below: `*` and `?` in a
+  name (`"*.m3u"`, any case), or a path (`"CD*/*.log"` matches the logs of any CD
+  folder below; a leading `/` ties it to the sidecar's own folder). Put
+  `{"_hide": ["*.m3u", "*.m3u8", "*.pls"]}` in `<tags-dir>/wavemorph.json` to
+  keep playlists out of the whole library.
 - Top-level keys that start with `_` are settings (`_hide`, `_keep`, `_drop`,
   `_target`, `_cover`); others, such as `"_comment"`, are ignored. `//` comments are
   allowed, but a sidecar in the tags tree is rewritten without them when tags are

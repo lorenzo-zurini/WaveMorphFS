@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "sidecar.hpp"
 
+#include <algorithm>
+
 #include <nlohmann/json.hpp>
 
 namespace wm {
@@ -54,6 +56,35 @@ std::optional<std::string> canonical_track_key(std::string_view k) {
     auto d = parse_u64(std::string(k.substr(0, sep))), n = parse_u64(std::string(k.substr(sep + 1)));
     if (!d || !n) return std::nullopt;
     return std::format("{}-{:02}", *d, *n);
+}
+
+bool hide_pattern_matches(std::string_view pattern, std::string_view path) {
+    std::string p = lower(pattern), s = lower(path);
+    // iterative glob; "*" and "?" never match "/"
+    size_t pi = 0, si = 0, star = std::string::npos, mark = 0;
+    while (si < s.size()) {
+        if (pi < p.size() && p[pi] == '*') {
+            star = pi++;
+            mark = si;
+        } else if (pi < p.size() && (p[pi] == s[si] || (p[pi] == '?' && s[si] != '/'))) {
+            pi++;
+            si++;
+        } else if (star != std::string::npos && s[mark] != '/') {
+            pi = star + 1;
+            si = ++mark;
+        } else {
+            return false;
+        }
+    }
+    while (pi < p.size() && p[pi] == '*') pi++;
+    return pi == p.size();
+}
+
+bool Sidecar::hides(const std::string& name) const {
+    if (shown.contains(name)) return false;
+    if (hidden.contains(name)) return true;
+    return std::any_of(hide_patterns.begin(), hide_patterns.end(),
+                       [&](auto& p) { return p.find('/') == std::string::npos && hide_pattern_matches(p, name); });
 }
 
 bool tag_pattern_matches(std::string_view pattern, std::string_view name) {
@@ -124,10 +155,15 @@ Sidecar Sidecar::parse(const std::string& text) {
         if (!sc.target) warn("sidecar: ignoring invalid _target '{}'", t->get<std::string>());
     }
     if (auto h = doc.find("_hide"); h != doc.end()) {
-        if (h->is_string()) sc.hidden.insert(h->get<std::string>());
+        auto add = [&](const std::string& s) {
+            if (s.empty()) return;
+            if (is_hide_pattern(s)) sc.hide_patterns.push_back(s);
+            else sc.hidden.insert(s);
+        };
+        if (h->is_string()) add(h->get<std::string>());
         else if (h->is_array())
             for (auto& x : *h)
-                if (x.is_string()) sc.hidden.insert(x.get<std::string>());
+                if (x.is_string()) add(x.get<std::string>());
     }
     auto str = [](const json& t, const char* k) -> std::optional<std::string> {
         auto it = t.find(k);
@@ -158,7 +194,10 @@ Sidecar Sidecar::parse(const std::string& text) {
         for (auto& [k, v] : s->items()) {
             if (!v.is_object()) continue;
             sc.files[k] = table_to_tags(v);
-            if (auto h = v.find("_hide"); h != v.end() && truthy(*h)) sc.hidden.insert(k);
+            if (auto h = v.find("_hide"); h != v.end()) {
+                if (truthy(*h)) sc.hidden.insert(k);
+                else sc.shown.insert(k);  // "_hide": false shows it whatever a pattern says
+            }
             if (auto c = str(v, "_cover")) sc.file_covers[k] = *c;
             if (auto t = target_of(v)) sc.file_targets[k] = *t;
             if (auto f = filter_of(v); !f.empty()) sc.file_filters[k].add(f);
@@ -173,6 +212,8 @@ void Sidecar::merge(const Sidecar& later, int64_t later_mtime) {
     for (auto& [k, v] : later.files) files[k].merge(v);
     for (auto& [k, v] : later.track_names) track_names[k] = v;
     hidden.insert(later.hidden.begin(), later.hidden.end());
+    hide_patterns.insert(hide_patterns.end(), later.hide_patterns.begin(), later.hide_patterns.end());
+    shown.insert(later.shown.begin(), later.shown.end());
     hidden_tracks.insert(later.hidden_tracks.begin(), later.hidden_tracks.end());
     // "_target"s are not merged: they are read from the tags tree only (placement.cpp)
     if (later.cover) cover = later.cover;

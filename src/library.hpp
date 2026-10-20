@@ -275,11 +275,13 @@ private:
     Work<SacdDisc> sacd_state(const fs::path& src, const fs::path& dir, bool mc);
 
     Sig signature(const fs::path& dir) const;
-    /// The "_keep"/"_drop" a folder inherits: from the sidecar at the top of the
-    /// tags tree, then from each tags-tree folder above the folder's own, and the
-    /// newest mtime among those that set any.
+    /// The "_keep"/"_drop" and "_hide" patterns a folder inherits: from the
+    /// sidecar at the top of the tags tree, then from each tags-tree folder above
+    /// the folder's own, and the newest mtime among those that set any.
     struct InheritedFilters {
         std::vector<TagFilter> levels;  // most general first
+        /// "_hide" patterns, with the depth (below its root) of the folder they are relative to
+        std::vector<std::pair<std::string, size_t>> hides;
         int64_t mtime = 0;
     };
     InheritedFilters inherited_filters(const fs::path& dir) const;
@@ -342,7 +344,11 @@ private:
     std::set<fs::path> md5_queued_, encode_queued_;
     std::map<fs::path, JobFailure> md5_failed_, encode_failed_;
     std::map<fs::path, std::string> sidecar_errors_;  // source folder -> why its sidecars do not parse
-    mutable std::map<fs::path, std::pair<int64_t, TagFilter>> filter_files_;  // tags-tree sidecar -> mtime, its folder filter
+    struct InheritedRules {
+        TagFilter filter;
+        std::vector<std::string> hides;
+    };
+    mutable std::map<fs::path, std::pair<int64_t, InheritedRules>> filter_files_;  // tags-tree sidecar -> mtime, what it passes down
 
     std::mutex jobs_mu_;
     std::condition_variable jobs_cv_;

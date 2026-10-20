@@ -25,10 +25,12 @@
 // exactly as written. Names starting with "_" are not tags: "_name" in a track
 // table pins that track's file name (set when it is first edited on the mount,
 // so renaming by title does not move files under tag editors like beets), and
-// "_hide": true in a track or file table hides that track or file. A top-level
-// "_hide": ["name", ...] hides files of the folder by name: a source CUE sheet,
-// image or SACD ISO (with all its tracks; the remaining discs are numbered as if
-// it were not there), or any entry of the mount. "_target" places files elsewhere
+// "_hide": true in a track or file table hides that track or file ("_hide": false
+// shows a file a pattern hides). A top-level "_hide": ["name", ...] hides files of
+// the folder by name: a source CUE sheet, image or SACD ISO (with all its tracks;
+// the remaining discs are numbered as if it were not there), or any entry of the
+// mount; entries with "*", "?" or "/" are patterns (is_hide_pattern), which the
+// tags tree passes down to every folder below. "_target" places files elsewhere
 // in the mount: at the top level it moves the whole folder (subfolders follow
 // unless they have their own), in a track or file table it moves that one file;
 // the value is a directory path relative to the mount root ("Classical Music/
@@ -71,6 +73,13 @@ struct TagFilter {
         drop.insert(drop.end(), o.drop.begin(), o.drop.end());
     }
 };
+/// A "_hide" entry with "*", "?" or "/" is a pattern; others are plain file names.
+inline bool is_hide_pattern(std::string_view s) { return s.find_first_of("*?/") != std::string_view::npos; }
+/// Whether `path` matches "_hide" pattern `pattern`: case-insensitive, "*" and
+/// "?" within one path component. (A pattern with "/" is matched against the end
+/// of a file's path below the pattern's folder, or with a leading "/" against
+/// the whole of it; see ListingBuild::hides.)
+bool hide_pattern_matches(std::string_view pattern, std::string_view path);
 /// Whether tag name `name` matches `pattern` (see TagFilter).
 bool tag_pattern_matches(std::string_view pattern, std::string_view name);
 /// "a//b/ c" -> "a/b/ c"; nullopt for empty paths and "." / ".." / hidden components.
@@ -86,6 +95,8 @@ struct Sidecar {
     std::map<std::string, Tags> files;
     std::map<std::string, std::string> track_names;  // canonical track key -> pinned file name ("_name")
     std::set<std::string> hidden;                     // "_hide": names, and file tables with "_hide": true
+    std::vector<std::string> hide_patterns;           // "_hide" entries with wildcards or "/" (is_hide_pattern)
+    std::set<std::string> shown;                      // file tables with "_hide": false
     std::set<std::string> hidden_tracks;              // canonical keys of track tables with "_hide": true
     // "_target"s, from parse() only: load() leaves them out (placements come from the tags tree)
     std::optional<std::string> target;                // "_target" of the folder (normalized)
@@ -114,7 +125,8 @@ struct Sidecar {
     const Tags* file(const std::string& name) const;
     /// Pinned file name of track `n` of disc `disc`, if any.
     const std::string* track_name(std::optional<uint32_t> disc, uint32_t n) const;
-    bool hides(const std::string& name) const { return hidden.contains(name); }
+    /// Whether this sidecar hides file `name` of its folder (by name or by a pattern).
+    bool hides(const std::string& name) const;
     bool hides_track(std::optional<uint32_t> disc, uint32_t n) const;
     /// Serialize tags to sidecar JSON (used by `tags-init`).
     static std::string render(const Tags& album, const std::vector<std::pair<std::string, Tags>>& tracks,

@@ -224,3 +224,24 @@ TEST(filters_drop_id3_frames_that_are_not_tags) {
     CHECK_MSG(tag_pattern_matches("PRIV*", "PRIV:mailto:x") && tag_pattern_matches("PRIV", "PRIV:mailto:x"), "a frame id names its frames");
     CHECK(!tag_pattern_matches("PRIV:other", "PRIV:mailto:x"));
 }
+
+TEST(hide_patterns_inherit_down_the_tags_tree) {
+    Lib l;
+    for (auto* f : {"A/a.flac", "A/list.m3u", "A/LIST2.M3U8", "A/radio.pls", "A/CD1/x.flac", "A/CD1/disc.m3u", "A/CD1/rip.log", "A/rip.log",
+                    "B/keep.m3u", "B/song.flac", "B/Scans/front.jpg"}) {
+        fs::create_directories((l.src / f).parent_path());
+        atomic_write(l.src / f, std::string_view("x"));
+    }
+    CHECK(hide_pattern_matches("*.m3u", "LIST.M3U") && !hide_pattern_matches("*.m3u", "a/list.m3u") && hide_pattern_matches("cd?/*.log", "CD1/rip.log"));
+    l.sidecar("", R"({"_hide": ["*.m3u", "*.m3u8", "*.pls", "CD*/*.log"]})");  // the whole library
+    l.sidecar("Lib/B", R"({"_hide": "Scans", "file": {"keep.m3u": {"_hide": false}}})");
+    auto& lib = l.open();
+    auto names = [&](const char* rel) {
+        std::vector<std::string> out;
+        for (auto& e : lib.list_dir(l.src / rel)->entries) out.push_back(e.name);
+        return out;
+    };
+    CHECK_MSG((names("A") == std::vector<std::string>{"CD1", "a.flac", "rip.log"}), "playlists hidden at any depth, any case");
+    CHECK_MSG((names("A/CD1") == std::vector<std::string>{"x.flac"}), "a path pattern matches below its folder");
+    CHECK_MSG((names("B") == std::vector<std::string>{"keep.m3u", "song.flac"}), "\"_hide\": false shows one again; plain names still work");
+}
