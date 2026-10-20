@@ -1,0 +1,168 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// "_keep" / "_drop": tags removed from (and allowed again in) what is served,
+// at every level from the whole library down to one file.
+#include <thread>
+
+#include "library.hpp"
+#include "sidecar.hpp"
+#include "test.hpp"
+#include "writeback.hpp"
+
+using namespace wm;
+
+namespace {
+
+/// Sources under lib/ (root "Lib"), sidecars under tags/.
+struct Lib {
+    wmtest::TempDir tmp{"wm-filters"};
+    fs::path src = tmp / "lib", tags = tmp / "tags";
+    std::shared_ptr<Library> lib;
+
+    Lib() { fs::create_directories(src); }
+    void sidecar(const fs::path& rel, std::string_view json) {
+        fs::create_directories(tags / rel);
+        atomic_write(tags / rel / SIDECAR_NAME, json);
+    }
+    Library& open() {
+        Config cfg;
+        cfg.roots = {{"Lib", src}};
+        cfg.tags_dir = tags;
+        cfg.cache_dir = tmp / "cache";
+        cfg.workers = 0;
+        cfg.recheck = std::chrono::milliseconds(100);
+        lib = Library::create(std::move(cfg));
+        return *lib;
+    }
+};
+
+/// A short FLAC with the given tags, aged so that it counts as settled.
+void flac_with(const fs::path& p, const std::vector<std::string>& tags) {
+    fs::create_directories(p.parent_path());
+    auto st = run({"ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=f=440:d=2", "-c:a", "flac", p.string()});
+    CHECK_MSG(st.ok(), "ffmpeg: {}", st.err);
+    std::vector<std::string> argv = {"metaflac", "--remove-all-tags"};
+    for (auto& t : tags) argv.push_back("--set-tag=" + t);
+    argv.push_back(p.string());
+    CHECK(run(argv).ok());
+    fs::last_write_time(p, fs::file_time_type::clock::now() - std::chrono::hours(1));
+}
+
+Tags served(Library& lib, const fs::path& dir, const std::string& name, const std::string& ext) {
+    auto l = lib.list_dir(dir);
+    auto e = l->find(name);
+    CHECK_MSG(e != nullptr, "{} is listed", name);
+    if (!e) return {};
+    return read_file_tags(ext, [&](uint64_t o, size_t n) { return e->file->read_at(o, n); }, e->file->size());
+}
+
+bool has(const Tags& t, const char* k) { return t.get(k) != nullptr; }
+
+}  // namespace
+
+TEST(tag_patterns_match_like_sidecar_names) {
+    CHECK(tag_pattern_matches("artists", "ARTISTS"));
+    CHECK_MSG(tag_pattern_matches("album_artist", "ALBUMARTIST"), "synonyms are one field");
+    CHECK(!tag_pattern_matches("ARTIST", "ARTISTS"));
+    CHECK_MSG(tag_pattern_matches("MUSICBRAINZ_*", "MusicBrainz Album Id"), "wildcards see canonical names too");
+    CHECK(tag_pattern_matches("musicbrainz_*", "MUSICBRAINZ_RELEASEGROUPID"));
+    CHECK(tag_pattern_matches("*SORT", "albumartist_sort"));
+    CHECK(tag_pattern_matches("*_CREDIT", "ARTIST_CREDIT"));
+    CHECK(tag_pattern_matches("*", "anything"));
+    CHECK(!tag_pattern_matches("REPLAYGAIN_*", "TITLE"));
+}
+
+TEST(filters_inherit_and_more_specific_levels_decide) {
+    Lib l;
+    flac_with(l.src / "Comp" / "Album" / "img.flac",
+              {"ALBUM=Img", "ARTISTS=a; b", "MUSICBRAINZ_ALBUMID=src-id", "GENRE=Classical", "ASIN=B000"});
+    atomic_write(l.src / "Comp" / "Album" / "img.cue",
+                 std::string_view("FILE \"img.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"One\"\n    INDEX 01 00:00:00\n"
+                                  "  TRACK 02 AUDIO\n    TITLE \"Two\"\n    INDEX 01 00:01:00\n"));
+    fs::last_write_time(l.src / "Comp" / "Album" / "img.cue", fs::file_time_type::clock::now() - std::chrono::hours(1));
+    l.sidecar("", R"({"_drop": "ASIN"})");                                     // the whole library
+    l.sidecar("Lib", R"({"_drop": ["ARTISTS", "MUSICBRAINZ_*"]})");            // the root
+    l.sidecar("Lib/Comp/Album", R"({
+        "album": {"MusicBrainz Album Id": "chosen"},
+        "track": {"1": {"_drop": "GENRE"}, "2": {"ARTISTS": "chosen too"}}
+    })");
+    auto& lib = l.open();
+    fs::path dir = l.src / "Comp" / "Album";
+    Tags one = served(lib, dir, "01 - One.flac", "flac"), two = served(lib, dir, "02 - Two.flac", "flac");
+    CHECK_MSG(!has(one, "ASIN") && !has(two, "ASIN"), "dropped library-wide");
+    CHECK_MSG(!has(one, "ARTISTS"), "dropped for the root");
+    CHECK_MSG(two.get("ARTISTS") && *two.get("ARTISTS") == "chosen too", "a value set for a track beats an inherited drop");
+    CHECK_MSG(one.get("MUSICBRAINZ_ALBUMID") && *one.get("MUSICBRAINZ_ALBUMID") == "chosen", "a value set in the folder's sidecar beats an inherited drop");
+    CHECK_MSG(!has(one, "GENRE") && has(two, "GENRE"), "dropped for one track only");
+    CHECK(one.get("TITLE") && *one.get("TITLE") == "One");
+}
+
+TEST(filters_whitelist_regular_files) {
+    Lib l;
+    flac_with(l.src / "A" / "song.flac", {"TITLE=Song", "ARTIST=Someone", "ENCODER=x", "REPLAYGAIN_TRACK_GAIN=-3 dB"});
+    auto st = run({"ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=d=1", "-c:a", "libmp3lame", "-metadata", "title=Tune", "-metadata", "ARTISTS=a; b",
+                   "-metadata", "artist=A", (l.src / "A" / "tune.mp3").string()});
+    CHECK_MSG(st.ok(), "ffmpeg: {}", st.err);
+    fs::last_write_time(l.src / "A" / "tune.mp3", fs::file_time_type::clock::now() - std::chrono::hours(1));
+    // a whitelist for the whole library: only these names are served
+    l.sidecar("", R"({"_keep": ["TITLE", "ARTIST", "TRACKNUMBER"]})");
+    auto& lib = l.open();
+    Tags f = served(lib, l.src / "A", "song.flac", "flac");
+    CHECK(has(f, "TITLE") && has(f, "ARTIST") && !has(f, "ENCODER") && !has(f, "REPLAYGAIN_TRACK_GAIN"));
+    Tags m = served(lib, l.src / "A", "tune.mp3", "mp3");
+    CHECK_MSG(has(m, "TITLE") && has(m, "ARTIST") && !has(m, "ARTISTS"), "the TXXX frame goes too");
+}
+
+TEST(filters_files_they_leave_alone_are_served_unchanged) {
+    Lib l;
+    flac_with(l.src / "A" / "song.flac", {"TITLE=Song"});
+    l.sidecar("", R"({"_drop": "ASIN"})");
+    auto& lib = l.open();
+    auto e = lib.list_dir(l.src / "A")->find("song.flac");
+    CHECK(e && e->file->describe().starts_with("passthrough:"));
+}
+
+TEST(filters_dropped_tags_are_not_stored_from_edits) {
+    Lib l;
+    flac_with(l.src / "A" / "song.flac", {"TITLE=Song"});
+    l.sidecar("Lib", R"({"_drop": ["ARTISTS", "*_SORT"]})");
+    auto& lib = l.open();
+    fs::path dir = l.src / "A";
+    fs::path sidecar = l.tags / "Lib" / "A" / SIDECAR_NAME;
+    // only dropped tags: nothing is written
+    lib.apply_edit(dir, "song.flac", std::string(EDIT_FILE), "song.flac", Tags::from_pairs({{"ARTISTS", "x"}, {"ARTIST_SORT", "y"}}));
+    CHECK_MSG(!fs::exists(sidecar), "the sidecar stays clean");
+    // mixed: the rest is stored
+    lib.apply_edit(dir, "song.flac", std::string(EDIT_FILE), "song.flac", Tags::from_pairs({{"ARTISTS", "x"}, {"GENRE", "Jazz"}}));
+    auto text = try_read_text(sidecar);
+    CHECK(text && text->find("GENRE") != std::string::npos && text->find("ARTISTS") == std::string::npos);
+}
+
+TEST(filters_changing_above_relists_and_moves_mtimes) {
+    Lib l;
+    flac_with(l.src / "A" / "song.flac", {"TITLE=Song", "ASIN=B000"});
+    l.sidecar("Lib", R"({"_drop": "GENRE"})");
+    auto& lib = l.open();
+    fs::path dir = l.src / "A";
+    auto before = lib.list_dir(dir);
+    CHECK(has(served(lib, dir, "song.flac", "flac"), "ASIN"));
+    int64_t mt = before->find("song.flac")->mtime;
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    l.sidecar("Lib", R"({"_drop": ["GENRE", "ASIN"]})");
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));  // past cfg.recheck
+    CHECK_MSG(!has(served(lib, dir, "song.flac", "flac"), "ASIN"), "a root sidecar's change reaches the folder below");
+    CHECK_MSG(lib.list_dir(dir)->find("song.flac")->mtime > mt, "and its files' mtimes move forward");
+}
+
+TEST(filters_whitelists_add_up_and_drops_still_apply) {
+    Lib l;
+    flac_with(l.src / "A" / "song.flac", {"TITLE=Song", "ARTIST=Someone", "COMPOSER=Bach", "GENRE=Baroque", "ENCODER=x"});
+    flac_with(l.src / "B" / "other.flac", {"TITLE=Other", "ARTIST=Someone", "COMPOSER=Bach", "GENRE=Baroque"});
+    l.sidecar("Lib", R"({"_keep": ["TITLE", "ARTIST", "COMPOSER"]})");
+    l.sidecar("Lib/A", R"({"_keep": "GENRE", "file": {"song.flac": {"_drop": "COMPOSER"}}})");
+    auto& lib = l.open();
+    Tags a = served(lib, l.src / "A", "song.flac", "flac"), b = served(lib, l.src / "B", "other.flac", "flac");
+    CHECK_MSG(has(a, "GENRE") && !has(b, "GENRE"), "a folder adds to the whitelist it inherits");
+    CHECK_MSG(!has(a, "ENCODER"), "names no whitelist lists are dropped");
+    CHECK_MSG(!has(a, "COMPOSER") && has(b, "COMPOSER"), "a more specific drop beats an inherited keep");
+    CHECK(has(a, "TITLE") && has(b, "TITLE"));
+}

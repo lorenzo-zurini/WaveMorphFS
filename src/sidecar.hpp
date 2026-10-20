@@ -34,8 +34,14 @@
 // the value is a directory path relative to the mount root ("Classical Music/
 // Mahler/Symphony No. 5 (Bernstein, 1987)"). Targets are read from the sidecars
 // of the tags tree. "_cover" (top level, in "album", or in a track or file table)
-// names an image (absolute, or relative to --covers-dir) embedded as the front
-// cover of the tracks, replacing their pictures. Other top-level keys (e.g.
+// names an image (absolute, relative to --covers-dir, or with "./" relative to
+// the folder's tags-tree folder) embedded as the front cover of the tracks,
+// replacing their pictures. "_keep" (a whitelist: only the names listed at any
+// level are served) and "_drop" (a blacklist) are lists of tag names, "*"
+// wildcards allowed (see TagFilter): at the top level or in "album" for the
+// folder and, from the tags tree, every folder below it; in a track or file table
+// for that one. A sidecar at the top of the tags tree sets them for the whole
+// library. Other top-level keys (e.g.
 // "_comment") are ignored, and // or /* */ comments are allowed; tag edits made
 // through the mount rewrite the tags-tree sidecar, which drops its comments
 // ("_comment" keys survive).
@@ -53,6 +59,20 @@
 namespace wm {
 
 inline constexpr const char* SIDECAR_NAME = "wavemorph.json";
+
+/// "_keep" / "_drop" of one level: tag-name patterns. A pattern matches a name
+/// case-insensitively and across synonyms (as sidecar names do); "*" matches any
+/// run of characters ("MUSICBRAINZ_*", "*SORT").
+struct TagFilter {
+    std::vector<std::string> keep, drop;
+    bool empty() const { return keep.empty() && drop.empty(); }
+    void add(const TagFilter& o) {
+        keep.insert(keep.end(), o.keep.begin(), o.keep.end());
+        drop.insert(drop.end(), o.drop.begin(), o.drop.end());
+    }
+};
+/// Whether tag name `name` matches `pattern` (see TagFilter).
+bool tag_pattern_matches(std::string_view pattern, std::string_view name);
 /// "a//b/ c" -> "a/b/ c"; nullopt for empty paths and "." / ".." / hidden components.
 std::optional<std::string> normalize_target(std::string_view p);
 /// Track key as the listing spells it: "2-05", "2.5", "2-5" -> "2-05"; "05" -> "5".
@@ -74,6 +94,9 @@ struct Sidecar {
     std::optional<std::string> cover;                 // "_cover" for the folder (top level or in "album")
     std::map<std::string, std::string> track_covers;  // canonical track key -> "_cover"
     std::map<std::string, std::string> file_covers;   // file name -> "_cover"
+    TagFilter filter;                                 // "_keep"/"_drop" of the folder (top level or in "album")
+    std::map<std::string, TagFilter> track_filters;   // canonical track key -> its "_keep"/"_drop"
+    std::map<std::string, TagFilter> file_filters;    // file name -> its "_keep"/"_drop"
     /// "_cover" for a file (by name), else for its track key, else the folder's.
     const std::string* cover_for(const std::string& name, const std::string* track_key) const;
     /// newest mtime among the sidecar files that contributed

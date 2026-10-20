@@ -56,6 +56,32 @@ std::optional<std::string> canonical_track_key(std::string_view k) {
     return std::format("{}-{:02}", *d, *n);
 }
 
+bool tag_pattern_matches(std::string_view pattern, std::string_view name) {
+    if (pattern.find('*') == std::string_view::npos) return same_field(pattern, name);
+    // a glob over the name as written and over its canonical field name
+    auto glob = [](std::string_view p, std::string_view s) {
+        size_t pi = 0, si = 0, star = std::string_view::npos, mark = 0;
+        while (si < s.size()) {
+            if (pi < p.size() && p[pi] == '*') {
+                star = pi++;
+                mark = si;
+            } else if (pi < p.size() && p[pi] == s[si]) {
+                pi++;
+                si++;
+            } else if (star != std::string_view::npos) {
+                pi = star + 1;
+                si = ++mark;
+            } else {
+                return false;
+            }
+        }
+        while (pi < p.size() && p[pi] == '*') pi++;
+        return pi == p.size();
+    };
+    std::string up = upper(pattern);
+    return glob(up, upper(name)) || glob(up, canonical_field(name));
+}
+
 std::string track_key(std::optional<uint32_t> disc, uint32_t n) { return disc ? std::format("{}-{:02}", *disc, n) : std::to_string(n); }
 
 Sidecar Sidecar::parse(const std::string& text) {
@@ -72,9 +98,24 @@ Sidecar Sidecar::parse(const std::string& text) {
         }
         return false;
     };
+    // "_keep" / "_drop": a name or a list of names
+    auto filter_of = [](const json& t) {
+        TagFilter f;
+        if (!t.is_object()) return f;
+        for (auto [key, out] : {std::pair{"_keep", &f.keep}, std::pair{"_drop", &f.drop}})
+            if (auto it = t.find(key); it != t.end()) {
+                if (it->is_string() && !it->get<std::string>().empty()) out->push_back(it->get<std::string>());
+                else if (it->is_array())
+                    for (auto& x : *it)
+                        if (x.is_string() && !x.get<std::string>().empty()) out->push_back(x.get<std::string>());
+            }
+        return f;
+    };
     for (const json* where : {&doc, doc.contains("album") ? &doc["album"] : nullptr})
-        if (where && where->is_object())
+        if (where && where->is_object()) {
             if (auto c = where->find("_cover"); c != where->end() && c->is_string() && !c->get<std::string>().empty()) sc.cover = c->get<std::string>();
+            sc.filter.add(filter_of(*where));
+        }
     if (auto t = doc.find("_target"); t != doc.end() && t->is_string()) {
         sc.target = normalize_target(t->get<std::string>());
         if (!sc.target) warn("sidecar: ignoring invalid _target '{}'", t->get<std::string>());
@@ -108,6 +149,7 @@ Sidecar Sidecar::parse(const std::string& text) {
             if (auto h = v.find("_hide"); h != v.end() && truthy(*h)) sc.hidden_tracks.insert(ck);
             if (auto c = str(v, "_cover")) sc.track_covers[ck] = *c;
             if (auto t = target_of(v)) sc.track_targets[ck] = *t;
+            if (auto f = filter_of(v); !f.empty()) sc.track_filters[ck].add(f);
         }
     if (auto s = doc.find("file"); s != doc.end() && s->is_object())
         for (auto& [k, v] : s->items()) {
@@ -116,6 +158,7 @@ Sidecar Sidecar::parse(const std::string& text) {
             if (auto h = v.find("_hide"); h != v.end() && truthy(*h)) sc.hidden.insert(k);
             if (auto c = str(v, "_cover")) sc.file_covers[k] = *c;
             if (auto t = target_of(v)) sc.file_targets[k] = *t;
+            if (auto f = filter_of(v); !f.empty()) sc.file_filters[k].add(f);
         }
     return sc;
 }
@@ -132,6 +175,9 @@ void Sidecar::merge(const Sidecar& later, int64_t later_mtime) {
     if (later.cover) cover = later.cover;
     for (auto& [k, v] : later.track_covers) track_covers[k] = v;
     for (auto& [k, v] : later.file_covers) file_covers[k] = v;
+    filter.add(later.filter);
+    for (auto& [k, v] : later.track_filters) track_filters[k].add(v);
+    for (auto& [k, v] : later.file_filters) file_filters[k].add(v);
     mtime = std::max(mtime.value_or(later_mtime), later_mtime);
 }
 

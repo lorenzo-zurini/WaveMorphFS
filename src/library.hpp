@@ -87,6 +87,7 @@ struct Entry {
 
 struct Sig {
     std::optional<int64_t> dir_mtime, sidecar_mtime, overlay_mtime;
+    std::optional<int64_t> inherited_mtime;  // newest sidecar of the tags tree above the folder's
     uint64_t generation = 0;
     bool operator==(const Sig&) const = default;
 };
@@ -274,6 +275,16 @@ private:
     Work<SacdDisc> sacd_state(const fs::path& src, const fs::path& dir, bool mc);
 
     Sig signature(const fs::path& dir) const;
+    /// The "_keep"/"_drop" a folder inherits: from the sidecar at the top of the
+    /// tags tree, then from each tags-tree folder above the folder's own, and the
+    /// newest mtime among those that set any.
+    struct InheritedFilters {
+        std::vector<TagFilter> levels;  // most general first
+        int64_t mtime = 0;
+    };
+    InheritedFilters inherited_filters(const fs::path& dir) const;
+    /// Tags-tree folders whose sidecars `dir` inherits from, most general first.
+    std::vector<fs::path> inherited_dirs(const fs::path& dir) const;
     /// The sidecars of `dir` that parse, merged; `broken` if one does not.
     std::optional<Sidecar> load_sidecar(const fs::path& dir, const std::optional<fs::path>& overlay, bool& broken);
     /// A new listing of `dir`; `previous` (if any) is kept while a sidecar is broken.
@@ -331,6 +342,7 @@ private:
     std::set<fs::path> md5_queued_, encode_queued_;
     std::map<fs::path, JobFailure> md5_failed_, encode_failed_;
     std::map<fs::path, std::string> sidecar_errors_;  // source folder -> why its sidecars do not parse
+    mutable std::map<fs::path, std::pair<int64_t, TagFilter>> filter_files_;  // tags-tree sidecar -> mtime, its folder filter
 
     std::mutex jobs_mu_;
     std::condition_variable jobs_cv_;

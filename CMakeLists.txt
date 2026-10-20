@@ -82,6 +82,7 @@ if(WAVEMORPH_TESTS)
     tests/main.cpp
     tests/test_audio.cpp
     tests/test_flac.cpp
+    tests/test_filters.cpp
     tests/test_formats.cpp
     tests/test_fs.cpp
     tests/test_library.cpp

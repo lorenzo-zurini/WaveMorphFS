@@ -413,13 +413,46 @@ one in the tags tree wins.
   the folder: a CUE sheet, an image or an SACD ISO (with all its tracks), or any
   file of the mount. Inside a `track` or `file` entry, `"_hide": true` hides that
   one track or file. Hidden sheets and ISOs don't count as discs.
-- Top-level keys that start with `_` are settings (`_hide`, `_target`,
-  `_cover`); others, such as `"_comment"`, are ignored. `//` comments are
+- Top-level keys that start with `_` are settings (`_hide`, `_keep`, `_drop`,
+  `_target`, `_cover`); others, such as `"_comment"`, are ignored. `//` comments are
   allowed, but a sidecar in the tags tree is rewritten without them when tags are
   edited on the mount.
 - Changes are picked up within seconds. A `cover.jpg` or `cover.png` in the
   sidecar folder appears in the album folder if the album has no cover of its
   own.
+
+### Choosing which tags are served
+
+`"_keep"` and `"_drop"` decide which tags reach the music server, whatever the
+files, the CUE sheets or a tagger put in:
+
+```json
+{
+  "_drop": ["ARTISTS", "*_SORT", "MUSICBRAINZ_*", "ASIN"],
+  "track": {"3": {"_drop": "DISCTOTAL"}}
+}
+```
+
+- `"_drop"` is a blacklist: the tags it lists are removed. `"_keep"` is a
+  whitelist: as soon as one applies to a file, only the tags it lists are served.
+  Each is a name or a list of names.
+- Names match the way sidecar names do (any case, and synonyms from other
+  formats: dropping `ARTISTS` also removes an MP3's `TXXX:ARTISTS` frame), and `*`
+  matches any run of characters (`MUSICBRAINZ_*`, `*_SORT`, `REPLAYGAIN_*`).
+- They can be set at every level. In a sidecar at the top of the tags directory
+  (`<tags-dir>/wavemorph.json`) they apply to the whole library, in a root's or
+  any folder's sidecar in the tags tree to that folder and everything below it,
+  in `"album"` to the folder, and in a `track` or `file` entry to that one.
+- Lists add up as they go down: a folder can keep a few more names than the
+  whitelist it inherits, or drop a few more. When levels disagree about a name,
+  the most specific one decides, and within one level `"_keep"` wins.
+- A value you set in a sidecar is served even when a less specific level drops
+  it, so a tag can be removed library-wide and still set on purpose in one
+  folder or for one track. (Putting a name in a track's `"_keep"` would make that
+  track whitelisted, so set the value instead.)
+- Tags a tagger writes through the mount that these lists remove are not stored
+  at all, so beets or Picard writing them back on every import leaves the
+  sidecars clean.
 
 ### Organizing the mount
 

@@ -12,6 +12,7 @@
 
 #include "md5.hpp"
 #include "retag.hpp"
+#include "writeback.hpp"
 
 namespace wm {
 
@@ -188,6 +189,7 @@ struct ListingBuild {
     const Sidecar* sc = nullptr;  // &*sidecar, or null
     /// newest sidecar or tags-tree change: files whose tags come from sidecars change with it
     std::optional<int64_t> edits_mtime;
+    std::vector<TagFilter> inherited;  // "_keep"/"_drop" from the tags tree above (Library::inherited_filters)
     CoverSet covers;
     std::set<std::string> hidden;  // source files not listed as they are
     std::vector<Entry> entries;    // listed under their own names
@@ -356,6 +358,68 @@ NamedTrack name_track(ListingBuild& b, Tags& tg, const DiscSlot& disc, uint32_t 
 /// mtime of generated content: never older than OUTPUT_EPOCH_NS (changes of the
 /// output format), than what it is made from, or than the cover embedded in it
 int64_t output_mtime(int64_t mt, const Cover* cover) { return std::max({mt, OUTPUT_EPOCH_NS, cover ? cover->mtime : 0}); }
+
+/// The "_keep"/"_drop" levels that apply to one file, most general first: the
+/// inherited ones, then the folder's sidecar, the track's table and the file's.
+struct FilterChain {
+    std::vector<const TagFilter*> levels;
+    int folder = 0, track = 0, file = 0;  // their positions in `levels`
+    const Tags *album = nullptr, *track_tags = nullptr, *file_tags = nullptr;  // tables that set tags explicitly
+
+    FilterChain(const std::vector<TagFilter>& inherited, const Sidecar* sc, const std::string* track_key, const std::string& file_name) {
+        static const TagFilter none;
+        for (auto& f : inherited) levels.push_back(&f);
+        folder = int(levels.size());
+        levels.push_back(sc ? &sc->filter : &none);
+        track = int(levels.size());
+        auto tf = sc && track_key ? sc->track_filters.find(*track_key) : decltype(sc->track_filters.cend()){};
+        levels.push_back(sc && track_key && tf != sc->track_filters.end() ? &tf->second : &none);
+        file = int(levels.size());
+        auto ff = sc ? sc->file_filters.find(file_name) : decltype(sc->file_filters.cend()){};
+        levels.push_back(sc && ff != sc->file_filters.end() ? &ff->second : &none);
+        if (sc) {
+            album = &sc->album;
+            if (track_key)
+                if (auto it = sc->tracks.find(*track_key); it != sc->tracks.end()) track_tags = &it->second;
+            file_tags = sc->file(file_name);
+        }
+    }
+    bool active() const {
+        return std::any_of(levels.begin(), levels.end(), [](auto* f) { return !f->empty(); });
+    }
+    /// The level of the most specific sidecar table that sets `name` (-1: none).
+    int set_at(const std::string& name) const {
+        auto sets = [&](const Tags* t) {
+            auto v = t ? t->get_all(name) : nullptr;
+            return v && !v->empty();
+        };
+        return sets(file_tags) ? file : sets(track_tags) ? track : sets(album) ? folder : -1;
+    }
+    /// Whether `name` is served. "_keep" lists are a whitelist: once any level
+    /// has one, only the names they list (at any level) are served. "_drop" lists
+    /// remove names. The most specific level that names it decides ("_keep" over
+    /// "_drop" within a level), and a value set in a sidecar table is served
+    /// unless a more specific level removes it.
+    bool kept(const std::string& name, int set_level) const {
+        auto any = [&](const std::vector<std::string>& ps) {
+            return std::any_of(ps.begin(), ps.end(), [&](auto& p) { return tag_pattern_matches(p, name); });
+        };
+        for (int i = int(levels.size()) - 1; i >= 0; i--) {
+            if (i <= set_level) return true;
+            if (any(levels[size_t(i)]->keep)) return true;
+            if (any(levels[size_t(i)]->drop)) return false;
+        }
+        return !whitelist();
+    }
+    bool whitelist() const {
+        return std::any_of(levels.begin(), levels.end(), [](auto* f) { return !f->keep.empty(); });
+    }
+    /// Remove from `tg` what this chain drops.
+    void apply(Tags& tg) const {
+        if (!active()) return;
+        std::erase_if(tg.m, [&](auto& kv) { return !kept(kv.first, set_at(kv.first)); });
+    }
+};
 
 /// Add the generated entries, numbering names that are taken ("X (2).flac"):
 /// real files keep theirs, then generated ones in the order they were made.
@@ -698,6 +762,17 @@ void Library::apply_edit(const fs::path& dir, const std::string& file_name, cons
         }
     }
     bool track = section == EDIT_TRACK;
+    // what "_drop" removes from this file is not stored: saved, it would be a
+    // value set on purpose and be served again (taggers such as beets write the
+    // same tags back on every import)
+    auto merged = Sidecar::load(dir, ov);
+    auto inherited = inherited_filters(dir);
+    FilterChain filters(inherited.levels, merged ? &*merged : nullptr, track ? &key : nullptr, track ? file_name : key);
+    auto stored = [&](const std::string& k, const std::vector<std::string>& vals) { return vals.empty() || filters.kept(k, filters.set_at(k)); };
+    if (!cover && std::none_of(changes.m.begin(), changes.m.end(), [&](auto& kv) { return stored(kv.first, kv.second); })) {
+        info("{}/{}: nothing stored, every change is removed by \"_drop\"", dir.string(), file_name);
+        return;
+    }
     const Tags* src_entry = nullptr;  // the in-source table of this entry
     const Tags* src_file = nullptr;   // track edits: the in-source file table of its name
     if (in_source) {
@@ -742,7 +817,12 @@ void Library::apply_edit(const fs::path& dir, const std::string& file_name, cons
             if (ek != keep && same_field(ek, k)) drop.push_back(ek);
         for (auto& d : drop) obj.erase(d);
     };
+    std::vector<std::string> not_stored;
     for (auto& [k, vals] : changes.m) {
+        if (!stored(k, vals)) {
+            not_stored.push_back(k);
+            continue;
+        }
         // keep the spelling already used for this entry, else for the album: in
         // this sidecar, then in the in-source one
         std::optional<std::string> name = in_json(entry(), k);
@@ -800,6 +880,11 @@ void Library::apply_edit(const fs::path& dir, const std::string& file_name, cons
             drop_others();
             entry().erase("_cover");
         }
+    }
+    if (!not_stored.empty()) {
+        std::string names;
+        for (auto& n : not_stored) names += (names.empty() ? "" : ", ") + n;
+        info("{}/{}: not stored, removed by \"_drop\": {}", dir.string(), file_name, names);
     }
     fs::create_directories(*ov);
     atomic_write(p, doc.dump(2, ' ', false, json::error_handler_t::replace) + "\n");
@@ -881,11 +966,55 @@ std::optional<fs::path> Library::overlay_dir(const fs::path& dir) const {
     return o;
 }
 
+std::vector<fs::path> Library::inherited_dirs(const fs::path& dir) const {
+    std::vector<fs::path> out = {cfg.tags_dir};  // the whole library
+    auto r = root_of(dir);
+    if (!r) return out;
+    fs::path d = cfg.tags_dir / r->first->name;
+    if (r->second.empty() || r->second == ".") return out;  // the root's own sidecar is its folder's
+    out.push_back(d);
+    std::vector<fs::path> parts(r->second.begin(), r->second.end());
+    for (size_t i = 0; i + 1 < parts.size(); i++) out.push_back(d /= parts[i]);
+    return out;
+}
+
+Library::InheritedFilters Library::inherited_filters(const fs::path& dir) const {
+    InheritedFilters out;
+    for (auto& d : inherited_dirs(dir)) {
+        fs::path p = d / SIDECAR_NAME;
+        auto m = mtime_ns(p);
+        if (!m) continue;
+        TagFilter f;
+        bool known = false;
+        {
+            std::lock_guard g(mu_);
+            if (auto it = filter_files_.find(p); it != filter_files_.end() && it->second.first == *m) f = it->second.second, known = true;
+        }
+        if (!known) {
+            // only the folder-level "_keep"/"_drop" are inherited (track and file
+            // tables name entries of that folder alone)
+            try {
+                if (auto text = try_read_text(p)) f = Sidecar::parse(*text).filter;
+            } catch (const std::exception& e) {
+                warn("sidecar {}: {}", p.string(), e.what());
+            }
+            std::lock_guard g(mu_);
+            filter_files_[p] = {*m, f};
+        }
+        if (f.empty()) continue;
+        out.levels.push_back(std::move(f));
+        out.mtime = std::max(out.mtime, *m);
+    }
+    return out;
+}
+
 Sig Library::signature(const fs::path& dir) const {
     Sig s;
     s.dir_mtime = mtime_ns(dir);
     s.sidecar_mtime = mtime_ns(dir / SIDECAR_NAME);
     if (auto ov = overlay_dir(dir)) s.overlay_mtime = newest_mtime(*ov);
+    for (auto& d : inherited_dirs(dir))
+        if (auto m = mtime_ns(d / SIDECAR_NAME)) s.inherited_mtime = std::max(s.inherited_mtime.value_or(0), *m);
     std::lock_guard g(mu_);
     if (auto it = generations_.find(dir); it != generations_.end()) s.generation = it->second.first;
     return s;
@@ -974,6 +1103,10 @@ std::shared_ptr<Listing> Library::build_listing(const fs::path& dir, const Sig& 
     // removing a sidecar (or cover.jpg) from the tags tree changes the overlay
     // folder's mtime, not any sidecar's: without it, mtimes would go back
     b.edits_mtime = b.sc ? max_mtime({b.sc->mtime, sig.overlay_mtime}) : sig.overlay_mtime;
+    // "_keep"/"_drop" from above change what every file here is served with
+    auto inherited = inherited_filters(dir);
+    b.inherited = std::move(inherited.levels);
+    if (inherited.mtime) b.edits_mtime = std::max(b.edits_mtime.value_or(0), inherited.mtime);
     for (auto& n : b.names)
         if (n.is_file && !is_ignored(n.name))
             if (auto until = settles_at(n.mtime)) b.settle_until(*until);  // its size and contents are not final yet
@@ -1103,11 +1236,26 @@ void Library::add_source_file(ListingBuild& b, const DirItem& n) {
     bool taggable = ext == "flac" || ext == "mp3" || ext == "m4a" || ext == "dsf";
     VFilePtr vf;
     const Cover* cv = b.sc && taggable && ext != "m4a" ? b.covers.get(b.sc->cover_for(n.name, nullptr)) : nullptr;
-    if (b.sc && taggable && (!b.sc->album.empty() || b.sc->file(n.name) || cv)) {
-        Tags ov = b.sc->album;
-        if (auto f = b.sc->file(n.name)) ov.merge(*f);  // keeps removals for retag_file
+    if (taggable) {
+        Tags ov = b.sc ? b.sc->album : Tags{};
+        if (b.sc)
+            if (auto f = b.sc->file(n.name)) ov.merge(*f);  // keeps removals for retag_file
+        bool retag = b.sc && (!b.sc->album.empty() || b.sc->file(n.name) || cv);
         try {
-            vf = retag_file(p, ext, ov, cv);
+            // what the filters drop, of the file's own tags and of the sidecar's,
+            // becomes a removal (files they leave alone are not retagged for them)
+            if (FilterChain filters(b.inherited, b.sc, nullptr, n.name); filters.active()) {
+                File src(p);
+                Tags own = read_file_tags(ext, [&](uint64_t o, size_t l) { return src.read_vec(o, l); }, src.size());
+                std::vector<std::string> drop;
+                for (auto& [k, v] : own.m)
+                    if (!v.empty() && !filters.kept(k, -1)) drop.push_back(k);
+                for (auto& [k, v] : ov.m)
+                    if (!v.empty() && !filters.kept(k, filters.set_at(k))) drop.push_back(k);
+                for (auto& k : drop) ov.m[k] = {};
+                retag |= !drop.empty();
+            }
+            if (retag) vf = retag_file(p, ext, ov, cv);
         } catch (const std::exception& e) {
             warn("retag {}: {}", p.string(), e.what());
         }
@@ -1139,6 +1287,7 @@ bool Library::add_standalone(ListingBuild& b, const DirItem& n) {
             tg.overlay(b.sc->album);
             if (auto f = b.sc->file(n.name)) tg.overlay(*f);
         }
+        FilterChain(b.inherited, b.sc, nullptr, n.name).apply(tg);
         const Cover* cv = b.sc ? b.covers.get(b.sc->cover_for(n.name, nullptr)) : nullptr;
         int64_t mt = output_mtime(std::max(n.mtime, b.edits_mtime.value_or(0)), cv);
         try {
@@ -1220,6 +1369,7 @@ std::optional<Entry> Library::standalone_track(ListingBuild& b, const std::strin
         tg.overlay(b.sc->album);
         if (auto f = b.sc->file(name)) tg.overlay(*f);
     }
+    FilterChain(b.inherited, b.sc, nullptr, name).apply(tg);
     const Cover* cv = b.sc ? b.covers.get(b.sc->cover_for(name, nullptr)) : nullptr;
     std::vector<flac::HeaderBlock> pictures = ready.pictures;
     if (cv) pictures = {{flac::BLOCK_PICTURE, flac_picture(*cv)}};
@@ -1282,6 +1432,7 @@ std::optional<std::vector<Entry>> Library::image_tracks(ListingBuild& b, const C
             if (auto aa = tg.get_all("ALBUMARTIST")) tg.set_many("ARTIST", *aa);
         overlay_sidecar_track(tg, b.sc, disc, t.number);
         auto [name, key, cv] = name_track(b, tg, disc, t.number, "", ext, true);
+        FilterChain(b.inherited, b.sc, &key, name).apply(tg);
         VFilePtr vf;
         if (ready.wv) {
             vf = std::make_shared<WvTrack>(ready.wv, s, e, tg, (*wv_layout)[i], cv);
@@ -1319,6 +1470,7 @@ std::vector<Entry> Library::sacd_tracks(ListingBuild& b, const std::shared_ptr<c
         // the track tables (and their pinned names) are the stereo tracks': edits of
         // a multichannel track go to the file table of its own name
         auto [name, key, cv] = name_track(b, tg, disc, num, mc ? "MC " : "", "dsf", !mc);
+        FilterChain(b.inherited, b.sc, &key, name).apply(tg);
         auto vf = std::make_shared<DsfTrack>(sacd, i, tg, cv);
         if (mc) out.push_back(Entry::make_tagged(name, std::move(vf), output_mtime(mt, cv), EDIT_FILE, name, "dsf"));
         else out.push_back(Entry::make_tagged(std::move(name), std::move(vf), output_mtime(mt, cv), EDIT_TRACK, std::move(key), "dsf"));

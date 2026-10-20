@@ -99,6 +99,12 @@ file, mtime, tag_section/tag_key/tag_ext for edit routing).
   A final frame cut short by a broken last sector is padded with 0x69.
 - **Sidecars**: `<tags-dir>/<root name>/<relative dir>/wavemorph.json` (+ optional
   in-source one). Sections `album`, `track` ("N" or "D-NN"), `file` (by name).
+  `_keep`/`_drop` (library.cpp FilterChain): levels = `<tags-dir>/wavemorph.json`,
+  tags-tree folders above (Library::inherited_filters, cached by mtime), the
+  folder, its track and file entries. Most specific mention decides, keep beats
+  drop within a level, any `_keep` makes it a whitelist, explicit sidecar values
+  beat less specific drops; regular files get dropped names as retag removals;
+  apply_edit doesn't store dropped names.
 - **Writable mount**: writes go to a sparse anonymous scratch file; on
   flush/release tags are read back (Vorbis/ID3/MP4 → names), diffed against the
   generated file (`tag_changes`: synonyms one field, placeholder zeros and a YEAR

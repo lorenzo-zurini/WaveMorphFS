@@ -9,6 +9,17 @@ Generated files carry an *output epoch*: when a release changes what generated
 files contain, their modification times move forward, so music servers re-read
 them once on their next scan.
 
+## [Unreleased]
+
+### Added
+- `"_keep"` (whitelist) and `"_drop"` (blacklist) decide which tags are served,
+  at every level: the whole library (`<tags-dir>/wavemorph.json`), a root, any
+  folder of the tags tree and everything below it, a folder's `"album"`, a track,
+  a file. Names match case-insensitively and across synonyms, with `*` wildcards.
+  The most specific level decides; a value set in a sidecar beats a less specific
+  drop. Tags these lists remove are not stored when a tagger writes them through
+  the mount, so sidecars stay clean.
+
 ## [0.2.1] - 2026-10-19
 
 ### Added
@@ -151,6 +162,7 @@ lossless images (APE, WavPack, TTA, TAK, WAV, ALAC) encoded to FLAC on the fly,
 SACD ISOs (plain DSD and DST) as DSF, sidecar tags for every file kind, tag edits
 on the mount stored in sidecars, and a container image for amd64 and arm64.
 
+[Unreleased]: https://github.com/lorenzo-zurini/WaveMorphFS/compare/v0.2.1...HEAD
 [0.2.1]: https://github.com/lorenzo-zurini/WaveMorphFS/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/lorenzo-zurini/WaveMorphFS/compare/v0.1.9...v0.2.0
 [0.1.9]: https://github.com/lorenzo-zurini/WaveMorphFS/compare/v0.1.8...v0.1.9
