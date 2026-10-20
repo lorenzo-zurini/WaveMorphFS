@@ -59,7 +59,9 @@ The main use is turning a messy collection into a clean one without touching it:
 3. **Organize it.** A line in a folder's sidecar places that folder, a disc or a
    single track anywhere in the mount, so the tree follows artist, composer or work
    rather than whatever the folders on disk are called. The same way, junk can be
-   hidden and one front cover set for a whole album or work.
+   hidden, one front cover set for a whole album or work, and tags you don't want
+   (a tagger's extras, ripper leftovers) removed from the whole library with a
+   single list, or kept to a whitelist.
 4. **Stream it.** The music server sees an ordinary, tidy folder of tagged tracks,
    and rescans it like any other.
 
@@ -99,6 +101,9 @@ Beyond splitting and converting:
   with all of them. Tag names are kept exactly as given, so Picard's
   `MusicBrainz Album Id`, ffprobe's `album_artist` and plain Vorbis names all work
   and are never renamed.
+- **Only the tags you want.** A whitelist or a blacklist of tag names, with
+  wildcards, can be set for the whole library, a folder tree, an album, a track
+  or a file, and tags it removes are never saved back from a tagger.
 - **Edit tags and covers on the mount.** Open a track in Picard, Kid3, beets or
   any other tag editor, change its tags or embed a new front cover, and save. The
   change is stored alongside the folder's sidecar and shows up at once; the
