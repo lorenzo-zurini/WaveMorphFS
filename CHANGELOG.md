@@ -9,6 +9,36 @@ Generated files carry an *output epoch*: when a release changes what generated
 files contain, their modification times move forward, so music servers re-read
 them once on their next scan.
 
+## [0.3.0] - 2026-11-24
+
+WaveMorphFS is now an NFS server and needs no privileges. The FUSE mount, which
+needed root, `CAP_SYS_ADMIN` and `/dev/fuse` in the container, is gone.
+
+### Added
+- `wavemorphfs nfs [ADDRESS:]PORT` serves the library over NFS version 3 (with
+  the MOUNT protocol on the same port), and this is now how the container
+  image runs: with no root, no capabilities and no devices. Other containers
+  get the library as an NFS volume that Docker mounts for them, so nothing is
+  configured on the host. File handles survive restarts, so clients carry on
+  through a restart or upgrade of the server, even mid-file. Tag and cover
+  edits made through the share are stored in sidecars as before; as NFS has no
+  "file closed", an edit is stored once its writer has been quiet for a moment. Only clients on reserved ports (the
+  kernel's NFS client) are accepted unless `--insecure` is given.
+
+### Changed
+- The container image serves NFS on port 2049 (`WAVEMORPH_NFS`); its
+  healthcheck checks that the port is listening. It runs as compose `user:`
+  with every capability dropped, or starts as root and switches to
+  `PUID`/`PGID`.
+
+### Removed
+- The FUSE mount (`mount`, `--allow-other`, `WAVEMORPH_MOUNT`, the
+  `user.wavemorph.source` attribute) and the libfuse dependency.
+
+### Fixed
+- `WAVEMORPH_SACD_MULTICHANNEL` / `--sacd-multichannel` were ignored by the NFS
+  server.
+
 ## [0.2.4] - 2026-10-20
 
 ### Added
@@ -179,6 +209,7 @@ lossless images (APE, WavPack, TTA, TAK, WAV, ALAC) encoded to FLAC on the fly,
 SACD ISOs (plain DSD and DST) as DSF, sidecar tags for every file kind, tag edits
 on the mount stored in sidecars, and a container image for amd64 and arm64.
 
+[0.3.0]: https://github.com/lorenzo-zurini/WaveMorphFS/compare/v0.2.4...v0.3.0
 [0.2.4]: https://github.com/lorenzo-zurini/WaveMorphFS/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/lorenzo-zurini/WaveMorphFS/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/lorenzo-zurini/WaveMorphFS/compare/v0.2.1...v0.2.2

@@ -1,6 +1,6 @@
 # WaveMorphFS — notes for Claude sessions
 
-Read-only-source FUSE filesystem (C++20, GPL-3.0-or-later) that presents pristine
+Read-only-source NFS server (C++20, GPL-3.0-or-later) that presents pristine
 music files (CUE images, APE, SACD ISOs, which must stay byte-identical) as one
 tagged file per track for music servers. See README.md for the user-facing picture; this file is the
 developer briefing.
@@ -28,9 +28,11 @@ developer briefing.
 
 ```
 src/
-  main.cpp       CLI: mount, ls, verify, compare, tags-init (command table, validated roots, --version)
-  fs.cpp         libfuse3 high-level API (every op through guarded()); path -> Library listing; writable
-                 mount (shared_ptr WriteSessions, edits -> sidecars, default_permissions)
+  main.cpp       CLI: nfs, ls, verify, compare, tags-init (command table, validated roots, --version)
+  vtree.cpp      the mount tree as served: resolve(path) -> Node, dir mtimes, store_edit(), space()
+  nfs.cpp xdr.hpp  the server: NFSv3 + MOUNT v3 over TCP (ONC RPC, XDR). Handles = "WM",1,0 + md5(mount
+                 path), paths appended to <cache>/nfs-handles (survive restarts); edits per path, stored by a
+                 sweeper once quiet; reserved-port check unless --insecure; worker threads answer requests
   library.cpp    per-directory listing rules (build_listing = ListingBuild steps), background jobs
                  (measured<L>() for on-the-fly layouts, failures remembered per SrcKey), status.txt,
                  apply_edit(), OUTPUT_EPOCH_NS
@@ -60,10 +62,11 @@ src/
   util.cpp       errors (wm::Error, WM_ENSURE, with_context), File/pread, atomic_write (fsync'd), logging, run(),
                  worker pools, strict UTF-8
   version.hpp.in generated version.hpp (WAVEMORPH_VERSION, set by CI from the tag)
-tests/           tiny in-tree framework (TEST/CHECK/TempDir, `--list`, name filter): test_flac, test_audio
+tests/           tiny in-tree framework (TEST/CHECK/TempDir, `--list`, name filter): test_nfs (in-process
+                 RPC client: tree, paging, handles across restarts, edits, garbage), test_flac, test_audio
                  (FLAC/encoded paths vs the flac tool), test_wavpack, test_sacd (synthetic ISOs, DST vs FFmpeg),
-                 test_tags, test_tagformats (parsers incl. malformed input), test_library, test_fs (FUSE;
-                 skips without /dev/fuse), test_formats
+                 test_tags, test_tagformats (parsers incl. malformed input), test_library, test_tree
+                 (placements, write-back, covers), test_formats
 docker/entrypoint.sh, Dockerfile (Debian trixie, builds with -Werror + runs tests; runtime has only the libs;
                  PUID/PGID, hands its own dirs to PUID, /wavemorph defaults)
 .github/workflows/docker.yml  ASan/UBSan job + multi-arch (native amd64+arm64) image -> ghcr.io/<owner>/wavemorphfs;
@@ -107,23 +110,31 @@ file, mtime, tag_section/tag_key/tag_ext for edit routing).
   apply_edit doesn't store dropped names. `_hide` patterns (`*`/`?`, or paths
   matched against the end of the path below the pattern's folder, `/...`
   anchored) inherit the same way (ListingBuild::hides); plain names stay local.
-- **Writable mount**: writes go to a sparse anonymous scratch file; on
-  flush/release tags are read back (Vorbis/ID3/MP4 → names), diffed against the
+- **Tag edits**: writes go to a sparse anonymous scratch file (WriteSession);
+  when the writer is done (see NFS) tags are read back (Vorbis/ID3/MP4 → names), diffed against the
   generated file (`tag_changes`: synonyms one field, placeholder zeros and a YEAR
   echoing DATE ignored, track numbers compared numerically) and stored by
   `Library::apply_edit` (track."N" for split tracks + `_name` pin, file."<name>"
   for regular files). A changed front cover (read_front_cover, before vs after)
   is stored as `<tags dir>/.covers/<md5>.jpg|png` and set as the entry's
   `_cover: "./.covers/..."` (removed picture → `_cover` dropped); `./` cover paths
-  resolve against the tags-tree folder. Create/rename/delete → EROFS.
+  resolve against the tags-tree folder. Create/rename/delete → NFS3ERR_ROFS.
+- **NFS** (no privileges anywhere): stateless, so no
+  open/release. A WRITE/SETATTR(size) to an editable file starts a WriteSession
+  keyed by mount path; READ/GETATTR use it (mtime = last write, so other
+  clients' caches drop); the sweeper stores it (store_edit) once the writer has
+  been quiet `NfsOptions::quiet` (1.5 s), keeps serving it for `keep` (30 s)
+  after last use, and stores pending ones on SIGTERM. Docker mounts the share
+  as a `type: nfs` volume (dockerd does the kernel mount), so the server
+  container needs a fixed IP on its own network. Hard mounts ride out restarts.
 - **Concurrency**: two worker lanes (`submit(task, Lane::Decode|Encode)`). Decode
   jobs never wait on other jobs; encode jobs may wait only on decode jobs. The
   item a reader needs right now is produced in the reader's thread; pools only do
   read-ahead, and read-ahead starts only for sequential readers. Keep this rule or
   you get deadlocks. Pools are never destroyed (destroying a condvar with waiters
   blocks exit).
-- **FUSE**: 1 MiB max_write/readahead, `auto_cache`, attr/entry TTL 1 s,
-  direct_io for write sessions. Path resolution goes through mount-directory
+- **Serving**: 1 MiB rsize/wsize; attributes carry the generated mtime, which
+  clients use to drop cached pages. Path resolution goes through mount-directory
   listings (`Library::list_vdir`, placement.cpp): a mount path need not match a
   source path because sidecar `"_target"`s (read from the tags tree only, so the
   whole tree is known without listing sources) move folders and files. File nodes
@@ -138,20 +149,22 @@ build/wavemorphfs-tests            # all; or a substring filter: build/wavemorph
 # before committing anything substantial, also the sanitizers:
 cmake -S . -B build-asan -G Ninja -DCMAKE_BUILD_TYPE=Debug -DWAVEMORPH_SANITIZE=address,undefined
 ```
-Deps: libfuse3, libFLAC, libwavpack, libavformat/libavcodec/libavutil/libswscale, nlohmann-json; `flac`
+Deps: libFLAC, libwavpack, libavformat/libavcodec/libavutil/libswscale, nlohmann-json; `flac`
 and `ffmpeg` binaries for tests/verify. Warnings must stay at zero.
 
 ## Verifying changes (do this, not just unit tests)
 
 - `wavemorphfs ls <dir>` / `verify <dir>` (flac -t / ffmpeg decode / stream MD5)
   / `compare <dir> <split dir>` (PCM MD5 vs old split files).
-- For anything touching output bytes: mount the new build on a scratch mountpoint
-  (with `--tags-dir`/`--cache-dir` pointing at the real ones, or copies if the
-  test edits) and byte-compare whole files **and** random reads against the
-  production mount. Mutagen (python) is available for tag-editor tests.
+- For anything touching output bytes: serve the new build from a scratch
+  container (Storage bound read-only at its real path, as cache keys are
+  path-based; copies of tags/cache) on its own network, mount it as a Docker
+  `type: nfs` volume in a tools container, and byte-compare whole files **and**
+  random reads against the production share. Mutagen (python) is available for
+  tag-editor tests. Unprivileged host processes can't mount NFS: let Docker do it.
 - Performance: benchmark sequential MB/s, first-byte and fresh-open random 64K
   latency per file kind (passthrough, retagged, flac-image, encoded APE, DSF plain,
-  DSF DST) on a scratch mount; compare before/after. Baseline after the perf
+  DSF DST) on a scratch share; compare before/after. Baseline after the perf
   pass: APE ~100 MB/s, DST ~70 MB/s (CPU-bound, all cores), plain DSF ~1.6 GB/s.
 
 ## Releases

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 cmake_minimum_required(VERSION 3.20)
-project(wavemorphfs VERSION 0.2.4 LANGUAGES CXX)
+project(wavemorphfs VERSION 0.3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -14,10 +14,8 @@ set(WAVEMORPH_VERSION "" CACHE STRING "Version reported by --version; empty: the
 option(WAVEMORPH_WERROR "Treat compiler warnings as errors" OFF)
 set(WAVEMORPH_SANITIZE "" CACHE STRING "Sanitizers to build with, e.g. address,undefined")
 
-# <format> needs GCC 13 / Clang 17; FUSE_USE_VERSION 312 needs libfuse 3.12;
-# AVChannelLayout needs FFmpeg 5.1; 64-bit WavPack configuration needs libwavpack 5
+# <format> needs GCC 13 / Clang 17; AVChannelLayout needs FFmpeg 5.1; 64-bit WavPack configuration needs libwavpack 5
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(FUSE3 REQUIRED IMPORTED_TARGET fuse3>=3.12)
 pkg_check_modules(FLAC REQUIRED IMPORTED_TARGET flac>=1.3)
 pkg_check_modules(LIBAV REQUIRED IMPORTED_TARGET libavformat>=59.27 libavcodec>=59.37 libavutil>=57.28 libswscale>=6.7)
 pkg_check_modules(WAVPACK REQUIRED IMPORTED_TARGET wavpack>=5.0)
@@ -65,11 +63,11 @@ add_library(wmcore STATIC
   src/library.cpp
   src/placement.cpp
   src/cover.cpp
-  src/fs.cpp
+  src/vtree.cpp
+  src/nfs.cpp
 )
 target_include_directories(wmcore PUBLIC src ${CMAKE_CURRENT_BINARY_DIR}/generated)
-target_compile_definitions(wmcore PUBLIC FUSE_USE_VERSION=312)
-target_link_libraries(wmcore PUBLIC PkgConfig::FUSE3 PkgConfig::FLAC PkgConfig::LIBAV PkgConfig::WAVPACK nlohmann_json::nlohmann_json Threads::Threads)
+target_link_libraries(wmcore PUBLIC PkgConfig::FLAC PkgConfig::LIBAV PkgConfig::WAVPACK nlohmann_json::nlohmann_json Threads::Threads)
 
 add_executable(wavemorphfs src/main.cpp)
 target_link_libraries(wavemorphfs PRIVATE wmcore)
@@ -84,11 +82,12 @@ if(WAVEMORPH_TESTS)
     tests/test_flac.cpp
     tests/test_filters.cpp
     tests/test_formats.cpp
-    tests/test_fs.cpp
     tests/test_library.cpp
+    tests/test_nfs.cpp
     tests/test_sacd.cpp
     tests/test_tagformats.cpp
     tests/test_tags.cpp
+    tests/test_tree.cpp
     tests/test_wavpack.cpp
   )
   target_link_libraries(wavemorphfs-tests PRIVATE wmcore)

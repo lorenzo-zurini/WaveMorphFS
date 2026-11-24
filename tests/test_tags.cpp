@@ -302,7 +302,7 @@ TEST(targets_place_folders_and_files) {
 
 TEST(lookups_survive_listing_rebuilds) {
     // mount listings are rebuilt every 1.5 s and the old one is freed while other
-    // FUSE threads may still be resolving paths through it (production saw
+    // request threads may still be resolving paths through it (production saw
     // std::bad_alloc from copying a freed path in getattr)
     wmtest::TempDir tmp("wm-lookup");
     fs::path dir = tmp.path();

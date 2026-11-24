@@ -1,18 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// The mount tree (placements), tag write-back and the FUSE layer.
+// The mount tree (placements), tag write-back and covers set by tag editors.
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include <atomic>
-#include <csignal>
 #include <cstdio>
 #include <cstring>
-#include <thread>
 
 #include "apetag.hpp"
 #include "cover.hpp"
-#include "fs.hpp"
 #include "library.hpp"
 #include "test.hpp"
 #include "writeback.hpp"
@@ -215,96 +211,6 @@ TEST(writeback_write_while_storing_stays_dirty) {
     fs::remove_all(scratch);
 }
 
-// ---------------------------------------------------------------- a real mount
-
-namespace {
-
-/// The library mounted in a background thread; skipped (nullopt from start())
-/// where FUSE is not available (containers without /dev/fuse, docker build).
-class Mount {
-public:
-    static std::unique_ptr<Mount> start(std::shared_ptr<Library> lib, const fs::path& at) {
-        if (!fs::exists("/dev/fuse") || !run({"fusermount3", "-V"}).ok()) return nullptr;
-        fs::create_directories(at);
-        auto m = std::unique_ptr<Mount>(new Mount(at));
-        m->thread_ = std::thread([m = m.get(), lib = std::move(lib)] { m->rc_ = mount_fs(lib, {m->at_.string(), 4, false}); });
-        struct stat outer, inner;
-        CHECK(::stat(at.parent_path().c_str(), &outer) == 0);
-        for (int i = 0; i < 100 && m->rc_ < 0; i++) {
-            if (::stat(at.c_str(), &inner) == 0 && inner.st_dev != outer.st_dev) return m;
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
-        return nullptr;  // mounting failed (no permission to mount here)
-    }
-    /// Stop as a service manager would; returns mount_fs()'s exit code.
-    int stop_with_sigterm() {
-        ::kill(::getpid(), SIGTERM);  // the mount's handlers are installed: it answered requests
-        thread_.join();
-        return rc_;
-    }
-    ~Mount() {
-        if (thread_.joinable()) {
-            run({"fusermount3", "-uz", at_.string()});
-            thread_.join();
-        }
-    }
-
-private:
-    explicit Mount(fs::path at) : at_(std::move(at)) {}
-    fs::path at_;
-    std::thread thread_;
-    std::atomic<int> rc_ = -1;
-};
-
-}  // namespace
-
-TEST(mount_edits_sessions_and_stop) {
-    Fixture f("mount");
-    make_flac(f.src / "A" / "a.flac", "Old");
-    f.sidecar("A", R"({"album": {"ALBUM": "X"}})");  // retagged: generated files carry tag padding
-    f.open();
-    fs::path mnt = f.dir / "mnt";
-    auto m = Mount::start(f.lib, mnt);
-    if (!m) {
-        std::printf("      (skipped: FUSE is not available here)\n");
-        return;
-    }
-    std::string path = (mnt / "Lib" / "A" / "a.flac").string();
-    auto mounted_tags = [&] { return tags_of(Passthrough(path, fs::file_size(path)), "flac"); };
-    CHECK(*mounted_tags().get("TITLE") == "Old");
-
-    // an editor saving in place sees its edit when it reads the file back
-    auto st = run({"metaflac", "--set-tag=GENRE=Edited", path});
-    CHECK_MSG(st.ok(), "metaflac: {}", st.err);
-    auto t0 = Clock::now();
-    while (!mounted_tags().get("GENRE") && Clock::now() - t0 < std::chrono::seconds(3)) std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    auto took = std::chrono::duration<double>(Clock::now() - t0).count();
-    CHECK_MSG(mounted_tags().get("GENRE") && took < 1.2, "edit visible after {:.2f}s", took);
-
-    // an editor that truncates the file and dies: nothing is stored, the close reports it
-    std::string sidecar = *try_read_text(f.tags / "A" / SIDECAR_NAME);
-    int fd = ::open(path.c_str(), O_WRONLY | O_TRUNC);
-    CHECK(fd >= 0);
-    CHECK(::close(fd) != 0 && errno == EIO);
-    CHECK(*try_read_text(f.tags / "A" / SIDECAR_NAME) == sidecar);
-
-    // stat by name while writers come and go (a session freed under stat once)
-    std::atomic<bool> stop = false;
-    std::thread statter([&] {
-        struct stat s;
-        while (!stop) ::stat(path.c_str(), &s);
-    });
-    for (int i = 0; i < 200; i++) {
-        int w = ::open(path.c_str(), O_RDWR);
-        CHECK(w >= 0);
-        ::close(w);
-    }
-    stop = true;
-    statter.join();
-
-    CHECK_MSG(m->stop_with_sigterm() == 0, "SIGTERM is a normal stop");
-}
-
 // ---------------------------------------------------------------- covers set on the mount
 
 namespace {
@@ -380,27 +286,4 @@ TEST(covers_set_on_the_mount_are_stored_and_served) {
     CHECK(cover_of(*l->find("02 - Two.flac")->file, "flac") == blue);
     // only JPEG and PNG are taken
     CHECK_THROWS(lib.apply_edit(f.src / "A", "02 - Two.flac", std::string(EDIT_TRACK), "2", Tags{}, Library::CoverEdit{Bytes{'G', 'I', 'F', '8', '9', 'a'}}));
-}
-
-TEST(mount_cover_embedded_by_a_tag_editor) {
-    Fixture f("mountcover");
-    make_flac(f.src / "A" / "a.flac", "Song");
-    f.sidecar("A", R"({"album": {"ALBUM": "X"}})");
-    f.open();
-    fs::path mnt = f.dir / "mnt";
-    auto m = Mount::start(f.lib, mnt);
-    if (!m) {
-        std::printf("      (skipped: FUSE is not available here)\n");
-        return;
-    }
-    Bytes green = image_file(f.dir / "green.png", "green");
-    std::string path = (mnt / "Lib" / "A" / "a.flac").string();
-    auto st = run({"metaflac", "--import-picture-from=" + (f.dir / "green.png").string(), path});
-    CHECK_MSG(st.ok(), "metaflac: {}", st.err);
-    auto served = [&] { return cover_of(Passthrough(path, fs::file_size(path)), "flac"); };
-    auto t0 = Clock::now();
-    while (served() != green && Clock::now() - t0 < std::chrono::seconds(3)) std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    CHECK_MSG(served() == green, "the mount serves the cover the editor embedded");
-    CHECK(try_read_text(f.tags / "A" / SIDECAR_NAME)->find("\"_cover\": \"./.covers/") != std::string::npos);
-    CHECK_MSG(!fs::exists(f.src / "A" / ".covers"), "nothing is written next to the source");
 }

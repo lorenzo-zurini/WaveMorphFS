@@ -14,11 +14,15 @@ how the filesystem is run, and the steps or input that trigger the problem.
 - Its own data is the tags directory (sidecars, the only data worth backing up)
   and the cache directory (indexes, safe to delete).
 - Files are parsed from the library (FLAC, APE, WavPack, MP3, M4A, DSF, SACD
-  ISOs, CUE sheets, images). Malformed input must never crash the mount or make
+  ISOs, CUE sheets, images). Malformed input must never crash the server or make
   it read out of bounds; please report any file that does.
-- The mount is writable for tag edits only: writes are captured and stored as
-  sidecar changes. Access follows the file modes shown on the mount (owner =
-  the user running WaveMorphFS); with `--allow-other`, other users can read but
-  only that owner (and root) can edit.
-- The container needs `/dev/fuse` and `CAP_SYS_ADMIN` to mount; it drops to
-  `PUID`/`PGID` before starting the filesystem.
+- The NFS server parses requests from the network. Malformed or oversized
+  requests must never crash it; it closes such connections.
+- It needs no privileges: the container runs as an ordinary user with every
+  capability dropped. The kernel's NFS client on the host mounts the share.
+- The share is writable for tag edits only: writes are captured and stored as
+  sidecar changes. Everyone who can connect can read; only the user running
+  WaveMorphFS (and root) can edit. NFS version 3 trusts the user a client
+  claims, so the server accepts only connections from reserved ports (which
+  only the kernel and root can use), and the documented setup puts it on a
+  Docker network of its own. `--insecure` lifts the port check.

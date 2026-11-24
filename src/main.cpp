@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// WaveMorphFS - present pristine audio files as split, tagged tracks via FUSE.
+// WaveMorphFS - present pristine audio files as split, tagged tracks over NFS.
 //
 // Copyright (C) 2026 Lorenzo Zurini
 //
@@ -9,10 +9,12 @@
 // version. It is distributed WITHOUT ANY WARRANTY; see the GNU General Public
 // License (LICENSE) for details.
 
+#include <pthread.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cerrno>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -21,8 +23,8 @@
 
 #include <nlohmann/json.hpp>
 
-#include "fs.hpp"
 #include "library.hpp"
+#include "nfs.hpp"
 #include "util.hpp"
 #include "version.hpp"
 #include "writeback.hpp"
@@ -31,16 +33,19 @@ using namespace wm;
 
 namespace {
 
-const char* USAGE = R"USAGE(wavemorphfs - present pristine audio files as split, tagged tracks via FUSE
+const char* USAGE = R"USAGE(wavemorphfs - present pristine audio files as split, tagged tracks over NFS
 
 usage: wavemorphfs [global options] <command> [arguments]
        wavemorphfs --version | --help
 
 commands:
-  mount <mountpoint>        mount the filesystem (runs in the foreground)
+  nfs [ADDRESS:]PORT        serve the filesystem over NFS version 3 (runs in the foreground;
+                            no privileges needed; mount it with
+                            nfsvers=3,proto=tcp,port=PORT,mountport=PORT,mountproto=tcp,nolock)
+      --insecure            accept clients from unreserved ports (default: only the kernel's
+                            NFS client and root can connect)
       --workers N           background workers (default 2)
-      --threads N           FUSE threads (default 8)
-      --allow-other         let other users (e.g. a container's user) access the mount
+      --threads N           request threads (default 8)
       --prescan SECONDS     re-walk the library this often (default 900; 0: never)
       --sacd-multichannel   also expose SACD multichannel areas as "(Multichannel)" albums
                             (env WAVEMORPH_SACD_MULTICHANNEL; default off)
@@ -96,7 +101,7 @@ struct Cli {
     std::vector<std::string> pos;
     size_t workers = 2, threads = 8;
     uint64_t prescan = 900;
-    bool allow_other = false, sacd_multichannel = false, force = false;
+    bool insecure = false, sacd_multichannel = false, force = false;
 };
 
 [[noreturn]] void usage_error(const std::string& msg) {
@@ -104,7 +109,7 @@ struct Cli {
     std::exit(2);
 }
 
-int cmd_mount(const Cli& cli);
+int cmd_nfs(const Cli& cli);
 int cmd_ls(const Cli& cli);
 int cmd_verify(const Cli& cli);
 int cmd_compare(const Cli& cli);
@@ -117,17 +122,17 @@ struct Command {
     int (*run)(const Cli&);
 };
 const Command COMMANDS[] = {
-    {"mount", 1, "a mountpoint", cmd_mount},
+    {"nfs", 1, "a port to listen on", cmd_nfs},
     {"ls", 1, "a directory", cmd_ls},
     {"verify", 1, "a directory", cmd_verify},
     {"compare", 2, "a directory and a split directory", cmd_compare},
     {"tags-init", 1, "a directory", cmd_tags_init},
 };
 
-/// Options that only one command takes.
+/// Options that only some commands take (and those commands, space-separated).
 const std::pair<std::string_view, std::string_view> COMMAND_OPTIONS[] = {
-    {"--workers", "mount"}, {"--threads", "mount"}, {"--allow-other", "mount"}, {"--prescan", "mount"},
-    {"--sacd-multichannel", "mount"}, {"--force", "tags-init"},
+    {"--workers", "nfs"}, {"--threads", "nfs"}, {"--insecure", "nfs"},
+    {"--prescan", "nfs"}, {"--sacd-multichannel", "nfs"}, {"--force", "tags-init"},
 };
 
 Cli parse_args(int argc, char** argv) {
@@ -187,7 +192,7 @@ Cli parse_args(int argc, char** argv) {
         else if (arg == "--workers") c.workers = size_t(number(1));
         else if (arg == "--threads") c.threads = size_t(number(1));
         else if (arg == "--prescan") c.prescan = number(0);
-        else if (arg == "--allow-other") c.allow_other = flag();
+        else if (arg == "--insecure") c.insecure = flag();
         else if (arg == "--sacd-multichannel") c.sacd_multichannel = flag();
         else if (arg == "--force") c.force = flag();
         else usage_error("unknown option " + arg);
@@ -201,8 +206,11 @@ Cli parse_args(int argc, char** argv) {
     if (cmd == std::end(COMMANDS)) usage_error("unknown command " + c.cmd);
     c.run = cmd->run;
     if (c.pos.size() != cmd->args) usage_error(std::format("{} needs {}", c.cmd, cmd->args_help));
-    for (auto& [opt, only] : COMMAND_OPTIONS)
-        if (given.contains(std::string(opt)) && c.cmd != only) usage_error(std::format("{} only applies to {}", opt, only));
+    for (auto& [opt, only] : COMMAND_OPTIONS) {
+        auto cmds = split(only, ' ');
+        if (given.contains(std::string(opt)) && std::ranges::find(cmds, c.cmd) == cmds.end())
+            usage_error(std::format("{} only applies to {}", opt, join(cmds, " and ")));
+    }
     if (c.roots.empty()) usage_error("no --root given");
     return c;
 }
@@ -251,7 +259,7 @@ std::shared_ptr<Library> library(const Cli& cli, size_t workers) {
     cfg.cache_dir = dir(cli.cache_dir, "cache-dir");
     if (!cli.covers_dir.empty()) cfg.covers_dir = dir(cli.covers_dir, "covers-dir");
     cfg.workers = workers;
-    cfg.sacd_multichannel = cli.cmd == "mount" && cli.sacd_multichannel;
+    cfg.sacd_multichannel = cli.cmd == "nfs" && cli.sacd_multichannel;
     return Library::create(std::move(cfg));
 }
 
@@ -459,16 +467,26 @@ int cmd_tags_init(const Cli& cli) {
     return 0;
 }
 
-int cmd_mount(const Cli& cli) {
+int cmd_nfs(const Cli& cli) {
+    // stop signals are taken by serve_nfs (sigwait): block them in every thread,
+    // so before any is started
+    sigset_t set;
+    sigemptyset(&set);
+    for (int s : {SIGINT, SIGTERM, SIGHUP}) sigaddset(&set, s);
+    pthread_sigmask(SIG_BLOCK, &set, nullptr);
+    NfsOptions opt;
+    opt.listen = cli.pos[0];
+    opt.threads = cli.threads;
+    opt.insecure = cli.insecure;
     info("WaveMorphFS {}", VERSION);
     auto lib = library(cli, cli.workers);
     lib->start_workers();
     lib->refresh_placements(true);  // the tree is complete from the first request
     if (cli.prescan > 0) lib->start_prescan(std::chrono::seconds(cli.prescan));
-    int rc = mount_fs(lib, {cli.pos[0], cli.threads, cli.allow_other});
+    int rc = serve_nfs(std::move(lib), opt);
     // background workers and the prescan are detached and may be mid-job: leave
     // without running static destructors under them. Nothing is lost: every
-    // file is written atomically.
+    // file is written atomically, and serve_nfs stored the pending edits.
     std::fflush(nullptr);
     std::_Exit(rc);
 }

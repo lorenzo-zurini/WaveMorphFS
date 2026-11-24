@@ -228,7 +228,7 @@ void run_decoded_case(const char* codec, const char* ext, uint32_t rate, size_t 
         auto trp = std::make_shared<EncodedTrack>(image, s, e, tags, layout[i]);  // shared: exercises read-ahead
         auto& tr = *trp;
         Bytes bytes;
-        for (uint64_t o = 0; o < tr.size(); o += 131072) {  // FUSE-sized sequential reads
+        for (uint64_t o = 0; o < tr.size(); o += 131072) {  // client-sized sequential reads
             Bytes part = tr.read_at(o, 131072);
             bytes.insert(bytes.end(), part.begin(), part.end());
         }

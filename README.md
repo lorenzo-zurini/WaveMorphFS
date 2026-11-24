@@ -46,9 +46,9 @@ source files had.
 
 The main use is turning a messy collection into a clean one without touching it:
 
-1. **Mount it.** Give WaveMorphFS one or more folders (`--root`) and a mountpoint
-   anywhere you like: a local folder, a folder your music server's container
-   sees, or one you share over the network. CUE images are split into
+1. **Mount it.** Give WaveMorphFS one or more folders (`--root`). It serves the
+   library over NFS, so your music server's container (as a Docker volume) or
+   any other machine mounts it wherever it likes. CUE images are split into
    tracks, APE-style files are served as FLAC, SACD ISOs as DSF, and files that are
    still being copied or are damaged are kept out.
 2. **Tag it.** Run beets, Picard or any tag editor on the mounted files, with
@@ -149,18 +149,22 @@ Two things can look like a change but aren't:
 
 ## Quick start with Docker
 
-This is a complete stack: WaveMorphFS mounts your music,
-[Navidrome](https://www.navidrome.org/) serves it, and
+This is a complete stack: WaveMorphFS serves your music,
+[Navidrome](https://www.navidrome.org/) streams it, and
 [beets](https://beets.io/) tags it from MusicBrainz, with every tag beets
 writes going into a sidecar. Images for amd64 and arm64 are published as
 `ghcr.io/lorenzo-zurini/wavemorphfs` (`:latest` and `:X.Y.Z` for releases,
 `:edge` for the main branch).
 
+WaveMorphFS runs as an NFS server with no privileges at all: no root, no
+capabilities, no devices. The other containers get the library as an ordinary
+Docker volume, which Docker mounts for them with the kernel's NFS client. Nothing
+needs installing or configuring on the host.
+
 ```
 music-stack/
 ├── docker-compose.yml
 ├── wavemorph/
-│   ├── mnt/        the mount (created by the container)
 │   ├── tags/       sidecars: the only data worth backing up
 │   ├── cache/      indexes, safe to delete
 │   └── status.txt  which images are ready, being processed, or failed
@@ -169,14 +173,11 @@ music-stack/
     └── config.yaml
 ```
 
-Create the folders first, as the user who will own them:
+Create the folders first, as the user the containers run as (here uid 1000):
 
 ```sh
-mkdir -p music-stack/wavemorph music-stack/navidrome music-stack/beets
+mkdir -p music-stack/wavemorph/tags music-stack/wavemorph/cache music-stack/navidrome music-stack/beets
 ```
-
-WaveMorphFS takes care of `wavemorph/` itself, but Navidrome runs as
-`user: 1000:1000` and needs `navidrome/` to be writable.
 
 ```yaml
 # docker-compose.yml
@@ -184,28 +185,19 @@ services:
   wavemorphfs:
     image: ghcr.io/lorenzo-zurini/wavemorphfs:latest   # amd64 and arm64
     container_name: wavemorphfs
-    devices:
-      - /dev/fuse
-    # only what it needs: the FUSE mount (SYS_ADMIN), switching to PUID/PGID,
-    # and handing its own folders to that user on the first start
+    # the user the filesystem runs as: owner of wavemorph/, able to read the
+    # music; only this user (and root) can edit tags through the share
+    user: 1000:1000
+    # it needs no privileges
     cap_drop:
       - ALL
-    cap_add:
-      - SYS_ADMIN
-      - SETUID
-      - SETGID
-      - CHOWN
-      - DAC_OVERRIDE
-      - FOWNER
     security_opt:
-      - apparmor:unconfined       # AppArmor blocks FUSE mounts in containers
+      - no-new-privileges:true
+    read_only: true
     environment:
-      # the user the filesystem runs as: owner of wavemorph/, able to read the music
-      - PUID=1000
-      - PGID=1000
       # also expose SACD multichannel areas as "(Multichannel)" albums
       - WAVEMORPH_SACD_MULTICHANNEL=false
-    # one --root per library: NAME=PATH shows PATH as folder NAME of the mount
+    # one --root per library: NAME=PATH shows PATH as folder NAME of the share
     command:
       - --root=Music=/music
       - --root=Classical Music=/classical
@@ -213,13 +205,10 @@ services:
       # the music: read-only, WaveMorphFS never writes to it
       - /path/to/music:/music:ro
       - /path/to/classical:/classical:ro
-      # mount (mnt/), sidecars (tags/) and indexes (cache/); rshared: the FUSE
-      # mount made in here propagates back to the host
-      - type: bind
-        source: ./wavemorph
-        target: /wavemorph
-        bind:
-          propagation: rshared
+      - ./wavemorph:/wavemorph
+    networks:
+      library:
+        ipv4_address: 10.89.0.2   # the volumes below connect here
     restart: unless-stopped
 
   navidrome:
@@ -227,8 +216,8 @@ services:
     user: 1000:1000
     environment:
       # the image sets ND_MUSICFOLDER=/music, which overrides navidrome.toml
-      - ND_MUSICFOLDER=/wm/mnt/Music
-      # FUSE gives no change notifications: rescan on a timer
+      - ND_MUSICFOLDER=/library/Music
+      # NFS sends no change notifications: rescan on a timer
       - ND_SCANNER_SCHEDULE=@every 1h
     ports:
       - 4533:4533
@@ -237,14 +226,7 @@ services:
         condition: service_healthy
     volumes:
       - ./navidrome:/data
-      # bind the PARENT of the mountpoint with rslave, not the mountpoint itself:
-      # that way the mount reappears after wavemorphfs restarts
-      - type: bind
-        source: ./wavemorph
-        target: /wm
-        read_only: true
-        bind:
-          propagation: rslave
+      - library-ro:/library
     restart: unless-stopped
 
   beets:
@@ -258,19 +240,35 @@ services:
         condition: service_healthy
     volumes:
       - ./beets:/config
-      # writable: tag writes on the mount are stored as sidecars
-      - type: bind
-        source: ./wavemorph
-        target: /wm
-        bind:
-          propagation: rslave
+      # writable: tag writes are stored as sidecars
+      - library:/library
     restart: unless-stopped
+
+# a network of its own: nothing else can reach the server
+networks:
+  library:
+    ipam:
+      config:
+        - subnet: 10.89.0.0/29   # any free private range
+
+# the share, mounted by Docker with the kernel's NFS client
+volumes:
+  library:
+    driver_opts:
+      type: nfs
+      o: addr=10.89.0.2,port=2049,mountport=2049,nfsvers=3,proto=tcp,mountproto=tcp,nolock,noacl,actimeo=1
+      device: ":/"
+  library-ro:
+    driver_opts:
+      type: nfs
+      o: addr=10.89.0.2,port=2049,mountport=2049,nfsvers=3,proto=tcp,mountproto=tcp,nolock,noacl,actimeo=1,ro
+      device: ":/"
 ```
 
 ```yaml
-# beets/config.yaml: tag files in place on the mount; never move or copy them
-# (their names are fixed by the mount)
-directory: /wm/mnt
+# beets/config.yaml: tag files in place on the share; never move or copy them
+# (their names are fixed by WaveMorphFS)
+directory: /library
 library: /config/library.db
 plugins: musicbrainz
 import:
@@ -285,10 +283,10 @@ Then:
 
 ```sh
 docker compose up -d
-docker compose exec beets beet import /wm/mnt/Music
+docker compose exec beets beet import /library/Music
 ```
 
-Add further libraries (for example `/wm/mnt/Classical Music`) in Navidrome's
+Add further libraries (for example `/library/Classical Music`) in Navidrome's
 web UI under *Libraries*.
 
 The first start takes a while on a large collection: every image is decoded
@@ -297,18 +295,22 @@ tracks. The results are cached, so later starts take seconds.
 
 Things worth knowing:
 
-- The host folder holding `wavemorph/` must be on a shared mount for `rshared`
-  to work. That is the default on systemd hosts; otherwise run
-  `mount --make-rshared /`.
-- Bind the folder that contains the mountpoint into other containers, never the
-  mountpoint itself. A bind of the mountpoint goes stale ("Transport endpoint is
-  not connected") whenever wavemorphfs restarts.
-- The container starts as root only to switch to `PUID`/`PGID`. Compose's
-  `user:` works too, but only for uid 1000, because `fusermount3` needs a passwd
-  entry for the user it runs as.
-- The paths inside the container can be changed with `WAVEMORPH_MOUNT`,
-  `WAVEMORPH_TAGS_DIR` and `WAVEMORPH_CACHE_DIR`. For `_cover` images, bind
-  their folder read-only and point `WAVEMORPH_COVERS_DIR` at it.
+- **Restarts are invisible.** NFS clients wait while the server is away and
+  carry on when it is back: restarting or upgrading wavemorphfs doesn't disturb
+  Navidrome or beets, not even a file being played.
+- **Start order.** Docker mounts a volume when the container using it starts,
+  so the server has to be running first. `depends_on` takes care of that for
+  `docker compose up`; if the host starts containers on its own after a reboot
+  and Navidrome comes up first, start it again once wavemorphfs is healthy.
+- **Who can connect.** The server only accepts connections from reserved ports,
+  which only the kernel (and root) can use, so the user a client claims is the
+  one its kernel vouches for. The network of its own keeps other containers
+  away. `--insecure` lifts the port check (for a userspace NFS client, say).
+- The NFS client needs the host's `nfs` kernel module, which every mainstream
+  distribution ships; Docker loads it on the first mount.
+- The paths inside the container can be changed with `WAVEMORPH_TAGS_DIR` and
+  `WAVEMORPH_CACHE_DIR`, and the port with `WAVEMORPH_NFS`. For `_cover` images,
+  bind their folder read-only and point `WAVEMORPH_COVERS_DIR` at it.
   `WAVEMORPH_LOG=debug` logs more.
 - When an upgrade changes what generated files contain, their modification
   times move forward, so Navidrome's next regular scan picks the change up.
@@ -317,23 +319,22 @@ Things worth knowing:
 
 ## Installing from source
 
-Linux only. You need GCC 13+ or Clang 17+, CMake 3.20+, pkg-config, libfuse3
-3.12+, libFLAC, libwavpack 5, FFmpeg 5.1+ (libavformat, libavcodec, libavutil,
+Linux only. You need GCC 13+ or Clang 17+, CMake 3.20+, pkg-config, libFLAC, libwavpack 5, FFmpeg 5.1+ (libavformat, libavcodec, libavutil,
 libswscale) and nlohmann/json 3.10+. The tests, `verify` and `compare` also use
 the `flac`, `metaflac` and `ffmpeg` command-line tools. On Debian or Ubuntu:
 
 ```sh
-sudo apt install g++ cmake ninja-build pkg-config libfuse3-dev libflac-dev libwavpack-dev \
-    nlohmann-json3-dev libavformat-dev libavcodec-dev libavutil-dev libswscale-dev flac ffmpeg fuse3
+sudo apt install g++ cmake ninja-build pkg-config libflac-dev libwavpack-dev \
+    nlohmann-json3-dev libavformat-dev libavcodec-dev libavutil-dev libswscale-dev flac ffmpeg
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 build/wavemorphfs-tests      # unit tests
 sudo cmake --install build   # /usr/local/bin/wavemorphfs
 ```
 
-If other users, such as a music server, should read the mount, enable
-`user_allow_other` in `/etc/fuse.conf`. Then run the mount as a service, for
-example with systemd:
+From a source build, `wavemorphfs ... nfs 2049` serves the library over NFS as
+the container does. Run it as a service, for example with systemd, and mount it
+wherever the music should appear:
 
 ```ini
 # /etc/systemd/system/wavemorphfs.service
@@ -345,12 +346,16 @@ After=local-fs.target
 User=music
 ExecStart=/usr/local/bin/wavemorphfs --root=Music=/srv/music \
     --tags-dir=/srv/wavemorph/tags --cache-dir=/srv/wavemorph/cache \
-    mount /srv/wavemorph/mnt --allow-other
-ExecStopPost=-/usr/bin/fusermount3 -uz /srv/wavemorph/mnt
+    nfs 127.0.0.1:2049
 Restart=on-failure
 
 [Install]
 WantedBy=multi-user.target
+```
+
+```
+# /etc/fstab
+127.0.0.1:/  /srv/library  nfs  nfsvers=3,proto=tcp,port=2049,mountport=2049,mountproto=tcp,nolock,noacl,_netdev  0 0
 ```
 
 To build the container image yourself, replace `image:` in the compose file
@@ -359,10 +364,12 @@ with `build: <path to this repository>`.
 ## Command line
 
 ```sh
-# mount: one --root per library, shown as a top-level folder of the mount
+# serve over NFS on port 2049: one --root per library, shown as a top-level folder
 wavemorphfs --root "Music=/srv/music" --root "Classical Music=/srv/classical" \
     --tags-dir /srv/wavemorph/tags --cache-dir /srv/wavemorph/cache \
-    mount /srv/wavemorph/mnt --allow-other
+    nfs 2049
+# a client mounts it with
+mount -t nfs -o nfsvers=3,proto=tcp,port=2049,mountport=2049,mountproto=tcp,nolock,noacl server:/ /mnt/library
 
 # the other commands take the same --root/--tags-dir/--cache-dir options and a
 # folder inside one of the roots
@@ -373,7 +380,7 @@ wavemorphfs $R compare /srv/music/Album <split> # compare its tracks with files 
 wavemorphfs $R tags-init /srv/music/Album       # write a sidecar filled with the current tags
 ```
 
-`wavemorphfs --help` lists every option: worker and FUSE thread counts, the
+`wavemorphfs --help` lists every option: worker and request thread counts, the
 prescan interval (`--prescan 0` turns the periodic re-walk off) and SACD
 multichannel areas. `tags-init` reads the tags of every taggable file (FLAC,
 DSF, MP3, M4A, WavPack); with `--force` it replaces an existing sidecar, but it
@@ -531,8 +538,9 @@ album, for example by work:
 
 FLAC, DSF, MP3, M4A and WavPack files on the mount can be edited in place with
 any tag editor. Writes go to a scratch copy, never to the source. When the
-editor closes the file, its tags are read back, compared field by field with
-what the mount generated, and only the differences are saved in the folder's
+editor is done (NFS has no "file closed", so once its writes have stopped for
+a moment), its tags are read back, compared field by field with what the mount
+generated, and only the differences are saved in the folder's
 sidecar: under `track."N"` for split tracks (which also pins the file's name,
 so retitling a track doesn't rename it), and under `file."<name>"` for regular
 files. Names already used in the sidecar keep their spelling, and removed tags
@@ -581,6 +589,10 @@ gets read access.
   VORBIS_COMMENT block, the ID3v2.4 tag, the MP4 `ilst` (with chunk offsets
   adjusted), DSF's trailing ID3 tag or WavPack's APEv2 tag. Tags and pictures a
   sidecar doesn't mention are kept.
+- **Served over NFS version 3**, with the MOUNT protocol on the same port, by
+  the same process that builds the tracks. File handles name paths in the mount
+  and are kept in the cache directory, so they stay valid across restarts and
+  clients just carry on.
 - **Slow work runs in the background.** Indexing, measuring and SACD scans run
   in worker threads. A folder's tracks appear when they are ready, and its
   modification time changes so music servers notice.
@@ -612,13 +624,14 @@ on every change.
   `status.txt` (next to the cache directory) lists every image as ready,
   pending, settling or failed, with the error for failed ones. A failed image
   stays visible as its original files.
-- **"Transport endpoint is not connected" in another container.** It bound the
-  mountpoint itself instead of the folder containing it.
-- **`option allow_other only allowed if 'user_allow_other' is set`.** Add
-  `user_allow_other` to `/etc/fuse.conf` (the container image already has it).
-- **The mount fails inside a container with "permission denied".** The container
-  needs `/dev/fuse`, `CAP_SYS_ADMIN` and an AppArmor setting that allows FUSE
-  mounts (`apparmor:unconfined` in the example). `dmesg` shows AppArmor denials.
+- **A container won't start: "error while mounting volume ... no route to
+  host" or "connection refused".** WaveMorphFS wasn't running yet when Docker
+  mounted the volume; start the container again once wavemorphfs is healthy.
+- **"refusing ... clients must connect from a reserved port" in the log.**
+  Something other than a kernel NFS client tried to connect. Use `--insecure`
+  only if you trust everything that can reach the port.
+- **Tag edits give "permission denied".** Only the user WaveMorphFS runs as (and
+  root) may edit: run the tagger as that user.
 - **More detail.** `WAVEMORPH_LOG=debug` logs every listing, job and cache
   decision.
 
@@ -636,7 +649,7 @@ on every change.
   the mount) leave M4A files alone.
 - Sidecar tags apply to FLAC, MP3, M4A, DSF and WavPack. Ogg, Opus and
   standalone WAV or AIFF files are passed through as they are.
-- FUSE can't notify music servers of changes, so they need to rescan on a timer.
+- NFS can't notify music servers of changes, so they need to rescan on a timer.
 
 ## Support
 
