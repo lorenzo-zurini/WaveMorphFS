@@ -299,9 +299,8 @@ Things worth knowing:
   carry on when it is back: restarting or upgrading wavemorphfs doesn't disturb
   Navidrome or beets, not even a file being played.
 - **Start order.** Docker mounts a volume when the container using it starts,
-  so the server has to be running first. `depends_on` takes care of that for
-  `docker compose up`; if the host starts containers on its own after a reboot
-  and Navidrome comes up first, start it again once wavemorphfs is healthy.
+  so the server has to be listening first. `depends_on` takes care of that for
+  `docker compose up`; after a reboot, see below.
 - **Who can connect.** The server only accepts connections from reserved ports,
   which only the kernel (and root) can use, so the user a client claims is the
   one its kernel vouches for. The network of its own keeps other containers
@@ -316,6 +315,33 @@ Things worth knowing:
   times move forward, so Navidrome's next regular scan picks the change up.
 - Let Navidrome's own scheduled scan do the scanning; don't run `navidrome scan`
   in a second container next to the running server.
+
+### After a reboot
+
+At boot, Docker starts every container at once and doesn't retry one whose
+volume failed to mount, so Navidrome and beets stay down when they come up
+before WaveMorphFS listens. Have the host run `docker compose up` once Docker is
+ready; compose then starts them after WaveMorphFS is healthy:
+
+```ini
+# /etc/systemd/system/music-stack.service
+[Unit]
+Description=Start the music stack in order
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/docker compose --project-directory /path/to/music-stack up -d --wait
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```sh
+sudo systemctl enable music-stack.service
+```
 
 ## Installing from source
 
@@ -625,8 +651,9 @@ on every change.
   pending, settling or failed, with the error for failed ones. A failed image
   stays visible as its original files.
 - **A container won't start: "error while mounting volume ... no route to
-  host" or "connection refused".** WaveMorphFS wasn't running yet when Docker
-  mounted the volume; start the container again once wavemorphfs is healthy.
+  host" or "connection refused".** WaveMorphFS wasn't listening yet when Docker
+  mounted the volume. `docker compose up -d` starts it in order; after a
+  reboot, the unit under *After a reboot* does that for you.
 - **"refusing ... clients must connect from a reserved port" in the log.**
   Something other than a kernel NFS client tried to connect. Use `--insecure`
   only if you trust everything that can reach the port.

@@ -9,6 +9,16 @@ Generated files carry an *output epoch*: when a release changes what generated
 files contain, their modification times move forward, so music servers re-read
 them once on their next scan.
 
+## [Unreleased]
+
+### Changed
+- The image's healthcheck runs every second while the server starts, so
+  containers that wait for it (`depends_on: service_healthy`) start about a
+  second after it listens instead of up to ten.
+- The README shows how to start the stack in order after a reboot: Docker
+  restores every container at once and doesn't retry one whose NFS volume
+  could not be mounted yet.
+
 ## [0.3.0] - 2026-11-24
 
 WaveMorphFS is now an NFS server and needs no privileges. The FUSE mount, which

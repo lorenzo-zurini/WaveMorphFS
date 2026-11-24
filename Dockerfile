@@ -35,6 +35,6 @@ ENV WAVEMORPH_NFS=2049 \
     WAVEMORPH_CACHE_DIR=/wavemorph/cache \
     WAVEMORPH_LOG=info
 EXPOSE 2049
-HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=3 CMD ["/entrypoint.sh", "health"]
+HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --start-interval=1s --retries=3 CMD ["/entrypoint.sh", "health"]
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["/entrypoint.sh"]
