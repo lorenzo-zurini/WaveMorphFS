@@ -9,7 +9,7 @@ Generated files carry an *output epoch*: when a release changes what generated
 files contain, their modification times move forward, so music servers re-read
 them once on their next scan.
 
-## [Unreleased]
+## [0.3.1] - 2026-11-24
 
 ### Changed
 - The image's healthcheck runs every second while the server starts, so
@@ -219,6 +219,7 @@ lossless images (APE, WavPack, TTA, TAK, WAV, ALAC) encoded to FLAC on the fly,
 SACD ISOs (plain DSD and DST) as DSF, sidecar tags for every file kind, tag edits
 on the mount stored in sidecars, and a container image for amd64 and arm64.
 
+[0.3.1]: https://github.com/lorenzo-zurini/WaveMorphFS/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/lorenzo-zurini/WaveMorphFS/compare/v0.2.4...v0.3.0
 [0.2.4]: https://github.com/lorenzo-zurini/WaveMorphFS/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/lorenzo-zurini/WaveMorphFS/compare/v0.2.2...v0.2.3
